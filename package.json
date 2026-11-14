@@ -1,0 +1,32 @@
+{
+  "name": "qq-voice-room",
+  "version": "0.1.0-preview.1",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc --noEmit false --outDir dist --rootDir .",
+    "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
+    "test": "node --test dist/tests/voice-room-request-lifecycle.test.js",
+    "predemo": "npm run build",
+    "demo": "node dist/scripts/demo.js",
+    "preroom:doctor": "npm run build",
+    "room:doctor": "node --env-file=.env dist/scripts/room-qq.js check",
+    "preroom:qq": "npm run build",
+    "room:qq": "node --env-file=.env dist/scripts/room-qq.js run"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.3.0",
+    "@earendil-works/pi-coding-agent": "1.3.0",
+    "typebox": "1.3.27",
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "@types/ws": "8.18.2",
+    "typescript": "5.8.3"
+  }
+}

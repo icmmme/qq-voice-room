@@ -1,0 +1,48 @@
+{
+  "roomId": "demo-room",
+  "groupId": "10000",
+  "ownerId": "10001",
+  "ingressAccountKey": "account-a",
+  "dataDir": "../../local/voice-room-data",
+  "port": 3011,
+  "execution": "worker",
+  "workerQueue": {
+    "capacity": 32,
+    "memberLimit": 8,
+    "memberWindowMs": 60000,
+    "ttlMs": 120000
+  },
+  "deliveryMode": "text",
+  "characterLanguages": {
+    "character-a": {
+      "textLanguage": "zh",
+      "voiceLanguage": "zh",
+      "translateForVoice": false
+    },
+    "character-b": {
+      "textLanguage": "zh",
+      "voiceLanguage": "ja",
+      "translateForVoice": true
+    }
+  },
+  "characters": [
+    {
+      "id": "character-a",
+      "accountKey": "account-a",
+      "selfId": "10002",
+      "name": "虚构甲",
+      "voiceKey": "voice-a",
+      "tokenEnv": "ROOM_QQ_A_TOKEN",
+      "personaFile": "a.md"
+    },
+    {
+      "id": "character-b",
+      "accountKey": "account-b",
+      "selfId": "10003",
+      "name": "虚构乙",
+      "voiceKey": "voice-b",
+      "tokenEnv": "ROOM_QQ_B_TOKEN",
+      "personaFile": "b.md"
+    }
+  ]
+}
