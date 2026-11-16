@@ -9,6 +9,7 @@
   "scripts": {
     "build": "tsc --noEmit false --outDir dist --rootDir .",
     "typecheck": "tsc --noEmit",
+    "verify:foundation": "node tools/verify-foundation.mjs",
     "pretest": "npm run build",
     "test": "node --test dist/tests/voice-room-request-lifecycle.test.js",
     "predemo": "npm run build",

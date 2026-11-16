@@ -1,0 +1,23 @@
+[
+  {
+    "commandId": "freeze-evidence-check",
+    "command": "node tools/freeze-evidence.mjs --check",
+    "cwd": "Q",
+    "exitCode": 0,
+    "rawLogSha256": "A4F2977BB6C68398FD809A7F6FFFCB388ECF5D9B3B8BA0A062C176497DA6B00A"
+  },
+  {
+    "commandId": "architecture-guard",
+    "command": "node tools/architecture-guard.mjs",
+    "cwd": "Q",
+    "exitCode": 0,
+    "rawLogSha256": "AAA7B825AAC50C66EBAD090486DC48796351B0D3915505262602B6D892EEAC44"
+  },
+  {
+    "commandId": "git-diff-check",
+    "command": "git diff --check",
+    "cwd": "Q",
+    "exitCode": 0,
+    "rawLogSha256": "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+  }
+]
