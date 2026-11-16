@@ -8,6 +8,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { QqPeer, type QqAttemptOptions } from "../src/qq-peer.js";
 import type { ModelConfig } from "../src/config.js";
 import { checkRoomConfig } from "../src/voice-room/config.js";
+import { parseRoomQqMessage } from "../src/voice-room/qq-message.js";
 import type { RoomQqSettings } from "../src/voice-room/qq-config.js";
 import { roomPublicPolicy } from "../src/voice-room/public-policy.js";
 import {
@@ -99,6 +100,7 @@ interface DispatchRecord {
 
 interface LifecycleHarness {
   readonly root: string;
+  readonly checkedConfig: ReturnType<typeof checkRoomConfig>;
   readonly room: VoiceRoom;
   readonly prompts: Parameters<RoomLifecycleWorker["model"]["generate"]>[0][];
   readonly dispatches: DispatchRecord[];
@@ -117,7 +119,7 @@ async function lifecycleHarness(t: TestContext, options: {
   deps?: Partial<RoomDependencies>;
 }): Promise<LifecycleHarness> {
   const root = mkdtempSync(join(tmpdir(), "pa-lifecycle-test-"));
-  const config = options.config ?? roomConfig();
+  const checkedConfig = checkRoomConfig(options.config ?? roomConfig());
   let sent = 0;
   let synthesisCalls = 0;
   const prompts: LifecycleHarness["prompts"] = [];
@@ -139,7 +141,7 @@ async function lifecycleHarness(t: TestContext, options: {
     permitsPrompt: () => true,
     ...options.deps,
   };
-  const room = new VoiceRoom(join(root, "room.sqlite"), config, deps, { execution: "lifecycle" });
+  const room = new VoiceRoom(join(root, "room.sqlite"), checkedConfig, deps, { execution: "lifecycle" });
   const wrappedModel = {
     generate: async (prompt: Parameters<RoomLifecycleWorker["model"]["generate"]>[0],
       signal: AbortSignal, maxChars: number): Promise<RoomLifecycleAnswer> => {
@@ -164,7 +166,7 @@ async function lifecycleHarness(t: TestContext, options: {
     });
     return options.dispatch ? options.dispatch(request, record) : defaultDispatch(request);
   };
-  for (const character of config.characters) room.setOnline(character.accountKey, true);
+  for (const character of checkedConfig.characters) room.setOnline(character.accountKey, true);
   await room.startLifecycleProductionWorker({
     model: wrappedModel,
     apiTimeoutMs: 100,
@@ -182,6 +184,7 @@ async function lifecycleHarness(t: TestContext, options: {
   t.after(close);
   return {
     root,
+    checkedConfig,
     room,
     prompts,
     dispatches,
@@ -1032,4 +1035,107 @@ test("lifecycle ingress rejects other accounts and duplicates, and audit exposes
   const audit = JSON.stringify(h.room.store.lifecycleAudit());
   assert.doesNotMatch(audit, /body-secret-never-audited/);
   assert.match(audit, /completed/);
+});
+
+test("offline single @ acceptance path joins real parser, checked config, lifecycle SQLite, generation and one text dispatch", async t => {
+  const config = roomConfig();
+  const h = await lifecycleHarness(t, {
+    config,
+    model: { generate: async () => ({ kind: "reply", segments: ["synthetic single-mention reply"] }) },
+  });
+  const qqEvent = (messageId: number, message: unknown[]) => ({
+    post_type: "message",
+    message_type: "group",
+    sub_type: "normal",
+    self_id: 10002,
+    group_id: 10000,
+    user_id: 10001,
+    message_id: messageId,
+    sender: { user_id: 10001 },
+    message,
+  });
+
+  const parsed = parseRoomQqMessage(qqEvent(800001, [
+    { type: "at", data: { qq: "10002" } },
+    { type: "text", data: { text: " hello " } },
+  ]), "account-a", h.checkedConfig);
+  assert.ok(parsed, "the real parser must accept one configured character mention");
+  assert.deepEqual(parsed.mentions, ["10002"]);
+  assert.equal(parsed.text, "hello");
+  assert.equal(parsed.messageId, "800001");
+  assert.equal(parsed.accountKey, "account-a");
+  assert.equal(parsed.selfId, "10002");
+  assert.equal(parsed.groupId, "10000");
+  assert.equal(parsed.senderId, "10001");
+
+  assert.equal(h.room.receiveLifecycle(parsed, QUEUE), "scheduled");
+  await h.room.whenIdle();
+
+  const requests = h.room.store.lifecycleRequests();
+  assert.equal(requests.length, 1);
+  const request = requests[0]!;
+  assert.equal(request.status, "completed");
+  assert.equal(request.source, "direct");
+  assert.equal(request.input.messageId, "800001");
+  assert.equal(request.input.text, "hello");
+  assert.deepEqual(request.input.mentions, ["10002"]);
+
+  const target = h.room.store.historyMessage(request.messageRowId);
+  assert.ok(target, "the admitted message row must still exist");
+  assert.equal(target.speakerType, "user");
+  assert.equal(target.platformId, "800001");
+
+  const turns = h.room.store.lifecycleTurns(request.requestId);
+  assert.equal(turns.length, 1);
+  const turn = turns[0]!;
+  assert.equal(turn.characterId, "character-a");
+  assert.equal(turn.status, "completed");
+  assert.equal(turn.segmentCount, 1);
+  const segments = h.room.store.lifecycleSegments(turn.turnId);
+  assert.equal(segments.length, 1);
+  assert.equal(segments[0]!.state, "completed");
+
+  assert.equal(h.prompts.length, 1);
+  const prompt = h.prompts[0]!;
+  assert.equal(prompt.characterId, "character-a");
+  assert.equal(prompt.targetId, request.messageRowId);
+  assert.equal(prompt.tools.length, 0);
+
+  assert.equal(h.dispatches.length, 1);
+  assert.deepEqual(h.dispatches[0], {
+    characterId: "character-a",
+    medium: "text",
+    text: "synthetic single-mention reply",
+    requestId: request.requestId,
+  });
+  const textAttempts = h.room.store.lifecycleAudit().filter(row => row.medium === "text");
+  assert.equal(textAttempts.length, 1);
+  assert.equal(textAttempts[0]!.requestId, request.requestId);
+  assert.deepEqual(textAttempts[0]!.receipts, ["ack"]);
+
+  const requestsBeforeDuplicate = h.room.store.lifecycleRequests().length;
+  const dispatchesBeforeDuplicate = h.dispatches.length;
+  assert.equal(h.room.receiveLifecycle(parsed, QUEUE), "duplicate");
+  await h.room.whenIdle();
+  assert.equal(h.room.store.lifecycleRequests().length - requestsBeforeDuplicate, 0);
+  assert.equal(h.dispatches.length - dispatchesBeforeDuplicate, 0);
+
+  const unmentioned = parseRoomQqMessage(qqEvent(800002, [
+    { type: "text", data: { text: "not addressed to a character" } },
+  ]), "account-a", h.checkedConfig);
+  assert.ok(unmentioned, "an ordinary group text message is parsed for observation");
+  assert.deepEqual(unmentioned.mentions, []);
+  const requestsBeforeUnmentioned = h.room.store.lifecycleRequests().length;
+  const dispatchesBeforeUnmentioned = h.dispatches.length;
+  assert.equal(h.room.receiveLifecycle(unmentioned, QUEUE), "observed");
+  await h.room.whenIdle();
+  assert.equal(h.room.store.lifecycleRequests().length - requestsBeforeUnmentioned, 0);
+  assert.equal(h.dispatches.length - dispatchesBeforeUnmentioned, 0);
+
+  const atAll = parseRoomQqMessage(qqEvent(800003, [
+    { type: "at", data: { qq: "all" } },
+  ]), "account-a", h.checkedConfig);
+  assert.equal(atAll, null);
+  assert.equal(h.synthesisCalls, 0);
+  assert.equal(h.prompts.length, 1);
 });

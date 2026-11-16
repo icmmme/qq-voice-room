@@ -1,0 +1,160 @@
+{
+  "schemaVersion": "m1-input-identity-v1",
+  "task": "VR-PRODUCT-TAKEOVER-01/M1",
+  "phase": "M1_ENGINEERING_FOUNDATION",
+  "generatedAtUtc": "2026-11-16T10:32:52.846Z",
+  "q": {
+    "repo": "Q",
+    "branch": "main",
+    "baseIdentity": {
+      "head": "ec8db7ba6991e4ef61efc949eec6c48968b6ff49",
+      "tree": "d4fe1d8aee4682823b0bffa9c056f3606295cd67",
+      "parent": null,
+      "trackedCount": 56,
+      "trackedPaths": [
+        ".env.example",
+        ".gitattributes",
+        ".gitignore",
+        "README.md",
+        "examples/voice-room/a.md",
+        "examples/voice-room/b.md",
+        "examples/voice-room/room.example.json",
+        "package-lock.json",
+        "package.json",
+        "scripts/demo.ts",
+        "scripts/room-qq.ts",
+        "src/channel-route.ts",
+        "src/character-prompt.ts",
+        "src/config.ts",
+        "src/dialogue-style/config.ts",
+        "src/file-persona.ts",
+        "src/identity-safety.ts",
+        "src/memory-safety.ts",
+        "src/memory/types.ts",
+        "src/privacy.ts",
+        "src/prompting/context-budget.ts",
+        "src/prompting/token-estimate.ts",
+        "src/qq-config.ts",
+        "src/qq-message.ts",
+        "src/qq-peer.ts",
+        "src/qq-privacy.ts",
+        "src/relationship/state.ts",
+        "src/relationship/timezone.ts",
+        "src/relationship/types.ts",
+        "src/storage.ts",
+        "src/voice-room/config.ts",
+        "src/voice-room/context.ts",
+        "src/voice-room/delivery-policy.ts",
+        "src/voice-room/fish.ts",
+        "src/voice-room/github.ts",
+        "src/voice-room/language.ts",
+        "src/voice-room/model-diagnostics.ts",
+        "src/voice-room/model.ts",
+        "src/voice-room/participation-policy.ts",
+        "src/voice-room/proxy.ts",
+        "src/voice-room/public-policy.ts",
+        "src/voice-room/qq-config.ts",
+        "src/voice-room/qq-message.ts",
+        "src/voice-room/qq-server.ts",
+        "src/voice-room/response-planner.ts",
+        "src/voice-room/runtime.ts",
+        "src/voice-room/store.ts",
+        "src/voice-room/tools.ts",
+        "src/voice-room/types.ts",
+        "src/voice-room/url-tokens.ts",
+        "src/voice-room/websearch.ts",
+        "src/web-task.ts",
+        "src/web.ts",
+        "tests/voice-room-fixture.ts",
+        "tests/voice-room-request-lifecycle.test.ts",
+        "tsconfig.json"
+      ]
+    },
+    "worktreeObservation": {
+      "observationSource": "git status --porcelain=v1 --untracked-files=normal",
+      "head": "ec8db7ba6991e4ef61efc949eec6c48968b6ff49",
+      "tree": "d4fe1d8aee4682823b0bffa9c056f3606295cd67",
+      "stagedCount": 0,
+      "stagedEntries": [],
+      "modifiedTrackedPaths": [
+        "package.json"
+      ],
+      "untrackedCount": 6,
+      "untrackedEntries": [
+        ".harness/",
+        "AGENTS.md",
+        "docs/",
+        "evidence/",
+        "tests/foundation/",
+        "tools/"
+      ],
+      "clean": false
+    }
+  },
+  "p": {
+    "repo": "P",
+    "head": "442b34a286376ddd2457f93160e05dda89a99fd8",
+    "tree": "0ff7d0dd57ed219849e82c320ed71305429e2cb6",
+    "branch": "feat/web-context-v2",
+    "readOnly": true,
+    "mode": "READ_ONLY"
+  },
+  "toolchain": {
+    "node": "v24.21.0",
+    "npm": "11.19.0",
+    "git": "git version 2.49.0.windows.1",
+    "powershell": "5.1.26100.8457",
+    "platform": "win32",
+    "arch": "x64"
+  },
+  "inputs": {
+    "executionContract": {
+      "path": "Shared/vr-product-takeover-01-m1-execution-20261116/M1_EXECUTION_CONTRACT.md",
+      "sha256": "E04ED3D7BE60E015BA59E60DFDCBADBCED5DB950691E503D4FE7B5C97F711E8C",
+      "bytes": 12512
+    },
+    "executionContractManifest": {
+      "path": "Shared/vr-product-takeover-01-m1-execution-20261116/SHA256SUMS",
+      "sha256": "00EBC29C38F818A5436C3A859078C0ABAE95FF7DC84407230711F288E7118785",
+      "bytes": 382
+    },
+    "executionContractReadback": {
+      "path": "Shared/vr-product-takeover-01-m1-execution-20261116/READBACK.txt",
+      "sha256": "FE3364DA4B290B35E504F3564A0B21BDDA0CDCCB5D18AB2919BA64BD3F031BD9",
+      "bytes": 563
+    },
+    "executionContractAddendum": {
+      "path": "Shared/vr-product-takeover-01-m1-execution-20261116/M1_EXECUTION_CONTRACT_ADDENDUM_01.md",
+      "sha256": "FCD519C1EA2616453FA400BB7094780B008BDD6F4FE5507F5D184592C85283FD",
+      "bytes": 3484
+    },
+    "ownerApprovalAddendum": {
+      "path": "Shared/vr-product-takeover-01-m1-execution-20261116/OWNER_APPROVAL_ADDENDUM_01.json",
+      "sha256": "7B1B5FEEF98B3EB0B5E9CA3E277E055A25DC682DC0E4CA26E4FA12C1531E23E6"
+    },
+    "ownerApproval": {
+      "path": "Shared/vr-product-takeover-01-m1-execution-20261116/OWNER_APPROVAL.json",
+      "sha256": "4B300AF089B99E5AAD365EBE3D65A6B5652498C567A1F77B21269887CAE27D1D"
+    },
+    "implementationPlan": {
+      "path": "Shared/vr-product-takeover-01-20261115/m1/M1_IMPLEMENTATION_PLAN.md",
+      "sha256": "FC05273CAC123007A18F86F849E40CA1741863BB5146D0C478B5CC304B096560"
+    },
+    "featureMapPlanning": {
+      "path": "Shared/vr-product-takeover-01-20261115/m1/FEATURE_MAP_PLANNING.json",
+      "sha256": "11AD010B773691AC869AF383BEFDEA79175B7A8E173FB6DD969224F8DC869F91"
+    },
+    "s2DeliveryContract": {
+      "path": "Shared/vr-product-takeover-01-20261115/contracts/S2_DELIVERY_CONTRACT.md",
+      "sha256": "C4FA44B903985981EDB061F3BB3EB4707874A3EDBB054A60F384819D6F7E2FB7"
+    },
+    "consumerIdentityRevision": {
+      "path": "Shared/vr-product-takeover-01-20261115/contracts/CONSUMER_IDENTITY_LIVENESS_REVISION.md",
+      "sha256": "3FCD5ED726F10D488107740929146DC0D2177735F7D543116E67F561CE481556"
+    },
+    "protectedAssetManifest": {
+      "path": "Shared/vr-audit-01-closure-20261115/ASSET_MANIFEST_FINAL.json",
+      "sha256": "D45E84EC6B4DFABEBA45634C0DFF7E141C8CB24D66D4B02D941C8B0AEAAE964A"
+    }
+  }
+}

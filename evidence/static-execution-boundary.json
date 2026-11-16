@@ -1,0 +1,225 @@
+{
+  "schemaVersion": "m1-static-execution-boundary-v1",
+  "contractRevision": 2,
+  "contractSha256": "E04ED3D7BE60E015BA59E60DFDCBADBCED5DB950691E503D4FE7B5C97F711E8C",
+  "contractAddendumSha256": "FCD519C1EA2616453FA400BB7094780B008BDD6F4FE5507F5D184592C85283FD",
+  "ownerApprovalAddendumSha256": "7B1B5FEEF98B3EB0B5E9CA3E277E055A25DC682DC0E4CA26E4FA12C1531E23E6",
+  "packageSha256": "267E25BEAE76966F41C470E6F981FA94B33AAA04DD28B56F5D4A45A29EE7D648",
+  "packageScriptsSha256": "D0840D6D1D52B8DB7F83CD4946EC0E18FDE66439704273090D4A0F72C9C91372",
+  "staticCompilationAllowed": true,
+  "typecheckStaticallyCompilesScripts": true,
+  "legacyEntryExecutions": 0,
+  "legacyRuntimeImports": 0,
+  "envFileReads": 0,
+  "foundationPathSpawnsLegacy": false,
+  "foundationPathImportsLegacy": false,
+  "packageIdentityValidated": true,
+  "packageScriptsValidated": true,
+  "legacyScriptsUnchanged": true,
+  "scannedFoundationSources": [
+    "tests/foundation/architecture-guard.test.mjs",
+    "tests/foundation/consumer-identity.test.mjs",
+    "tests/foundation/evidence.test.mjs",
+    "tests/foundation/feature-map.test.mjs",
+    "tests/foundation/foundation-entry.test.mjs",
+    "tests/foundation/harness.test.mjs",
+    "tests/foundation/s2-delivery.test.mjs",
+    "tools/architecture-guard.mjs",
+    "tools/freeze-evidence.mjs",
+    "tools/lib/architecture-guard.mjs",
+    "tools/lib/consumer-identity.mjs",
+    "tools/lib/env-read-guard.mjs",
+    "tools/lib/evidence-contract.mjs",
+    "tools/lib/feature-map.mjs",
+    "tools/lib/foundation-boundary.mjs",
+    "tools/lib/harness-contract.mjs",
+    "tools/lib/hash.mjs",
+    "tools/lib/s2-delivery.mjs",
+    "tools/verify-foundation.mjs"
+  ],
+  "scanStatus": "PASS",
+  "boundaryErrorCodes": [],
+  "foundationClosureSchema": "m1-foundation-closure-v1",
+  "foundationClosureRoots": [
+    "tests/foundation/architecture-guard.test.mjs",
+    "tests/foundation/consumer-identity.test.mjs",
+    "tests/foundation/evidence.test.mjs",
+    "tests/foundation/feature-map.test.mjs",
+    "tests/foundation/foundation-entry.test.mjs",
+    "tests/foundation/harness.test.mjs",
+    "tests/foundation/s2-delivery.test.mjs",
+    "tools/architecture-guard.mjs",
+    "tools/freeze-evidence.mjs",
+    "tools/lib/architecture-guard.mjs",
+    "tools/lib/consumer-identity.mjs",
+    "tools/lib/env-read-guard.mjs",
+    "tools/lib/evidence-contract.mjs",
+    "tools/lib/feature-map.mjs",
+    "tools/lib/foundation-boundary.mjs",
+    "tools/lib/harness-contract.mjs",
+    "tools/lib/hash.mjs",
+    "tools/lib/s2-delivery.mjs",
+    "tools/verify-foundation.mjs"
+  ],
+  "foundationClosureModules": [
+    {
+      "path": "tests/foundation/architecture-guard.test.mjs",
+      "bytes": 12924,
+      "sha256": "AFEC272721B8F3C721653DD1B489A55317B24C8774ADC09B9B107D6882C07BE1",
+      "role": "test-root"
+    },
+    {
+      "path": "tests/foundation/consumer-identity.test.mjs",
+      "bytes": 4928,
+      "sha256": "D874ABBDD48F13C557F9B64110FF1E6C99881948F3DABA37AC09DA5415FACA19",
+      "role": "test-root"
+    },
+    {
+      "path": "tests/foundation/evidence.test.mjs",
+      "bytes": 8714,
+      "sha256": "3E2859CD4AF2023F372CDD7F1AA9FA0C6F34BAC3DAA58D243845D3AE74B3C4C4",
+      "role": "test-root"
+    },
+    {
+      "path": "tests/foundation/feature-map.test.mjs",
+      "bytes": 3724,
+      "sha256": "6C0CDE48D14F326B5B0840B95F3CE77AAD45CDAC7EFB54AE5516DD4B129688E2",
+      "role": "test-root"
+    },
+    {
+      "path": "tests/foundation/foundation-entry.test.mjs",
+      "bytes": 14434,
+      "sha256": "0458F5F5CDA04E74BD8D34B2E1078AB62EFE15FB6D68717B9F3E8C6560B63921",
+      "role": "test-root"
+    },
+    {
+      "path": "tests/foundation/harness.test.mjs",
+      "bytes": 2651,
+      "sha256": "59064CE422A83DB4A2FA38C52A86E6A24DB32814ABDBFD02F3239852BFB26D2A",
+      "role": "test-root"
+    },
+    {
+      "path": "tests/foundation/s2-delivery.test.mjs",
+      "bytes": 4735,
+      "sha256": "A336F1D7EEFC50EF3E7DEDAB948B0F9E3448390775C98BB4E51B29580CCBC646",
+      "role": "test-root"
+    },
+    {
+      "path": "tools/architecture-guard.mjs",
+      "bytes": 1486,
+      "sha256": "98E4156B15C892993C4744A149A28D09897D57FD26F69589596DD7471CCFF6BE",
+      "role": "tool-root"
+    },
+    {
+      "path": "tools/freeze-evidence.mjs",
+      "bytes": 13979,
+      "sha256": "28750F907FD8A2BCCBD7EB87C4A322464D10AE92167809FEA30EF2A1105F0341",
+      "role": "tool-root"
+    },
+    {
+      "path": "tools/lib/architecture-guard.mjs",
+      "bytes": 32810,
+      "sha256": "28ED07B6731A779BB855C9242A6EB8E2EB0CCF8FA35A8B0317BB09A6A955756B",
+      "role": "tool-root"
+    },
+    {
+      "path": "tools/lib/consumer-identity.mjs",
+      "bytes": 3378,
+      "sha256": "17AB476B4EAFE002FF369BD0F2EB8B59EF17AFB489A4C7E2744746BE3C6C23C2",
+      "role": "tool-root"
+    },
+    {
+      "path": "tools/lib/env-read-guard.mjs",
+      "bytes": 4211,
+      "sha256": "C9F15D166002531BD0681E0F276E789FE9F00EE3B1CC1AD66762B42425CDD41E",
+      "role": "tool-root"
+    },
+    {
+      "path": "tools/lib/evidence-contract.mjs",
+      "bytes": 19729,
+      "sha256": "E33A906C0E2CC980236D27E0B43BC8A0D6CB8F7B32955187A8E3E9A6EDC68E42",
+      "role": "tool-root"
+    },
+    {
+      "path": "tools/lib/feature-map.mjs",
+      "bytes": 8412,
+      "sha256": "7A833E91006AC486A35593F47950812BCF3EC79C2F394B44C4F2ED38EAA0F02F",
+      "role": "tool-root"
+    },
+    {
+      "path": "tools/lib/foundation-boundary.mjs",
+      "bytes": 20132,
+      "sha256": "A858E537C9ACFCB93D817C921A683952C11D018E9F20DD6092D12C67CD6F03E7",
+      "role": "tool-root"
+    },
+    {
+      "path": "tools/lib/harness-contract.mjs",
+      "bytes": 3105,
+      "sha256": "9E204A413B8559D61645152E0560BF3830F23D3CC2BBCD1C7C188EA56078F13F",
+      "role": "tool-root"
+    },
+    {
+      "path": "tools/lib/hash.mjs",
+      "bytes": 528,
+      "sha256": "0A460DEF7D9BA596F52A8EF9DE115A9FBCFE8041CD5AB2366EFA1EC08B833653",
+      "role": "tool-root"
+    },
+    {
+      "path": "tools/lib/s2-delivery.mjs",
+      "bytes": 4578,
+      "sha256": "2322461FDB562C52B0DF350DD069AAD52C787122B650A11EEE753B1EDA93E515",
+      "role": "tool-root"
+    },
+    {
+      "path": "tools/verify-foundation.mjs",
+      "bytes": 8688,
+      "sha256": "45C2FB80F569E8D84AB8E406414E4B95CE20A60CCBC0145034BF72DBE71AED7D",
+      "role": "tool-root"
+    }
+  ],
+  "foundationClosurePaths": [
+    "tests/foundation/architecture-guard.test.mjs",
+    "tests/foundation/consumer-identity.test.mjs",
+    "tests/foundation/evidence.test.mjs",
+    "tests/foundation/feature-map.test.mjs",
+    "tests/foundation/foundation-entry.test.mjs",
+    "tests/foundation/harness.test.mjs",
+    "tests/foundation/s2-delivery.test.mjs",
+    "tools/architecture-guard.mjs",
+    "tools/freeze-evidence.mjs",
+    "tools/lib/architecture-guard.mjs",
+    "tools/lib/consumer-identity.mjs",
+    "tools/lib/env-read-guard.mjs",
+    "tools/lib/evidence-contract.mjs",
+    "tools/lib/feature-map.mjs",
+    "tools/lib/foundation-boundary.mjs",
+    "tools/lib/harness-contract.mjs",
+    "tools/lib/hash.mjs",
+    "tools/lib/s2-delivery.mjs",
+    "tools/verify-foundation.mjs"
+  ],
+  "foundationClosureSha256": "D753E57D346851F4CF63D6F84C22EBF4BC9B2F6AA174993C08DDF88696A4DB74",
+  "executedFoundationTests": [
+    "tests/foundation/architecture-guard.test.mjs",
+    "tests/foundation/consumer-identity.test.mjs",
+    "tests/foundation/evidence.test.mjs",
+    "tests/foundation/feature-map.test.mjs",
+    "tests/foundation/foundation-entry.test.mjs",
+    "tests/foundation/harness.test.mjs",
+    "tests/foundation/s2-delivery.test.mjs"
+  ],
+  "foundationTestCounts": {
+    "tests/foundation/architecture-guard.test.mjs": 20,
+    "tests/foundation/consumer-identity.test.mjs": 11,
+    "tests/foundation/evidence.test.mjs": 11,
+    "tests/foundation/feature-map.test.mjs": 10,
+    "tests/foundation/foundation-entry.test.mjs": 19,
+    "tests/foundation/harness.test.mjs": 6,
+    "tests/foundation/s2-delivery.test.mjs": 11
+  },
+  "foundationTestExecution": "PER_FILE_TAP_EXACT_COUNTS_NO_FAIL_SKIP_TODO",
+  "envReadPreflight": "FAIL_CLOSED_BEFORE_PACKAGE_AND_CLOSURE",
+  "envReadPreload": "tools/lib/env-read-guard.mjs",
+  "foundationCoverage": "PASS",
+  "evidenceSource": "complete local import closure, AST behavior scan, package byte identity and script allowlist"
+}
