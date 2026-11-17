@@ -19,6 +19,18 @@ create product runtime behavior.
 
 Do not infer an active task from chat, memory, branch names or old reports.
 
+## Voice Room workflow
+
+Before a Voice Room status report, handoff, substantive technical investigation,
+fix, feature, refactor, or verification review, read
+[`.agents/skills/voice-room-pstack/SKILL.md`](.agents/skills/voice-room-pstack/SKILL.md).
+Plain-language requests are sufficient. When the user names a pstack skill, use
+that skill for the task and read the entry for the project constraints.
+Quick lookups and unrelated questions can skip the entry.
+
+pstack supplies working methods. The active Harness contract still governs
+allowed paths, checks, evidence, and acceptance.
+
 ## Roles and separation
 
 - **Developer** implements, runs self-checks and freezes a candidate.
