@@ -4,48 +4,71 @@
 
 <!-- CANONICAL_STATE:BEGIN -->
 
-- Phase: `M2 - Runtime Migration, first capability`
-- Task: `VR-PRODUCT-TAKEOVER-01 / M2-SINGLE-MENTION`
-- Status: `ACCEPTED`
-- Owner opened the formal M2 authorization node in chat on
-  `2026-11-16 Asia/Shanghai`; the exact frozen candidate was accepted for the
-  offline single-`@` capability on `2026-11-17 Asia/Shanghai`; complete runtime
-  migration, deployment and production cutover remain separately gated.
-- M1 predecessor: candidate
-  `CC7205DF8B0B1C390D5E14A144C89088544508E9390280B6F019876F0B2EDC19`
-  accepted; closeout Review `PASS 0/0/0`, report SHA256
-  `45286C8DFD8EA207A9F2DEB2659EBDB467FD589231ED634412074A96257D2636`.
-- Baseline: HEAD `ec8db7ba6991e4ef61efc949eec6c48968b6ff49`, accepted M1
-  worktree snapshot `8d77ac22b37f4f7a330abe63eb72da9e7149e811`.
-- M2 candidate: patch
-  `C8588590837A03F30EF04AD86E5D78EC87D71D5ABCCCA1BC605FE2E73BDD3F1F`,
-  `13482` bytes, prospective tree
-  `d48a7d09fe3c1f8128515859f3a960b3b639c60f`; the acceptance record is
-  `.harness/M2_SINGLE_MENTION.md`.
+- Phase: `M3 - Ambient Participation`
+- Task: `VR-PRODUCT-TAKEOVER-01 / M3-AMBIENT-PARTICIPATION`
+- Status: `CANDIDATE_REVISED_PENDING_QA`
+- M2 predecessor:
+  `C8588590837A03F30EF04AD86E5D78EC87D71D5ABCCCA1BC605FE2E73BDD3F1F`
+  remains accepted only for the recorded offline single-`@` capability.
+- Baseline: Q HEAD `82399bc3327e8e86925b0fc2cd79e249fc7417f5`, tree
+  `6b0b736c34dbc370af89c22332bb0dab2d4ff8d5`.
 - Active contract:
-  `Shared/vr-product-takeover-01-m2-single-mention-20261116/M2_SINGLE_MENTION_CONTRACT.md`
-  SHA256 `2B4F80CD2395DCC7CBD643FE62D0C33F802F0018C94B8A6234B11EB53F3D29D3`.
-- M2 scope: add one permanent repository test for the offline single-`@`
-  vertical slice through the real parser, checked configuration, lifecycle
-  admission, temporary SQLite, generation worker, target binding and one
-  injected text dispatch.
-- Read-only: all existing `src/**`, `scripts/**`, package and lock files,
-  `tsconfig.json`, `.gitignore`, the accepted M1 candidate and its evidence.
-- M2-SM-01 through M2-SM-07 are implemented in the permanent lifecycle
-  test; independent QA and independent Review both report `PASS 0/0/0` for the
-  exact frozen candidate. This is acceptance of the offline single-`@`
-  capability only; it is not complete runtime migration, deployment or
-  cutover acceptance.
-- Candidate identity, command records and raw-log hashes are recorded in
-  `Shared/vr-product-takeover-01-m2-single-mention-20261116/developer/SELF_CHECK.md`.
-- The M1 foundation freeze tool remains evidence for the accepted M1 snapshot;
-  it is not an M2 authority after the active Harness task changes.
+  `Shared/vr-product-takeover-01-m3-ambient-20261118/M3_AMBIENT_CONTRACT.md`
+  SHA256 `D51EB20316A23565FE9A21C99292E2EC2FF5D08AB257039E2E22D64781D6167A`.
+- Contract Addendum R1:
+  `Shared/vr-product-takeover-01-m3-ambient-20261118/M3_AMBIENT_CONTRACT_ADDENDUM_R1.md`
+  SHA256 `6A8E7E3807AB5CA71436F8613353DDA06F6B438247079439FCA1F55A1537BB93`;
+  it authorizes the qq-server production assembly and corrects the Q worktree
+  baseline statement without changing the original contract.
+- M3 scope: one clean-room Ambient planner seam in the existing lifecycle,
+  strict public/bounded input, exact five-minute initiation threshold,
+  pre-call model budget charge, transactional paused admission, paused claims
+  and schema-9 cursor persistence.
+- Candidate paths (8): `src/voice-room/participation-planner.ts`,
+  `src/voice-room/qq-server.ts`, `src/voice-room/runtime.ts`,
+  `src/voice-room/store.ts`, `tests/voice-room-request-lifecycle.test.ts`,
+  `.harness/CURRENT_TASK.md`, `.harness/PROJECT_STATE.md`,
+  `evidence/architecture-baseline.json` (r4-authorized content; r5 baseline
+  identity refresh pending).
+- Read-only: all other `src/**`, `scripts/**`, package and lock files,
+  `tsconfig.json`, `.gitignore`, and existing evidence, including
+  `evidence/architecture-baseline.json`.
+- Review `M3-AMBIENT-CLEANROOM-REVIEW-20261119`: FAIL `0/2/4`; P1-2, P2-3
+  and P2-4 were revised, and P1-1 production wiring is now included under
+  Addendum R1.
+- r4 independent Review: FAIL `0/1/3`. The only code defect,
+  P1-R4-COOLDOWN-BYPASS, is fixed by advancing the single authoritative
+  ambient attempt timestamp before every real planner call. Skip, join,
+  initiate, throw, timeout and invalid output all share that path.
+- Architecture: r2 Option A covered the r4 bytes. r5 changes runtime/store
+  bytes; the planner remains `LEGACY_UNLAYERED_DEBT`. A new exact-candidate
+  identity authorization is pending; guard exit `1` with exactly two
+  `ARCH-BASELINE-CHANGED` violations for runtime/store is expected.
+  `evidence/architecture-baseline.json` remains the r2-authorized content and
+  is not edited.
+- The candidate remains pending independent QA and Review. No PASS is claimed,
+  and M2/earlier PASS results do not transfer.
+- Clean-room access record:
+  `P_SOURCE_ACCESS=NONE; P_METADATA_REFERENCE_DISCLOSED`.
 - Product runtime, live QQ/NapCat, model, TTS, production database, `.env`,
   `3011`, deployment and cutover remain not executed and not authorized.
-- P's uncommitted Ambient additions remain
-  `ORIGIN_UNRESOLVED_UNASSIGNED_WIP` and are not part of M2.
+- Handoff path:
+  `Shared/vr-product-takeover-01-m3-ambient-20261118/cleanroom/**`.
 
 <!-- CANONICAL_STATE:END -->
+
+## Accepted M2 Canonical State
+
+This section is historical; it is not the current phase.
+
+- Task: `VR-PRODUCT-TAKEOVER-01 / M2-SINGLE-MENTION`
+- Status: `ACCEPTED` for the offline single-`@` capability only.
+- Candidate patch SHA256
+  `C8588590837A03F30EF04AD86E5D78EC87D71D5ABCCCA1BC605FE2E73BDD3F1F`,
+  `13482` bytes, prospective tree
+  `d48a7d09fe3c1f8128515859f3a960b3b639c60f`.
+- Acceptance record: `.harness/M2_SINGLE_MENTION.md`. Its independent
+  QA/Review results bind only that exact accepted candidate.
 
 ## Accepted M1 Canonical State
 

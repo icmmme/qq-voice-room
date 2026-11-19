@@ -9,6 +9,7 @@ import { qqMessageId } from "../qq-message.js";
 import type { WorkerObligation, WorkerTurnBinding, RoomGatePermit } from "./types.js";
 import type { RoomControlResult, RoomCharacter, RoomDelivery, RoomDeliveryMode, RoomInput, RoomMessage, RoomParticipationMode, ResolvedDeliveryMode, Trigger, TurnState } from "./types.js";
 import { sanitizeWorkerContextBudgetDiagnostic } from "./context.js";
+import type { AmbientCursor, AmbientPlannerCursorOutcome } from "./participation-planner.js";
 
 interface State { paused: number; epoch: number; voice: number; next_index: number; ambient_at: number | null; delivery_mode: RoomDeliveryMode | null; next_accept_seq: number; mode: RoomParticipationMode; lifecycle_mode: "mention_only" | "ambient"; execution_revision: number; session_expires_at: number | null }
 const ACTIVE = "'generating','translating','text_sending','text_sent','synthesizing','audio_sending'";
@@ -132,10 +133,11 @@ export interface LifecycleAdmission {
   readonly kind: "enqueue" | "record_only" | "reject" | "duplicate";
   readonly request: LifecycleRequest | null;
   readonly reason: string | null;
+  readonly messageRowId?: number;
 }
 export interface LifecycleControlState {
   readonly mode: "mention_only" | "ambient";
-  readonly paused: false;
+  readonly paused: boolean;
   readonly epoch: number;
   readonly executionRevision: number;
   readonly sessionExpiresAt: null;
@@ -187,6 +189,14 @@ export interface LifecycleAcceptOptions {
   enqueue: boolean;
   deliveryMode: LifecycleDeliveryMode;
 }
+export interface AmbientAcceptOptions {
+  now: number;
+  expectedEpoch: number;
+  ownerToken: string;
+  policy: RoomQueuePolicy;
+  deliveryMode: LifecycleDeliveryMode;
+  eventKey: string;
+}
 type AcceptOptions = { now: number; expectedEpoch: number; source: Trigger } & (
   | { mode: "enqueue"; policy: RoomQueuePolicy }
   | { mode: "record_only" }
@@ -234,6 +244,7 @@ export class RoomStore {
   private nonBlockingDeliveryWrites = false;
   private readonly actorKey: string;
   private ownsWorkerLock = false;
+  private lifecyclePauseListener?: (paused: boolean) => void;
   constructor(file: string, readonly config: CheckedRoomConfig,
     options: { lifecycle?: "runtime" | "connection" } = {}) {
     if (basename(file) !== "room.sqlite") throw new Error("room-store-path-invalid");
@@ -1499,7 +1510,7 @@ export class RoomStore {
   lifecycleControlState(): LifecycleControlState {
     const s = this.state();
     if (s.lifecycle_mode !== "mention_only" && s.lifecycle_mode !== "ambient") throw new Error("room-lifecycle-mode-invalid");
-    return Object.freeze({ mode: s.lifecycle_mode, paused: false, epoch: s.epoch,
+    return Object.freeze({ mode: s.lifecycle_mode, paused: Boolean(s.paused), epoch: s.epoch,
       executionRevision: s.execution_revision, sessionExpiresAt: null });
   }
   /** Process startup only: invalidate old active work, then choose mention_only and a fenced owner lease. */
@@ -1575,6 +1586,10 @@ export class RoomStore {
       }
       if (options.bumpRevision) sets.push("execution_revision=execution_revision+1");
       if (sets.length) this.db.prepare(`UPDATE room_state SET ${sets.join(",")} WHERE id=1`).run(...values);
+      if (options.bumpRevision) {
+        this.db.prepare(`UPDATE room_lifecycle_owner SET execution_revision=
+          (SELECT execution_revision FROM room_state WHERE id=1) WHERE id=1`).run();
+      }
       const state = this.controlState();
       const localResult: RoomControlResult | undefined = options.outcome && checkedRoomControlResult({
         ...options.outcome, ...state, cancelledQueued,
@@ -1842,7 +1857,10 @@ export class RoomStore {
       this.assertLifecycleOwner(options.ownerToken, options.now);
       const eventKey = this.eventKey(input);
       const existing = this.db.prepare("SELECT * FROM room_lifecycle_requests WHERE event_key=?").get(eventKey);
-      if (existing) return { kind: "duplicate", request: this.lifecycleRequest(existing as Record<string, unknown>), reason: "duplicate" } as const;
+      if (existing) {
+        const request = this.lifecycleRequest(existing as Record<string, unknown>);
+        return { kind: "duplicate", request, reason: "duplicate", messageRowId: request.messageRowId } as const;
+      }
       if (this.seenEvent(eventKey)) return { kind: "duplicate", request: null, reason: "legacy_seen" } as const;
       this.assertEpoch(options.expectedEpoch);
       if (!this.rememberInput(input, options.now)) throw new Error("room-lifecycle-dedup-conflict");
@@ -1851,9 +1869,9 @@ export class RoomStore {
       }))];
       if (!options.enqueue || !characterIds.length) {
         const reply = input.replyToMessageId === undefined ? undefined : this.replyTarget(input.accountKey, input.replyToMessageId);
-        this.appendUser(input, options.now, reply?.id ?? null);
+        const messageRowId = this.appendUser(input, options.now, reply?.id ?? null);
         return { kind: options.enqueue ? "reject" : "record_only", request: null,
-          reason: options.enqueue ? "no_real_mention" : "record_only" } as const;
+          reason: options.enqueue ? "no_real_mention" : "record_only", messageRowId } as const;
       }
       if (options.source === "direct") this.cancelLifecycleRequests("ambient", "user_request_priority", options.now);
       const reply = input.replyToMessageId === undefined ? undefined : this.replyTarget(input.accountKey, input.replyToMessageId);
@@ -1862,7 +1880,7 @@ export class RoomStore {
       const messageRowId = this.appendUser(input, options.now, reply?.id ?? null);
       const active = this.db.prepare("SELECT count(*) AS n FROM room_lifecycle_requests WHERE status IN ('queued','generating','delivering')").get() as { n: number };
       if (Number(active.n) >= options.policy.capacity) {
-        return { kind: "reject", request: null, reason: "queue_full" } as const;
+        return { kind: "reject", request: null, reason: "queue_full", messageRowId } as const;
       }
       // Member limits are abuse controls, never a participation quota. The
       // attempt is recorded even when it is rejected.
@@ -1872,7 +1890,7 @@ export class RoomStore {
           WHERE speaker_type='user' AND speaker_id=? AND created_at>?`)
           .get(memberKey, options.now - options.policy.memberWindowMs)!.n);
         if (recent >= options.policy.memberLimit) {
-          return { kind: "reject", request: null, reason: "member_rate_limited" } as const;
+          return { kind: "reject", request: null, reason: "member_rate_limited", messageRowId } as const;
         }
       }
       const sequence = this.state().next_accept_seq;
@@ -1895,7 +1913,104 @@ export class RoomStore {
           (turn_id,request_id,character_id,mention_index,status,reason,created_at,updated_at)
           VALUES (?,?,?,?,'pending',NULL,?,?)`).run(randomUUID(), requestId, characterId, index, options.now, options.now);
       }
-      return { kind: "enqueue", request: this.lifecycleRequestById(requestId), reason: null } as const;
+      return { kind: "enqueue", request: this.lifecycleRequestById(requestId), reason: null, messageRowId } as const;
+    });
+  }
+  /**
+   * Admit a planner-selected ambient request against an existing public human
+   * row. The pause read is repeated inside this transaction immediately before
+   * the first insert, so a direct paused-state transition cannot slip between
+   * the planner and admission.
+   */
+  acceptAmbientLifecycle(anchorRowId: number, rawCharacterIds: readonly string[],
+    options: AmbientAcceptOptions): LifecycleAdmission {
+    if (!Number.isSafeInteger(anchorRowId) || anchorRowId <= 0 || !Array.isArray(rawCharacterIds)
+      || rawCharacterIds.length < 1 || rawCharacterIds.length > 2
+      || rawCharacterIds.some(id => typeof id !== "string")
+      || new Set(rawCharacterIds).size !== rawCharacterIds.length
+      || !timestamp(options.now) || !timestamp(options.expectedEpoch)
+      || typeof options.ownerToken !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(options.ownerToken)
+      || !["text", "both"].includes(options.deliveryMode)
+      || typeof options.eventKey !== "string" || !/^[0-9a-f]{64}$/.test(options.eventKey)
+      || !Number.isSafeInteger(options.policy.capacity) || options.policy.capacity <= 0
+      || !Number.isSafeInteger(options.policy.ttlMs) || options.policy.ttlMs <= 0
+      || !timestamp(options.now + options.policy.ttlMs)) {
+      throw new Error("room-ambient-admission-invalid");
+    }
+    return this.transaction(() => {
+      this.assertLifecycleOwner(options.ownerToken, options.now);
+      this.assertEpoch(options.expectedEpoch);
+      const state = this.state();
+      if (state.paused) {
+        return { kind: "reject", request: null, reason: "paused", messageRowId: anchorRowId } as const;
+      }
+      if (state.lifecycle_mode !== "ambient") {
+        return { kind: "reject", request: null, reason: "mode", messageRowId: anchorRowId } as const;
+      }
+      const existing = this.db.prepare("SELECT * FROM room_lifecycle_requests WHERE event_key=?").get(options.eventKey);
+      if (existing) {
+        const request = this.lifecycleRequest(existing as Record<string, unknown>);
+        return { kind: "duplicate", request, reason: "duplicate", messageRowId: request.messageRowId } as const;
+      }
+      const anchor = this.db.prepare(`SELECT id,speaker_type AS speakerType,speaker_id AS speakerId,
+        account_key AS accountKey,text,platform_id AS platformId,target_id AS targetId,created_at AS createdAt
+        FROM room_messages WHERE id=?`).get(anchorRowId) as {
+          id: number; speakerType: string; speakerId: string; accountKey: string; text: string;
+          platformId: string; targetId: number | null; createdAt: number;
+        } | undefined;
+      if (!anchor || anchor.speakerType !== "user"
+        || !/^member-[0-9a-f]{16}$/.test(anchor.speakerId)) {
+        return { kind: "reject", request: null, reason: "anchor", messageRowId: anchorRowId } as const;
+      }
+      const latestHuman = this.db.prepare(`SELECT id FROM room_messages
+        WHERE speaker_type='user' ORDER BY id DESC LIMIT 1`).get() as { id: number } | undefined;
+      if (!latestHuman || Number(latestHuman.id) !== anchorRowId) {
+        return { kind: "reject", request: null, reason: "stale_anchor", messageRowId: anchorRowId } as const;
+      }
+      const requested = new Set(rawCharacterIds);
+      const characterIds = this.config.characters.filter(character => requested.has(character.id))
+        .map(character => character.id);
+      if (characterIds.length !== rawCharacterIds.length) {
+        return { kind: "reject", request: null, reason: "character", messageRowId: anchorRowId } as const;
+      }
+      const active = this.db.prepare(`SELECT count(*) AS n FROM room_lifecycle_requests
+        WHERE status IN ('queued','generating','delivering')`).get() as { n: number };
+      if (Number(active.n) >= options.policy.capacity || Number(active.n) > 0) {
+        return { kind: "reject", request: null, reason: "busy", messageRowId: anchorRowId } as const;
+      }
+      // Re-read the authority after all validation and immediately before insert.
+      if (this.state().paused) {
+        return { kind: "reject", request: null, reason: "paused", messageRowId: anchorRowId } as const;
+      }
+      const sequence = this.state().next_accept_seq;
+      if (!timestamp(sequence + 1)) throw new Error("room-accept-sequence-overflow");
+      this.db.prepare("UPDATE room_state SET next_accept_seq=? WHERE id=1").run(sequence + 1);
+      const selfId = this.config.characters.find(character => character.accountKey === anchor.accountKey)?.selfId
+        ?? this.config.characters.find(character => character.accountKey === this.config.ingressAccountKey)!.selfId;
+      const input: Omit<RoomInput, "senderId" | "unsupported"> = {
+        accountKey: anchor.accountKey,
+        selfId,
+        groupId: this.config.groupId,
+        messageId: anchor.platformId,
+        text: anchor.text,
+        mentions: [],
+      };
+      const payload = JSON.stringify({ input, characterIds, messageRowId: anchorRowId, senderKey: anchor.speakerId });
+      const requestId = randomUUID();
+      this.db.prepare(`INSERT INTO room_lifecycle_requests
+        (request_id,event_key,accept_seq,status,outcome_reason,source,execution_epoch,execution_revision,expires_at,message_row_id,delivery_mode,payload_json,created_at,updated_at)
+        VALUES (?,?,?,'queued',NULL,'ambient',?,?,?,?,?,?,?,?)`).run(requestId, options.eventKey,
+        sequence + 1, options.expectedEpoch, this.state().execution_revision, options.now + options.policy.ttlMs,
+        anchorRowId, options.deliveryMode, payload, options.now, options.now);
+      for (let index = 0; index < characterIds.length; index++) {
+        this.db.prepare(`INSERT INTO room_lifecycle_turns
+          (turn_id,request_id,character_id,mention_index,status,reason,created_at,updated_at)
+          VALUES (?,?,?,?,'pending',NULL,?,?)`).run(randomUUID(), requestId, characterIds[index]!, index,
+          options.now, options.now);
+      }
+      this.ambientAttempt(options.now);
+      return { kind: "enqueue", request: this.lifecycleRequestById(requestId), reason: null,
+        messageRowId: anchorRowId } as const;
     });
   }
   claimLifecycleGenerations(limit: number, ownerToken: string, expectedEpoch: number, now: number): readonly LifecycleGenerationClaim[] {
@@ -1903,6 +2018,7 @@ export class RoomStore {
     return this.transaction(() => {
       this.assertLifecycleOwner(ownerToken, now);
       this.assertEpoch(expectedEpoch);
+      if (this.state().paused) return Object.freeze([] as LifecycleGenerationClaim[]);
       this.expireLifecycleRequests(now);
       const rows = this.db.prepare(`SELECT t.turn_id,t.request_id,t.character_id,t.mention_index,t.status,t.reason
         FROM room_lifecycle_turns t JOIN room_lifecycle_requests r ON r.request_id=t.request_id
@@ -1913,8 +2029,11 @@ export class RoomStore {
         const turnId = String(row.turn_id), requestId = String(row.request_id);
         if (this.db.prepare("UPDATE room_lifecycle_turns SET status='generating',updated_at=? WHERE turn_id=? AND status='pending'")
           .run(now, turnId).changes !== 1) continue;
-        this.db.prepare("UPDATE room_lifecycle_requests SET status='generating',updated_at=? WHERE request_id=? AND status IN ('queued','generating')")
-          .run(now, requestId);
+        // Re-stamp at claim time: a pause advances the fence, and the next
+        // claim after resume makes this pending work live under the new revision.
+        this.db.prepare(`UPDATE room_lifecycle_requests SET status='generating',
+          execution_revision=?,updated_at=? WHERE request_id=? AND status IN ('queued','generating')`)
+          .run(this.state().execution_revision, now, requestId);
         const request = this.lifecycleRequestById(requestId);
         const turn = this.lifecycleTurns(requestId).find(item => item.turnId === turnId);
         const character = this.config.characters.find(item => item.id === String(row.character_id));
@@ -1922,6 +2041,30 @@ export class RoomStore {
         claimed.push(Object.freeze({ request, turn, character }));
       }
       return claimed;
+    });
+  }
+  /** Return one in-flight generation to pending after a pause/revision fence. */
+  releaseLifecycleGeneration(turnId: string, ownerToken: string, now: number): void {
+    if (typeof turnId !== "string" || !/^[0-9a-f-]{36}$/.test(turnId) || !timestamp(now)) {
+      throw new Error("room-lifecycle-release-invalid");
+    }
+    this.transaction(() => {
+      this.assertLifecycleOwner(ownerToken, now);
+      this.db.prepare(`UPDATE room_lifecycle_turns SET status='pending',reason=NULL,updated_at=?
+        WHERE turn_id=? AND status='generating'
+        AND request_id IN (SELECT request_id FROM room_lifecycle_requests
+          WHERE status IN ('queued','generating'))`).run(now, turnId);
+    });
+  }
+  /** Pause fence: all claimed-but-unfinished generations wait for resume. */
+  suspendLifecycleGenerations(ownerToken: string, now: number): number {
+    if (!timestamp(now)) throw new Error("room-lifecycle-release-invalid");
+    return this.transaction(() => {
+      this.assertLifecycleOwner(ownerToken, now);
+      return Number(this.db.prepare(`UPDATE room_lifecycle_turns SET status='pending',reason=NULL,updated_at=?
+        WHERE status='generating'
+        AND request_id IN (SELECT request_id FROM room_lifecycle_requests
+          WHERE status IN ('queued','generating'))`).run(now).changes);
     });
   }
   completeLifecycleTurn(turnId: string, segments: readonly { text: string; voiceText?: string; voiceLanguage?: "zh" | "ja" }[],
@@ -2004,6 +2147,7 @@ export class RoomStore {
   claimLifecycleDelivery(requestId: string, ownerToken: string, now: number): boolean {
     return this.transaction(() => {
       this.assertLifecycleOwner(ownerToken, now);
+      if (this.state().paused) return false;
       this.expireLifecycleRequests(now);
       const request = this.lifecycleRequestById(requestId);
       if (!request || !["queued","generating","delivering"].includes(request.status)) return false;
@@ -2012,8 +2156,9 @@ export class RoomStore {
       const turns = this.lifecycleTurns(requestId);
       if (turns.some(t => t.status === "pending" || t.status === "generating")) return false;
       if (!turns.some(t => t.status === "ready" || t.status === "delivering")) return false;
-      if (this.db.prepare("UPDATE room_lifecycle_requests SET status='delivering',updated_at=? WHERE request_id=? AND status IN ('queued','generating','delivering')")
-        .run(now, requestId).changes !== 1) return false;
+      if (this.db.prepare(`UPDATE room_lifecycle_requests SET status='delivering',
+        execution_revision=?,updated_at=? WHERE request_id=? AND status IN ('queued','generating','delivering')`)
+        .run(this.state().execution_revision, now, requestId).changes !== 1) return false;
       this.db.prepare("UPDATE room_lifecycle_turns SET status='delivering',updated_at=? WHERE request_id=? AND status='ready'")
         .run(now, requestId);
       this.lifecycleSettleRequest(requestId, now);
@@ -2489,7 +2634,31 @@ export class RoomStore {
     // fence that close/recovery must not erase.
     return Boolean(this.lifecycleAudioFence());
   }
-  setPaused(paused: boolean) { this.db.prepare("UPDATE room_state SET paused=? WHERE id=1").run(Number(paused)); }
+  setLifecyclePauseListener(listener: ((paused: boolean) => void) | undefined): void {
+    this.lifecyclePauseListener = listener;
+  }
+  /**
+   * Pausing is a lifecycle fence: it advances execution_revision so in-flight
+   * generation/delivery controllers fail their revision checks. Resuming does
+   * not advance it, so admitted work can be re-stamped by the next claim.
+   */
+  setPaused(paused: boolean): void {
+    const changed = this.transaction(() => {
+      if (Boolean(this.state().paused) === paused) return false;
+      if (paused) {
+        this.db.prepare("UPDATE room_state SET paused=1,execution_revision=execution_revision+1 WHERE id=1").run();
+        this.db.prepare(`UPDATE room_lifecycle_owner SET execution_revision=
+          (SELECT execution_revision FROM room_state WHERE id=1) WHERE id=1`).run();
+      } else {
+        this.db.prepare("UPDATE room_state SET paused=0 WHERE id=1").run();
+      }
+      return true;
+    });
+    if (changed) {
+      try { this.lifecyclePauseListener?.(paused); }
+      catch { /* The committed fence stands even if the runtime notification fails. */ }
+    }
+  }
   deliveryMode(): RoomDeliveryMode { const s = this.state(); return s.delivery_mode ?? (s.voice ? "both" : "text"); }
   setDeliveryMode(mode: RoomDeliveryMode) {
     this.db.prepare("UPDATE room_state SET delivery_mode=?,voice=? WHERE id=1").run(mode, Number(mode !== "text"));
@@ -2616,7 +2785,10 @@ export class RoomStore {
     this.db.prepare("UPDATE room_state SET next_index=next_index+1").run();
     return c;
   }
-  ambientAttempt(now: number) { this.db.prepare("UPDATE room_state SET ambient_at=?").run(now); }
+  ambientAttempt(now: number): void {
+    if (!timestamp(now)) throw new Error("room-ambient-attempt-invalid");
+    this.db.prepare("UPDATE room_state SET ambient_at=? WHERE id=1").run(now);
+  }
   canSpend(kind: "model" | "tts" | "send", now: number): boolean {
     const window = kind === "send" ? 60000 : 3600000;
     const limit = kind === "model" ? this.config.limits.modelAttemptsPerHour : kind === "tts"
@@ -2683,6 +2855,38 @@ export class RoomStore {
     const count = (kind: string) => (this.db.prepare("SELECT count(*) AS n FROM room_budget WHERE kind=?").get(kind) as { n: number }).n;
     return { model: count("model"), tts: count("tts"), send: count("send"),
       messages: (this.db.prepare("SELECT count(*) AS n FROM room_messages").get() as { n: number }).n };
+  }
+  ambientCursor(): AmbientCursor | null {
+    const row = this.db.prepare("SELECT value FROM room_meta WHERE key='ambient_cursor_v1'").get() as { value: string } | undefined;
+    if (!row) return null;
+    try {
+      const parsed = JSON.parse(row.value) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+        || Object.keys(parsed).sort().join(",") !== "contextKey,outcome,updatedAt"
+        || typeof parsed.contextKey !== "string" || !/^[0-9a-f]{64}$/.test(parsed.contextKey)
+        || !["skip","join","initiate","technical_defer"].includes(String(parsed.outcome))
+        || !Number.isSafeInteger(parsed.updatedAt) || Number(parsed.updatedAt) < 0) {
+        throw new Error("room-ambient-cursor-invalid");
+      }
+      return Object.freeze({ contextKey: parsed.contextKey,
+        outcome: parsed.outcome as AmbientPlannerCursorOutcome, updatedAt: Number(parsed.updatedAt) });
+    } catch { throw new Error("room-ambient-cursor-invalid"); }
+  }
+  recordAmbientCursor(contextKey: string, outcome: AmbientPlannerCursorOutcome, now: number): void {
+    if (typeof contextKey !== "string" || !/^[0-9a-f]{64}$/.test(contextKey)
+      || !["skip","join","initiate","technical_defer"].includes(outcome) || !timestamp(now)) {
+      throw new Error("room-ambient-cursor-invalid");
+    }
+    this.transaction(() => {
+      const value = JSON.stringify({ contextKey, outcome, updatedAt: now });
+      this.db.prepare("INSERT OR REPLACE INTO room_meta(key,value) VALUES ('ambient_cursor_v1',?)").run(value);
+      if (this.db.prepare("SELECT value FROM room_meta WHERE key='ambient_cursor_v1'").get()?.value !== value) {
+        throw new Error("room-ambient-cursor-invalid");
+      }
+    });
+  }
+  schemaVersion(): number {
+    return Number((this.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
   }
   close() {
     if (this.closed) return;

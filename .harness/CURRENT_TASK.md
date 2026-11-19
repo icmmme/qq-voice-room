@@ -4,63 +4,84 @@
 
 <!-- ACTIVE_TASK:BEGIN -->
 
-- Task: `VR-PRODUCT-TAKEOVER-01 / M2-SINGLE-MENTION`
-- Contract revision: `1`
-- Status: `ACCEPTED`
+- Task: `VR-PRODUCT-TAKEOVER-01 / M3-AMBIENT-PARTICIPATION`
+- Contract revision: `1 + Addendum R1`
+- Status: `CANDIDATE_REVISED_PENDING_QA`
 - Author of self-check: Developer
 - Self-check label: `SELF_CHECK - not independent Review`
 - Contract:
-  `Shared/vr-product-takeover-01-m2-single-mention-20261116/M2_SINGLE_MENTION_CONTRACT.md`
+  `Shared/vr-product-takeover-01-m3-ambient-20261118/M3_AMBIENT_CONTRACT.md`
 - Contract SHA256:
-  `2B4F80CD2395DCC7CBD643FE62D0C33F802F0018C94B8A6234B11EB53F3D29D3`
-- Owner authorization: formal M2 opening accepted in chat on
-  `2026-11-16 Asia/Shanghai`; production cutover is not authorized.
-- Owner decision: accepted the offline single-`@` capability on
-  `2026-11-17 Asia/Shanghai`; this acceptance does not include the complete
-  runtime migration, deployment or cutover.
-- Baseline HEAD: `ec8db7ba6991e4ef61efc949eec6c48968b6ff49`
-- Accepted M1 worktree snapshot:
-  `8d77ac22b37f4f7a330abe63eb72da9e7149e811`
-- Accepted M1 candidate:
-  `CC7205DF8B0B1C390D5E14A144C89088544508E9390280B6F019876F0B2EDC19`
-- M1 closeout Review:
-  `Shared/review-m1-closeout-CC7205DF-20261116/REVIEW_REPORT.md`
-  SHA256 `45286C8DFD8EA207A9F2DEB2659EBDB467FD589231ED634412074A96257D2636`,
-  `PASS 0/0/0`.
-- M2 candidate patch:
-  `Shared/vr-product-takeover-01-m2-single-mention-20261116/developer/candidate.patch`
-  SHA256 `C8588590837A03F30EF04AD86E5D78EC87D71D5ABCCCA1BC605FE2E73BDD3F1F`,
-  `13482` bytes, prospective tree
-  `d48a7d09fe3c1f8128515859f3a960b3b639c60f`, changed paths:
-  `.harness/CURRENT_TASK.md`, `.harness/PROJECT_STATE.md` and
-  `tests/voice-room-request-lifecycle.test.ts`.
-- Acceptance record: `.harness/M2_SINGLE_MENTION.md` binds the candidate,
-  contract/checklist and independent QA/Review evidence.
-- Allowed paths: `tests/voice-room-request-lifecycle.test.ts`,
+  `D51EB20316A23565FE9A21C99292E2EC2FF5D08AB257039E2E22D64781D6167A`
+- Contract Addendum R1:
+  `Shared/vr-product-takeover-01-m3-ambient-20261118/M3_AMBIENT_CONTRACT_ADDENDUM_R1.md`
+  SHA256
+  `6A8E7E3807AB5CA71436F8613353DDA06F6B438247079439FCA1F55A1537BB93`;
+  original contract bytes unchanged.
+- Owner/Product direction: candidate implementation only for M3 Ambient; no
+  live run, merge, deployment or cutover is authorized.
+- Baseline: Q HEAD `82399bc3327e8e86925b0fc2cd79e249fc7417f5`, tree
+  `6b0b736c34dbc370af89c22332bb0dab2d4ff8d5`.
+- Predecessor: M2 offline single-`@` candidate
+  `C8588590837A03F30EF04AD86E5D78EC87D71D5ABCCCA1BC605FE2E73BDD3F1F`
+  remains accepted only for its recorded capability.
+- Candidate paths (8): `src/voice-room/participation-planner.ts`,
+  `src/voice-room/qq-server.ts`, `src/voice-room/runtime.ts`,
+  `src/voice-room/store.ts`, `tests/voice-room-request-lifecycle.test.ts`,
   `.harness/CURRENT_TASK.md`, `.harness/PROJECT_STATE.md`,
-  optional `.harness/M2_SINGLE_MENTION.md`, and the Shared M2 evidence
-  directory.
-- Read-only paths: existing `src/**`, `scripts/**`, package and lock files,
-  `tsconfig.json`, `.gitignore`, the accepted M1 candidate and its evidence.
-- Acceptance: `M2-SM-01` through `M2-SM-07`.
-- Required checks: typecheck, build, targeted lifecycle test, full lifecycle
-  test file and architecture guard.
-- Explicitly forbidden: real QQ/NapCat, model, TTS, provider, production
-  database, `.env`, `3011`, deployment, runtime data change, stage, commit,
-  push or PR without separate authorization.
-- Developer self-check record: the independent self-check is not a Review;
-  candidate, commands and raw-log hashes are in the Shared M2 developer
-  evidence directory.
-
-This task validates the offline single-`@` vertical slice through the real
-parser, checked configuration, lifecycle admission, temporary SQLite,
-generation worker and audit. The model and transport are injected. It does not
-complete `RT-MIG-01` and does not authorize live migration or cutover.
-Independent QA and independent Review both report `PASS 0/0/0` for this exact
-frozen candidate. Acceptance is limited to the offline single-`@` capability;
-it is not complete runtime migration, deployment or cutover acceptance.
+  `evidence/architecture-baseline.json` (r4-authorized content; r5 baseline
+  identity refresh pending).
+- Handoff: `Shared/vr-product-takeover-01-m3-ambient-20261118/cleanroom/**`.
+- Acceptance: `M3-AMB-01` through `M3-AMB-10`, including exact 300000 ms
+  threshold, pre-call model spend, transactional paused admission, pause
+  fence/real-pump resume, transactional stale-anchor rejection, valid-UTF-8
+  planner prompt, cooldown advancement on every real planner attempt, strict
+  public planner input and schema-9 cursor persistence.
+- Read-only: all other `src/**`, `scripts/**`, package and lock files,
+  `tsconfig.json`, `.gitignore`, and existing evidence, including
+  `evidence/architecture-baseline.json`.
+- Independent Review `M3-AMBIENT-CLEANROOM-REVIEW-20261119` returned FAIL
+  `0/2/4`; that revision fixed P1-2 (pause lifecycle fence and resume pump),
+  P2-3 (stale-anchor admission recheck) and P2-4 (prompt UTF-8 regression
+  test). Under Owner-approved Addendum R1, P1-1 production `ambientPlanner`
+  wiring is now included in `qq-server.ts`; `scripts/demo.ts` remains
+  unchanged because it is an offline synthetic-worker demo.
+- The r4 independent Review returned FAIL `0/1/3`. This r5 revision fixes
+  P1-R4-COOLDOWN-BYPASS by advancing the single store-owned ambient attempt
+  timestamp before every real planner call and adds a permanent skip/throw
+  cooldown test. The two P2 documentation corrections cite Addendum R1 and
+  the actual Q-versus-cleanroom worktree state.
+- Architecture: the r2 exact-candidate authorization covered r4 and its
+  byte-identical r3 business bytes. r5 changes runtime/store bytes after that
+  baseline; the planner remains `LEGACY_UNLAYERED_DEBT`. A new exact-candidate
+  baseline refresh is pending. Guard exit `1` with exactly two
+  `ARCH-BASELINE-CHANGED` violations for runtime/store is expected and must
+  not be bypassed. `evidence/architecture-baseline.json` is not edited in r5.
+- Required checks: architecture guard (blocker recorded), typecheck, build,
+  Ambient-focused lifecycle tests, full lifecycle test file and
+  `git diff --check`.
+- Explicitly forbidden: reading P/protected assets or unclean candidates;
+  real QQ/NapCat, model, TTS, provider, production database, `.env`, `3011`,
+  deployment, stage, commit, push or PR.
+- Developer self-check is not independent QA or Review. This candidate remains
+  pending both, and no PASS is claimed.
+- Clean-room access record:
+  `P_SOURCE_ACCESS=NONE; P_METADATA_REFERENCE_DISCLOSED`.
 
 <!-- ACTIVE_TASK:END -->
+
+## Accepted M2 Task Record
+
+This section is historical; it is not the active task.
+
+- Task: `VR-PRODUCT-TAKEOVER-01 / M2-SINGLE-MENTION`
+- Status: `ACCEPTED` for the offline single-`@` capability only.
+- Candidate patch SHA256
+  `C8588590837A03F30EF04AD86E5D78EC87D71D5ABCCCA1BC605FE2E73BDD3F1F`,
+  `13482` bytes, prospective tree
+  `d48a7d09fe3c1f8128515859f3a960b3b639c60f`.
+- Acceptance record: `.harness/M2_SINGLE_MENTION.md`. Independent QA/Review
+  bind only that exact candidate and do not transfer to M3.
 
 ## Accepted M1 Task Record
 

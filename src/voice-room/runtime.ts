@@ -8,7 +8,7 @@ import { RoomStore, type RoomControlMutation, type RoomControlState, type RoomQu
   type LifecycleDeliveryMode, type LifecycleGenerationClaim, type LifecycleRequest, type LifecycleRequestStatus,
   type LifecycleTurnStatus,
   type LifecycleSegmentState } from "./store.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { ParticipationPolicy, type ParticipationNotice, type ParticipationReason } from "./participation-policy.js";
 import { DeliveryPolicy, requestsVoiceOnly } from "./delivery-policy.js";
 import { buildVoiceTranslationPrompt, validJapaneseVoice } from "./language.js";
@@ -18,6 +18,17 @@ import { RoomSendError, type RoomCharacter, type RoomConfig, type RoomControlAct
 import { roomToolSession } from "./tools.js";
 import { MonotonicDeadline } from "../web-task.js";
 import { RoomModelError, type RoomLifecycleAnswer } from "./model.js";
+import {
+  AMBIENT_HISTORY_LIMIT,
+  AMBIENT_IDLE_THRESHOLD_MS,
+  ambientPlannerCharacters,
+  ambientPlannerContextKey,
+  ambientPlannerHistory,
+  buildAmbientPlannerInput,
+  checkedAmbientPlannerDecision,
+  createAmbientPlannerPrompt,
+  type RoomAmbientPlanner,
+} from "./participation-planner.js";
 
 interface Run {
   id: string;
@@ -65,6 +76,7 @@ export interface RoomLifecycleDispatch {
 }
 export interface RoomLifecycleWorker {
   model: RoomLifecycleModelPort;
+  ambientPlanner?: RoomAmbientPlanner;
   apiTimeoutMs: number;
   closePolicy?: Partial<RoomClosePolicy>;
   dispatch(request: RoomLifecycleDispatch): Promise<string>;
@@ -122,6 +134,8 @@ export class VoiceRoom {
   private lifecycleLeaseTimer?: ReturnType<typeof setInterval>;
   private readonly lifecyclePrompts = new Map<string, RoomPrompt>();
   private readonly lifecycleGenerationTasks = new Set<Promise<void>>();
+  private readonly ambientTimers = new Set<ReturnType<typeof setTimeout>>();
+  private ambientPlan?: { readonly controller: AbortController; readonly promise: Promise<void> };
   private executionRevision = 0;
   private gateCounter = 0;
   private lastGate?: { gateId: string; revision: number; cancelled: boolean; returned: boolean };
@@ -293,7 +307,11 @@ export class VoiceRoom {
     this.executionRevision = result.state.executionRevision;
     const cancelledActive = emergencyCancelled || ((action === "stop" || action === "pause" || revisionChanged)
       ? this.abortWorkerRun(action === "stop" ? "control_stop" : action === "pause" ? "control_pause" : "control_revision_changed") : false);
-    if (action === "resume") this.wakeWorker();
+    if (action === "resume") {
+      this.wakeWorker();
+      if (this.consumer === "lifecycle") this.onLifecyclePauseChange(false);
+    }
+    if (action === "pause" && this.consumer === "lifecycle") this.onLifecyclePauseChange(true);
     return this.controlResult("applied", action, null, result.state, result.cancelledQueued, cancelledActive);
   }
   private permits(text: string): boolean {
@@ -365,14 +383,19 @@ export class VoiceRoom {
     if (deliveryMode === "both" && this.deps.voiceAvailable === false) return "rejected";
     try {
       const mentioned = Boolean(input.mentions?.some(id => this.config.characters.some(c => c.selfId === id)));
+      const lifecycleMode = this.lifecycleControl().mode;
       const admitted: LifecycleAdmission = this.store.acceptLifecycleInput(input, {
         ownerToken: token, expectedEpoch: this.readyEpoch!, now: this.now(),
-        source: mentioned ? "direct" : this.lifecycleControl().mode === "ambient" ? "ambient" : "direct",
+        source: mentioned ? "direct" : lifecycleMode === "ambient" ? "ambient" : "direct",
         enqueue: mentioned, deliveryMode, policy,
       });
       if (admitted.kind === "enqueue") {
         this.wakeLifecycleGenerations();
         return "scheduled";
+      }
+      if (admitted.kind === "record_only" && lifecycleMode === "ambient" && admitted.messageRowId !== undefined) {
+        this.scheduleAmbientOpportunity(admitted.messageRowId, policy,
+          Boolean(input.mentions?.length || input.replyToMessageId !== undefined));
       }
       return admitted.kind === "duplicate" ? "duplicate"
         : admitted.kind === "record_only" ? "observed" : "rejected";
@@ -770,12 +793,14 @@ export class VoiceRoom {
       || this.legacyUsed || this.closed) return Promise.reject(new Error("room-consumer-conflict"));
     if (!options || typeof options.dispatch !== "function" || typeof options.model?.generate !== "function"
       || typeof options.beginClose !== "function" || typeof options.sealObservations !== "function"
+      || (options.ambientPlanner !== undefined && typeof options.ambientPlanner.plan !== "function")
       || !Number.isInteger(options.apiTimeoutMs) || options.apiTimeoutMs < 100
       || options.apiTimeoutMs > 60000) return Promise.reject(new Error("room-worker-port-invalid"));
     this.consumer = "lifecycle";
     this.workerPhase = "starting";
     this.closePolicy = checkClosePolicy(options.closePolicy);
     this.lifecycleWorker = options;
+    this.store.setLifecyclePauseListener(paused => this.onLifecyclePauseChange(paused));
     this.store.beginDeliveryExecution();
     const fence = {};
     this.startupFence = fence;
@@ -837,15 +862,33 @@ export class VoiceRoom {
   private lifecycleRevisionLive(revision: number, accountKey?: string): boolean {
     try {
       const control = this.lifecycleControl();
-      return this.lifecycleOwnerLive() && control.executionRevision === revision
+      return this.lifecycleOwnerLive() && !control.paused && control.executionRevision === revision
         && control.epoch === this.readyEpoch
         && this.config.characters.every(character => this.online.has(character.accountKey))
         && (accountKey === undefined || this.online.has(accountKey));
     } catch { return false; }
   }
+  private onLifecyclePauseChange(paused: boolean): void {
+    if (this.consumer !== "lifecycle" || this.closed) return;
+    try { this.executionRevision = this.lifecycleControl().executionRevision; }
+    catch { return; }
+    if (paused) {
+      this.abortLifecycleWork();
+      const token = this.lifecycleOwnerToken;
+      if (token) {
+        try { this.store.suspendLifecycleGenerations(token, this.now()); }
+        catch { /* The owner/epoch fence already ends this work. */ }
+      }
+      return;
+    }
+    this.wakeLifecycleGenerations();
+    this.wakeLifecycleDelivery();
+  }
   private abortLifecycleWork(): void {
     for (const generation of this.lifecycleGenerations.values()) generation.controller.abort();
     this.lifecycleDelivery?.controller.abort();
+    this.clearAmbientTimers();
+    this.ambientPlan?.controller.abort();
     this.lifecycleWakeRequested = false;
     this.lifecycleDeliveryWakeRequested = false;
   }
@@ -860,6 +903,178 @@ export class VoiceRoom {
     } catch {
       this.faultWorker("room-lifecycle-disconnect-cancel-failed");
     }
+  }
+  private scheduleAmbientOpportunity(anchorRowId: number, policy: RoomQueuePolicy, blocked: boolean): void {
+    if (this.consumer !== "lifecycle" || !this.lifecycleWorker?.ambientPlanner || this.closed) return;
+    const anchor = this.store.historyMessage(anchorRowId);
+    if (!anchor || anchor.speakerType !== "user" || anchor.createdAt === undefined) return;
+    const now = this.now();
+    const quietAt = anchor.createdAt + this.config.limits.ambientQuietMs;
+    const initiationAt = anchor.createdAt + AMBIENT_IDLE_THRESHOLD_MS;
+    this.queueAmbientTimer(anchorRowId, policy, blocked, quietAt - now);
+    if (initiationAt > quietAt) this.queueAmbientTimer(anchorRowId, policy, blocked, initiationAt - now);
+  }
+  private queueAmbientTimer(anchorRowId: number, policy: RoomQueuePolicy, blocked: boolean, delayMs: number): void {
+    const timer = setTimeout(() => {
+      this.ambientTimers.delete(timer);
+      void this.runAmbientOpportunity(anchorRowId, policy, blocked).catch(() => {
+        this.faultWorker("room-ambient-opportunity-failed");
+      });
+    }, Math.max(0, delayMs));
+    timer.unref();
+    this.ambientTimers.add(timer);
+  }
+  private clearAmbientTimers(): void {
+    for (const timer of this.ambientTimers) clearTimeout(timer);
+    this.ambientTimers.clear();
+  }
+  private ambientOpportunityStopped(signal: AbortSignal, revision: number): boolean {
+    if (signal.aborted || this.closed) return true;
+    try {
+      const control = this.lifecycleControl();
+      return control.paused || control.mode !== "ambient" || !this.lifecycleRevisionLive(revision);
+    } catch { return true; }
+  }
+  /** Deterministic offline seam; production opportunities are timer-driven. */
+  ambientOpportunityForTest(anchorRowId: number, policy: RoomQueuePolicy, blocked = false): Promise<void> {
+    if (this.consumer !== "lifecycle" || this.closed) return Promise.reject(new Error("room-ambient-not-ready"));
+    return this.runAmbientOpportunity(anchorRowId, policy, blocked);
+  }
+  ambientAdmissionForTest(anchorRowId: number, characterIds: readonly string[],
+    policy: RoomQueuePolicy): LifecycleAdmission {
+    if (this.consumer !== "lifecycle" || !this.lifecycleOwnerToken || this.readyEpoch === undefined
+      || this.closed) throw new Error("room-ambient-not-ready");
+    const deliveryMode = this.store.deliveryMode();
+    if (deliveryMode !== "text" && deliveryMode !== "both") throw new Error("room-ambient-delivery-invalid");
+    const eventKey = createHash("sha256")
+      .update(`test:${anchorRowId}:${[...characterIds].join(",")}`, "utf8").digest("hex");
+    return this.store.acceptAmbientLifecycle(anchorRowId, characterIds, {
+      ownerToken: this.lifecycleOwnerToken,
+      expectedEpoch: this.readyEpoch,
+      now: this.now(),
+      policy,
+      deliveryMode,
+      eventKey,
+    });
+  }
+  ambientClaimForTest(limit = 4): readonly LifecycleGenerationClaim[] {
+    if (this.consumer !== "lifecycle" || !this.lifecycleOwnerToken || this.readyEpoch === undefined
+      || this.closed) throw new Error("room-ambient-not-ready");
+    return this.store.claimLifecycleGenerations(limit, this.lifecycleOwnerToken, this.readyEpoch, this.now());
+  }
+  private async runAmbientOpportunity(anchorRowId: number, policy: RoomQueuePolicy,
+    blocked: boolean): Promise<void> {
+    if (this.ambientPlan || this.consumer !== "lifecycle" || this.closed || this.workerPhase !== "ready") return;
+    const planner = this.lifecycleWorker?.ambientPlanner;
+    if (!planner) return;
+    try {
+      const now = this.now();
+      const control = this.lifecycleControl();
+      if (control.paused || control.mode !== "ambient") return;
+      const anchor = this.store.historyMessage(anchorRowId);
+      if (!anchor || anchor.speakerType !== "user" || anchor.createdAt === undefined
+        || now - anchor.createdAt < this.config.limits.ambientQuietMs) return;
+      const latestHuman = this.store.historyPage(50).filter(row => row.speakerType === "user").at(-1);
+      if (!latestHuman || latestHuman.id !== anchorRowId) return;
+      const participation = this.participationPolicy.decide({
+        history: this.store.historyPage(Math.min(500, Math.max(this.config.limits.historyPageRows,
+          this.config.limits.ambientMessages + 2))),
+        pendingIds: [anchorRowId],
+        now,
+        observedAt: anchor.createdAt,
+        lastAttemptAt: this.store.state().ambient_at,
+        online: this.online,
+        paused: control.paused,
+        stopped: this.autoStopped,
+        busy: this.lifecycleGenerations.size > 0 || Boolean(this.store.lifecycleHeadRequest()),
+        blockedTarget: blocked,
+        hasBudget: this.store.canSpend("model", now) && this.store.canSpend("send", now),
+      });
+      if (!participation.shouldReply) return;
+      const historyRows = this.store.historyPage(AMBIENT_HISTORY_LIMIT, { beforeId: anchorRowId });
+      if (!this.permits(anchor.text) || historyRows.some(row => !this.permits(row.text))) return;
+      let characters;
+      try {
+        characters = ambientPlannerCharacters(this.config.characters, character => {
+          const persona = this.deps.persona(character);
+          if (typeof persona !== "string" || !this.permits(persona)) throw new Error("room-ambient-private");
+          return persona;
+        });
+      } catch { return; }
+      const input = buildAmbientPlannerInput(anchor.text,
+        ambientPlannerHistory(historyRows, anchorRowId, this.config.characters), characters,
+        now - anchor.createdAt);
+      const prompt = createAmbientPlannerPrompt(input);
+      if (!this.permits(prompt.systemPrompt) || !this.permits(prompt.messages[0].content)) return;
+      const contextKey = ambientPlannerContextKey(input);
+      if (this.store.ambientCursor()?.contextKey === contextKey) return;
+      const revision = control.executionRevision;
+      const attemptAt = this.now();
+      if (!this.store.spend("model", attemptAt)) return;
+      this.store.ambientAttempt(attemptAt);
+      const controller = new AbortController();
+      const promise = this.planAmbientOpportunity(planner, {
+        anchorRowId, policy, input, prompt, contextKey, revision, controller,
+      });
+      this.ambientPlan = Object.freeze({ controller, promise });
+      try { await promise; }
+      finally { if (this.ambientPlan?.promise === promise) this.ambientPlan = undefined; }
+    } catch {
+      if (!this.closed) this.faultWorker("room-ambient-opportunity-failed");
+    }
+  }
+  private async planAmbientOpportunity(planner: RoomAmbientPlanner, request: {
+    anchorRowId: number; policy: RoomQueuePolicy; input: ReturnType<typeof buildAmbientPlannerInput>;
+    prompt: ReturnType<typeof createAmbientPlannerPrompt>; contextKey: string; revision: number;
+    controller: AbortController;
+  }): Promise<void> {
+    let raw: unknown;
+    try {
+      raw = await this.callLifecycle(request.controller.signal, this.config.limits.requestTimeoutMs,
+        signal => planner.plan(request.input, request.prompt, signal));
+    } catch {
+      if (this.ambientOpportunityStopped(request.controller.signal, request.revision)) return;
+      this.recordAmbientOutcome(request.contextKey, "technical_defer");
+      return;
+    }
+    if (this.ambientOpportunityStopped(request.controller.signal, request.revision)) return;
+    const decision = checkedAmbientPlannerDecision(raw, request.input);
+    if (!decision) {
+      this.recordAmbientOutcome(request.contextKey, "technical_defer");
+      return;
+    }
+    if (decision.kind === "skip") {
+      this.recordAmbientOutcome(request.contextKey, "skip");
+      return;
+    }
+    const deliveryMode = this.store.deliveryMode();
+    if (deliveryMode !== "text" && deliveryMode !== "both") return;
+    let admission: LifecycleAdmission;
+    try {
+      admission = this.store.acceptAmbientLifecycle(request.anchorRowId, decision.characterIds, {
+        ownerToken: this.lifecycleOwnerToken!,
+        expectedEpoch: this.readyEpoch!,
+        now: this.now(),
+        policy: request.policy,
+        deliveryMode,
+        eventKey: request.contextKey,
+      });
+    } catch {
+      this.faultWorker("room-ambient-admission-failed");
+      return;
+    }
+    if (admission.kind === "enqueue") {
+      this.recordAmbientOutcome(request.contextKey, decision.kind);
+      this.wakeLifecycleGenerations();
+    } else if (admission.kind === "duplicate") {
+      this.recordAmbientOutcome(request.contextKey, decision.kind);
+    } else if (admission.reason !== "paused" && admission.reason !== "busy" && admission.reason !== "mode") {
+      this.recordAmbientOutcome(request.contextKey, "technical_defer");
+    }
+  }
+  private recordAmbientOutcome(contextKey: string, outcome: "skip" | "join" | "initiate" | "technical_defer"): void {
+    try { this.store.recordAmbientCursor(contextKey, outcome, this.now()); }
+    catch { this.faultWorker("room-ambient-cursor-failed"); }
   }
   private lifecyclePrompt(character: RoomCharacter, request: LifecycleRequest): RoomPrompt {
     const target = this.store.historyMessage(request.messageRowId);
@@ -914,6 +1129,7 @@ export class VoiceRoom {
   private async pumpLifecycleGenerations(): Promise<void> {
     while (this.workerPhase === "ready" && !this.closed) {
       this.lifecycleWakeRequested = false;
+      if (this.lifecycleControl().paused) return;
       const free = LIFECYCLE_GENERATION_LIMIT - this.lifecycleGenerations.size;
       if (free <= 0) return;
       const token = this.lifecycleOwnerToken;
@@ -980,6 +1196,12 @@ export class VoiceRoom {
         fail(error instanceof Error && /^[a-z][a-z0-9_-]{0,79}$/.test(error.message)
           ? error.message : "lifecycle_generation_failed");
       }
+    } finally {
+      try {
+        if (this.store.lifecycleControlState().paused) {
+          this.store.releaseLifecycleGeneration(turn.turnId, ownerToken, this.now());
+        }
+      } catch { /* A concurrent pause/cancel already settled this turn. */ }
     }
   }
   private wakeLifecycleDelivery(): void {
@@ -998,6 +1220,7 @@ export class VoiceRoom {
   private async pumpLifecycleDelivery(): Promise<void> {
     while (this.workerPhase === "ready" && !this.closed && !this.lifecycleDelivery) {
       this.lifecycleDeliveryWakeRequested = false;
+      if (this.lifecycleControl().paused) return;
       if (this.store.hasUnresolvedLifecycleDelivery()) return;
       const token = this.lifecycleOwnerToken;
       if (!token) throw new Error("room-lifecycle-owner-lost");
@@ -1049,6 +1272,11 @@ export class VoiceRoom {
       failure = error;
     }
     if (receipt !== undefined) {
+      if (!this.lifecycleRevisionLive(attempt.revision, item.character.accountKey)) {
+        try { this.store.abandonLifecycleAttempt(attempt.attemptId, "delivery_cancelled", this.now()); }
+        catch { /* Preserve the immutable receipt for recovery. */ }
+        return;
+      }
       try {
         this.store.commitLifecycleText(attempt.attemptId, receipt, ownerToken, this.now());
         this.wakeLifecycleDelivery();
@@ -1110,6 +1338,11 @@ export class VoiceRoom {
         failure = error;
       }
       if (receipt !== undefined) {
+        if (!this.lifecycleRevisionLive(attempt.revision, item.character.accountKey)) {
+          try { this.store.abandonLifecycleAttempt(attempt.attemptId, "delivery_cancelled", this.now()); }
+          catch { /* Preserve the immutable receipt for recovery. */ }
+          return;
+        }
         try {
           this.store.commitLifecycleVoice(attempt.attemptId, receipt, ownerToken, this.now());
           this.lifecyclePrompts.delete(item.turn.turnId);
@@ -1748,6 +1981,7 @@ export class VoiceRoom {
         this.lifecyclePumpPromise,
         this.lifecycleDeliveryPumpPromise,
         this.lifecycleDelivery?.promise,
+        this.ambientPlan?.promise,
       ].filter((promise): promise is Promise<void> => promise !== undefined);
       const tasks = [...this.lifecycleGenerationTasks];
       if (!work.length && !tasks.length) return;
