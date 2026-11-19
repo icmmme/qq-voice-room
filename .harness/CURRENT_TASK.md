@@ -6,7 +6,7 @@
 
 - Task: `VR-PRODUCT-TAKEOVER-01 / M3-AMBIENT-PARTICIPATION`
 - Contract revision: `1 + Addendum R1`
-- Status: `CANDIDATE_REVISED_PENDING_QA`
+- Status: `ACCEPTED` (offline Ambient capability; merged to `main`)
 - Author of self-check: Developer
 - Self-check label: `SELF_CHECK - not independent Review`
 - Contract:
@@ -29,8 +29,8 @@
   `src/voice-room/qq-server.ts`, `src/voice-room/runtime.ts`,
   `src/voice-room/store.ts`, `tests/voice-room-request-lifecycle.test.ts`,
   `.harness/CURRENT_TASK.md`, `.harness/PROJECT_STATE.md`,
-  `evidence/architecture-baseline.json` (r4-authorized content; r5 baseline
-  identity refresh pending).
+  `evidence/architecture-baseline.json` (r6-authorized content; guard exit
+  `0` with `43` entries / `62` files).
 - Handoff: `Shared/vr-product-takeover-01-m3-ambient-20261118/cleanroom/**`.
 - Acceptance: `M3-AMB-01` through `M3-AMB-10`, including exact 300000 ms
   threshold, pre-call model spend, transactional paused admission, pause
@@ -51,20 +51,25 @@
   timestamp before every real planner call and adds a permanent skip/throw
   cooldown test. The two P2 documentation corrections cite Addendum R1 and
   the actual Q-versus-cleanroom worktree state.
-- Architecture: the r2 exact-candidate authorization covered r4 and its
-  byte-identical r3 business bytes. r5 changes runtime/store bytes after that
-  baseline; the planner remains `LEGACY_UNLAYERED_DEBT`. A new exact-candidate
-  baseline refresh is pending. Guard exit `1` with exactly two
-  `ARCH-BASELINE-CHANGED` violations for runtime/store is expected and must
-  not be bypassed. `evidence/architecture-baseline.json` is not edited in r5.
-- Required checks: architecture guard (blocker recorded), typecheck, build,
+- Architecture: the r3 exact-candidate authorization refreshed only
+  `runtime.ts` and `store.ts` identity for r5; r6 copies that authorized
+  baseline byte-for-byte (`BE6DC870...`, `43` entries). The planner remains
+  `LEGACY_UNLAYERED_DEBT` with an M5 exit. Guard exit `0`, `43` entries,
+  `62` files, `violations []`.
+- Required checks at r6: architecture guard exit `0`, typecheck, build,
   Ambient-focused lifecycle tests, full lifecycle test file and
-  `git diff --check`.
-- Explicitly forbidden: reading P/protected assets or unclean candidates;
-  real QQ/NapCat, model, TTS, provider, production database, `.env`, `3011`,
-  deployment, stage, commit, push or PR.
-- Developer self-check is not independent QA or Review. This candidate remains
-  pending both, and no PASS is claimed.
+  `git diff --check`; all green.
+- Not executed during implementation: reading P/protected assets or unclean
+  candidates; real QQ/NapCat, model, TTS, provider, production database,
+  `.env`, `3011`, deployment or cutover. Stage, commit, push and merge were
+  performed only after the Owner's `2026-11-19` decision.
+- Final independent results on r6: QA `CONDITIONAL_PASS 0/0/1`, Review
+  `CONDITIONAL PASS 0/0/1`, provenance boundary R3 `CONDITIONAL`. The single
+  open P2 is the reconstructed clean-room read log; the Owner explicitly
+  accepted that residual and approved merge on `2026-11-19 Asia/Shanghai`.
+- Merge: PR `#2`, merge commit `0f53999f9c3e8adf90829d31eea5171f750264e8`,
+  `origin/main` tree `9cb4ad45b740ec19a1758eebf1ee1fe81fbc3d83`.
+  Acceptance record: `.harness/M3_AMBIENT_PARTICIPATION.md`.
 - Clean-room access record:
   `P_SOURCE_ACCESS=NONE; P_METADATA_REFERENCE_DISCLOSED`.
 
