@@ -1364,8 +1364,13 @@ export class VoiceRoom {
       const reason = error instanceof Error && /^[a-z][a-z0-9_-]{0,79}$/.test(error.message)
         ? error.message : "voice_preparation_failed";
       try {
-        this.store.finishLifecycleSegment(item.segment.segmentId, "failed",
-          reason === "tts_budget" ? "tts_budget_exhausted" : reason, ownerToken, this.now());
+        const failureCode = reason === "tts_budget" ? "tts_budget_exhausted" : reason;
+        // Text already reached the platform in `both` mode; only the audio part failed.
+        if (this.store.settleLifecycleTextOnly(item.segment.segmentId, failureCode, ownerToken, this.now())) {
+          this.lifecyclePrompts.delete(item.turn.turnId);
+          return;
+        }
+        this.store.finishLifecycleSegment(item.segment.segmentId, "failed", failureCode, ownerToken, this.now());
       } catch {
         /* A concurrent cancellation or owner change already settled this segment. */
       }
