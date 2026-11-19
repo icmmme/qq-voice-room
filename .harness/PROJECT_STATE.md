@@ -6,7 +6,7 @@
 
 - Phase: `M3 - Ambient Participation`
 - Task: `VR-PRODUCT-TAKEOVER-01 / M3-AMBIENT-PARTICIPATION`
-- Status: `CANDIDATE_REVISED_PENDING_QA`
+- Status: `ACCEPTED` (offline Ambient capability; merged to `main`)
 - M2 predecessor:
   `C8588590837A03F30EF04AD86E5D78EC87D71D5ABCCCA1BC605FE2E73BDD3F1F`
   remains accepted only for the recorded offline single-`@` capability.
@@ -28,8 +28,8 @@
   `src/voice-room/qq-server.ts`, `src/voice-room/runtime.ts`,
   `src/voice-room/store.ts`, `tests/voice-room-request-lifecycle.test.ts`,
   `.harness/CURRENT_TASK.md`, `.harness/PROJECT_STATE.md`,
-  `evidence/architecture-baseline.json` (r4-authorized content; r5 baseline
-  identity refresh pending).
+  `evidence/architecture-baseline.json` (r6-authorized content; guard exit
+  `0` with `43` entries / `62` files).
 - Read-only: all other `src/**`, `scripts/**`, package and lock files,
   `tsconfig.json`, `.gitignore`, and existing evidence, including
   `evidence/architecture-baseline.json`.
@@ -40,14 +40,19 @@
   P1-R4-COOLDOWN-BYPASS, is fixed by advancing the single authoritative
   ambient attempt timestamp before every real planner call. Skip, join,
   initiate, throw, timeout and invalid output all share that path.
-- Architecture: r2 Option A covered the r4 bytes. r5 changes runtime/store
-  bytes; the planner remains `LEGACY_UNLAYERED_DEBT`. A new exact-candidate
-  identity authorization is pending; guard exit `1` with exactly two
-  `ARCH-BASELINE-CHANGED` violations for runtime/store is expected.
-  `evidence/architecture-baseline.json` remains the r2-authorized content and
-  is not edited.
-- The candidate remains pending independent QA and Review. No PASS is claimed,
-  and M2/earlier PASS results do not transfer.
+- Architecture: the r3 exact-candidate authorization refreshed only
+  runtime/store identity for r5; r6 copies the authorized baseline
+  byte-for-byte (`BE6DC870...`, `43` entries). The planner remains
+  `LEGACY_UNLAYERED_DEBT` with an M5 exit; guard exit `0`, `43` entries,
+  `62` files, `violations []`.
+- Final independent results on r6: QA `CONDITIONAL_PASS 0/0/1`, Review
+  `CONDITIONAL PASS 0/0/1`, provenance boundary R3 `CONDITIONAL`. The Owner
+  accepted the reconstructed-read-log residual and approved merge on
+  `2026-11-19 Asia/Shanghai`; M2/earlier results still do not transfer.
+- Merge: PR `#2`, merge commit
+  `0f53999f9c3e8adf90829d31eea5171f750264e8`, `origin/main` tree
+  `9cb4ad45b740ec19a1758eebf1ee1fe81fbc3d83`. Acceptance record:
+  `.harness/M3_AMBIENT_PARTICIPATION.md`.
 - Clean-room access record:
   `P_SOURCE_ACCESS=NONE; P_METADATA_REFERENCE_DISCLOSED`.
 - Product runtime, live QQ/NapCat, model, TTS, production database, `.env`,
