@@ -10,6 +10,7 @@ import type { ModelConfig } from "../src/config.js";
 import { checkRoomConfig } from "../src/voice-room/config.js";
 import { parseRoomQqMessage } from "../src/voice-room/qq-message.js";
 import type { RoomQqSettings } from "../src/voice-room/qq-config.js";
+import { startRoomQq } from "../src/voice-room/qq-server.js";
 import { roomPublicPolicy } from "../src/voice-room/public-policy.js";
 import {
   VoiceRoom,
@@ -17,9 +18,19 @@ import {
   type RoomLifecycleDispatch,
   type RoomLifecycleWorker,
 } from "../src/voice-room/runtime.js";
-import type { RoomQueuePolicy } from "../src/voice-room/store.js";
+import { RoomStore, type RoomQueuePolicy } from "../src/voice-room/store.js";
 import { RoomSendError, type RoomConfig, type RoomDependencies, type RoomInput } from "../src/voice-room/types.js";
 import type { RoomLifecycleAnswer } from "../src/voice-room/model.js";
+import {
+  AMBIENT_IDLE_THRESHOLD_MS,
+  ambientInitiationAllowed,
+  ambientPlannerContextKey,
+  buildAmbientPlannerInput,
+  checkedAmbientPlannerDecision,
+  createAmbientPlannerPrompt,
+  type AmbientPlannerInput,
+  type RoomAmbientPlanner,
+} from "../src/voice-room/participation-planner.js";
 import { deferred } from "./voice-room-fixture.js";
 
 const QUEUE: RoomQueuePolicy = { capacity: 20, memberLimit: 20, memberWindowMs: 1000, ttlMs: 10000 };
@@ -103,6 +114,7 @@ interface LifecycleHarness {
   readonly checkedConfig: ReturnType<typeof checkRoomConfig>;
   readonly room: VoiceRoom;
   readonly prompts: Parameters<RoomLifecycleWorker["model"]["generate"]>[0][];
+  readonly ambientPlannerCalls: AmbientPlannerInput[];
   readonly dispatches: DispatchRecord[];
   readonly synthesisCalls: number;
   receive(messageId: string, text: string, mentions?: readonly string[],
@@ -116,6 +128,7 @@ async function lifecycleHarness(t: TestContext, options: {
   translateVoice?: RoomDependencies["translateVoice"];
   synthesize?: RoomDependencies["synthesize"];
   dispatch?: (request: RoomLifecycleDispatch, record: (value: DispatchRecord) => void) => Promise<string>;
+  ambientPlanner?: RoomAmbientPlanner;
   deps?: Partial<RoomDependencies>;
 }): Promise<LifecycleHarness> {
   const root = mkdtempSync(join(tmpdir(), "pa-lifecycle-test-"));
@@ -123,6 +136,7 @@ async function lifecycleHarness(t: TestContext, options: {
   let sent = 0;
   let synthesisCalls = 0;
   const prompts: LifecycleHarness["prompts"] = [];
+  const ambientPlannerCalls: AmbientPlannerInput[] = [];
   const dispatches: DispatchRecord[] = [];
   let closed = false;
   const forbidden = async (): Promise<never> => { throw new Error("synthetic-legacy-dependency-forbidden"); };
@@ -149,6 +163,13 @@ async function lifecycleHarness(t: TestContext, options: {
       return options.model.generate(prompt, signal, maxChars);
     },
   };
+  const ambientPlanner = options.ambientPlanner === undefined ? undefined : {
+    plan: async (input: AmbientPlannerInput, prompt: Parameters<RoomAmbientPlanner["plan"]>[1],
+      signal: AbortSignal): Promise<unknown> => {
+      ambientPlannerCalls.push(input);
+      return options.ambientPlanner!.plan(input, prompt, signal);
+    },
+  };
   const record = (value: DispatchRecord) => { dispatches.push(value); };
   const defaultDispatch = async (request: RoomLifecycleDispatch): Promise<string> => {
     const messageId = String(700000 + ++sent);
@@ -169,6 +190,7 @@ async function lifecycleHarness(t: TestContext, options: {
   for (const character of checkedConfig.characters) room.setOnline(character.accountKey, true);
   await room.startLifecycleProductionWorker({
     model: wrappedModel,
+    ambientPlanner,
     apiTimeoutMs: 100,
     closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 100, releaseMs: 100, writeWaitMs: 50 },
     dispatch,
@@ -187,6 +209,7 @@ async function lifecycleHarness(t: TestContext, options: {
     checkedConfig,
     room,
     prompts,
+    ambientPlannerCalls,
     dispatches,
     get synthesisCalls() { return synthesisCalls; },
     receive: (messageId, text, mentions = [], overrides = {}) =>
@@ -1138,4 +1161,652 @@ test("offline single @ acceptance path joins real parser, checked config, lifecy
   assert.equal(atAll, null);
   assert.equal(h.synthesisCalls, 0);
   assert.equal(h.prompts.length, 1);
+});
+
+test("ambient initiation boundary is exact and planner input is public and bounded", async t => {
+  const base = Date.parse("2026-11-18T00:00:00Z");
+  let now = base;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      limits: { ambientQuietMs: 60000, ambientCooldownMs: 1, modelAttemptsPerHour: null },
+    }),
+    deps: { now: () => now },
+    ambientPlanner: {
+      plan: async input => input.constraints.allowInitiate
+        ? { kind: "initiate", characterIds: ["character-b", "character-a"] }
+        : { kind: "initiate", characterIds: ["character-a"] },
+    },
+    model: { generate: async () => ({ kind: "reply", segments: ["synthetic ambient reply"] }) },
+  });
+
+  for (let index = 0; index < 13; index++) {
+    assert.equal(h.receive(String(100 + index), `历史公开消息 ${index}`), "observed");
+  }
+  assert.equal(h.receive("200", "/room mode ambient"), "control");
+  assert.equal(h.receive("201", "我今天终于跑通了离线测试，大家怎么看？"), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+
+  now = base + AMBIENT_IDLE_THRESHOLD_MS - 1;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  const before = h.ambientPlannerCalls[0]!;
+  assert.equal(before.constraints.allowInitiate, false);
+  assert.equal(before.constraints.idleThresholdMs, AMBIENT_IDLE_THRESHOLD_MS);
+  assert.equal(before.constraints.maxHistory, 12);
+  assert.equal(before.history.length, 12);
+  assert.equal(before.anchor.text, "我今天终于跑通了离线测试，大家怎么看？");
+  assert.deepEqual(before.characters.map(character => character.id), ["character-a", "character-b"]);
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
+  assert.equal(h.room.store.ambientCursor()?.outcome, "technical_defer");
+  const publicInput = JSON.stringify(before);
+  assert.doesNotMatch(publicInput, /"accountKey"|"groupId"|"platformId"|"selfId"|"speakerId"|"targetId"/);
+  assert.doesNotMatch(publicInput, /account-a|10000|synthetic-token|C:\\\\synthetic/);
+
+  now = base + AMBIENT_IDLE_THRESHOLD_MS;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  await h.room.whenIdle();
+  assert.equal(h.ambientPlannerCalls.length, 2);
+  assert.equal(h.ambientPlannerCalls[1]!.constraints.allowInitiate, true);
+  assert.equal(h.room.store.ambientCursor()?.outcome, "initiate");
+
+  const requests = h.room.store.lifecycleRequests();
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]!.source, "ambient");
+  assert.equal(requests[0]!.messageRowId, anchor.id);
+  assert.equal(h.room.store.historyMessage(anchor.id)!.text, "我今天终于跑通了离线测试，大家怎么看？");
+  assert.deepEqual(h.room.store.lifecycleTurns(requests[0]!.requestId).map(turn => turn.characterId),
+    ["character-a", "character-b"]);
+  assert.equal(h.room.store.history().filter(row => row.speakerType === "user").length, 14);
+  assert.equal(h.dispatches.length, 2);
+});
+
+test("ambient lifecycle ingress schedules the quiet opportunity through the real seam", async t => {
+  const base = Date.parse("2026-11-18T00:30:00Z");
+  let now = base;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ limits: { ambientQuietMs: 10, ambientCooldownMs: 1000 } }),
+    deps: { now: () => now },
+    ambientPlanner: { plan: async () => ({ kind: "skip" }) },
+    model: { generate: async () => ({ kind: "reply", segments: ["unused"] }) },
+  });
+  assert.equal(h.receive("250", "/room mode ambient"), "control");
+  assert.equal(h.receive("251", "我今天终于跑通了离线测试，大家怎么看？"), "observed");
+  now = base + 10;
+  await waitFor(() => h.ambientPlannerCalls.length === 1, "scheduled ambient quiet opportunity");
+  assert.equal(h.room.store.ambientCursor()?.outcome, "skip");
+  assert.equal(h.room.store.counts().model, 1);
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.dispatches.length, 0);
+});
+
+test("ambient decision validation rejects extra, invented, duplicate and three ids", () => {
+  const characters = [
+    { id: "character-a", name: "Character A", persona: "public-a" },
+    { id: "character-b", name: "Character B", persona: "public-b" },
+  ] as const;
+  const before = buildAmbientPlannerInput("anchor", [{ speaker: "human", text: "prior" }], characters,
+    AMBIENT_IDLE_THRESHOLD_MS - 1);
+  const exact = buildAmbientPlannerInput("anchor", [{ speaker: "human", text: "prior" }], characters,
+    AMBIENT_IDLE_THRESHOLD_MS);
+  assert.equal(ambientInitiationAllowed(AMBIENT_IDLE_THRESHOLD_MS - 1), false);
+  assert.equal(ambientInitiationAllowed(AMBIENT_IDLE_THRESHOLD_MS), true);
+  assert.equal(checkedAmbientPlannerDecision({ kind: "initiate", characterIds: ["character-a"] }, before), null);
+  assert.deepEqual(checkedAmbientPlannerDecision({ kind: "initiate", characterIds: ["character-a"] }, exact),
+    { kind: "initiate", characterIds: ["character-a"] });
+  assert.deepEqual(checkedAmbientPlannerDecision({ kind: "join", characterIds: ["character-b", "character-a"] }, before),
+    { kind: "join", characterIds: ["character-a", "character-b"] });
+  assert.equal(checkedAmbientPlannerDecision({ kind: "join", characterIds: [] }, exact), null);
+  assert.equal(checkedAmbientPlannerDecision({ kind: "join", characterIds: ["character-a", "character-a"] }, exact), null);
+  assert.equal(checkedAmbientPlannerDecision({ kind: "join", characterIds: ["character-a", "character-b", "character-c"] }, exact), null);
+  assert.equal(checkedAmbientPlannerDecision({ kind: "join", characterIds: ["invented"] }, exact), null);
+  assert.equal(checkedAmbientPlannerDecision({ kind: "join", characterIds: ["character-a"], extra: true }, exact), null);
+  assert.equal(checkedAmbientPlannerDecision({ kind: "skip", extra: true }, exact), null);
+  assert.deepEqual(checkedAmbientPlannerDecision({ kind: "skip" }, exact), { kind: "skip" });
+});
+
+test("ambient planner prompt is valid UTF-8 Chinese without mojibake", () => {
+  const characters = [
+    { id: "character-a", name: "Character A", persona: "public-a" },
+  ] as const;
+  const prompt = createAmbientPlannerPrompt(
+    buildAmbientPlannerInput("anchor", [], characters, AMBIENT_IDLE_THRESHOLD_MS));
+  const text = `${prompt.systemPrompt}\n${prompt.messages[0].content}`;
+  const roundTrip = new TextDecoder("utf-8", { fatal: true }).decode(new TextEncoder().encode(text));
+  assert.equal(roundTrip, text);
+  assert.equal(text.includes("\uFFFD"), false);
+  assert.doesNotMatch(prompt.systemPrompt, /娴ｇ姵|浣犳槸|鍏紑|锟斤拷/);
+  assert.match(prompt.systemPrompt, /你是公开群聊的 Ambient 参与度规划器/);
+  assert.match(prompt.systemPrompt, /skip/);
+  assert.match(prompt.systemPrompt, /join/);
+  assert.match(prompt.systemPrompt, /initiate/);
+  assert.match(prompt.systemPrompt, /只返回一个 JSON 对象/);
+  assert.match(prompt.systemPrompt, /\{"kind":"skip"\}/);
+});
+
+test("ambient planner charges once before call and policy or spend blocks create no row", async t => {
+  const base = Date.parse("2026-11-18T01:00:00Z");
+  let now = base;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      limits: { ambientQuietMs: 60000, ambientCooldownMs: 1000, modelAttemptsPerHour: 1 },
+    }),
+    deps: { now: () => now },
+    ambientPlanner: { plan: async () => ({ kind: "skip" }) },
+    model: { generate: async () => ({ kind: "reply", segments: ["must not generate"] }) },
+  });
+  assert.equal(h.receive("300", "/room mode ambient"), "control");
+  assert.equal(h.receive("301", "我今天终于跑通了离线测试，大家怎么看？"), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 60000;
+
+  h.room.store.setPaused(true);
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 0);
+  assert.equal(h.room.store.counts().model, 0);
+  assert.equal(h.room.store.ambientCursor(), null);
+  h.room.store.setPaused(false);
+
+  type Spend = (kind: "model" | "tts" | "send", at: number) => boolean;
+  const mutableStore = h.room.store as unknown as { spend: Spend };
+  const originalSpend = mutableStore.spend.bind(h.room.store);
+  mutableStore.spend = () => false;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 0);
+  assert.equal(h.room.store.counts().model, 0);
+  assert.equal(h.room.store.ambientCursor(), null);
+  mutableStore.spend = originalSpend;
+
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  assert.equal(h.room.store.counts().model, 1);
+  assert.equal(h.room.store.ambientCursor()?.outcome, "skip");
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.dispatches.length, 0);
+  assert.equal(h.synthesisCalls, 0);
+
+  now = base + AMBIENT_IDLE_THRESHOLD_MS;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  assert.equal(h.room.store.counts().model, 1);
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
+});
+
+test("pausing while the ambient planner is in flight admits and generates nothing", async t => {
+  const base = Date.parse("2026-11-18T02:00:00Z");
+  let now = base;
+  const pending = deferred<unknown>();
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      limits: { ambientQuietMs: 60000, ambientCooldownMs: 1000, modelAttemptsPerHour: null },
+    }),
+    deps: { now: () => now },
+    ambientPlanner: { plan: async () => pending.promise },
+    model: { generate: async () => ({ kind: "reply", segments: ["must not generate"] }) },
+  });
+  assert.equal(h.receive("400", "/room mode ambient"), "control");
+  assert.equal(h.receive("401", "我今天终于跑通了离线测试，大家怎么看？"), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 60000;
+  const work = h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  await waitFor(() => h.ambientPlannerCalls.length === 1, "ambient planner in flight");
+  h.room.store.setPaused(true);
+  pending.resolve({ kind: "join", characterIds: ["character-a"] });
+  await work;
+  await flush();
+
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.dispatches.length, 0);
+  assert.equal(h.synthesisCalls, 0);
+  assert.equal(h.room.store.counts().model, 1);
+  assert.equal(h.room.store.state().ambient_at, base + 60000);
+  assert.equal(h.room.store.ambientCursor(), null);
+  assert.equal(h.room.store.seenEvent(ambientPlannerContextKey(h.ambientPlannerCalls[0]!)), false);
+});
+
+test("ambient admission rechecks pause inside its transaction and resume advances pending work", async t => {
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ limits: { ambientQuietMs: 60000 } }),
+    model: { generate: async () => ({ kind: "reply", segments: ["unused"] }) },
+  });
+  assert.equal(h.receive("500", "/room mode ambient"), "control");
+  assert.equal(h.receive("501", "我今天终于跑通了离线测试，大家怎么看？"), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+
+  const admitted = h.room.ambientAdmissionForTest(anchor.id, ["character-a"], QUEUE);
+  assert.equal(admitted.kind, "enqueue");
+  assert.equal(h.room.store.lifecycleRequests().length, 1);
+  const requestId = admitted.request!.requestId;
+  const beforePause = h.room.store.lifecycleControlState();
+  h.room.store.setPaused(true);
+  const paused = h.room.store.lifecycleControlState();
+  assert.equal(paused.paused, true);
+  assert.equal(paused.executionRevision, beforePause.executionRevision + 1);
+  assert.equal(h.room.store.lifecycleTurns(requestId)[0]!.status, "pending");
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.dispatches.length, 0);
+
+  h.room.store.setPaused(false);
+  await waitFor(() => h.dispatches.length === 1, "resumed lifecycle pump delivery");
+  await h.room.whenIdle();
+  assert.equal(h.prompts.length, 1);
+  assert.equal(h.room.store.lifecycleTurns(requestId)[0]!.status, "completed");
+  assert.equal(h.room.store.lifecycleRequests()[0]!.status, "completed");
+
+  h.room.store.setPaused(true);
+  assert.equal(h.receive("502", "又一条公开历史消息", []), "observed");
+  const second = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  const rejected = h.room.ambientAdmissionForTest(second.id, ["character-b"], QUEUE);
+  assert.equal(rejected.kind, "reject");
+  assert.equal(rejected.reason, "paused");
+  assert.equal(h.room.store.lifecycleRequests().length, 1);
+  assert.equal(h.room.store.schemaVersion(), 9);
+});
+
+test("pause fences an in-flight lifecycle generation and resume advances it", async t => {
+  const base = Date.parse("2026-11-18T02:30:00Z");
+  let now = base;
+  const generation = deferred<RoomLifecycleAnswer>();
+  let calls = 0;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      limits: { ambientQuietMs: 60000, ambientCooldownMs: 1000, modelAttemptsPerHour: null },
+    }),
+    deps: { now: () => now },
+    ambientPlanner: { plan: async () => ({ kind: "join", characterIds: ["character-a"] }) },
+    model: { generate: async () => {
+      calls++;
+      return calls === 1 ? generation.promise : { kind: "reply", segments: ["resumed reply"] };
+    } },
+  });
+  assert.equal(h.receive("700", "/room mode ambient"), "control");
+  assert.equal(h.receive("701", "我今天终于跑通了离线测试，大家怎么看？"), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 60000;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  await waitFor(() => h.prompts.length === 1, "in-flight lifecycle generation");
+  assert.equal(h.prompts[0]!.systemPrompt.includes("你正在公开群聊中扮演"), true);
+  assert.equal(h.prompts[0]!.systemPrompt.includes("\uFFFD"), false);
+
+  const requestId = h.room.store.lifecycleRequests()[0]!.requestId;
+  h.room.store.setPaused(true);
+  assert.equal(h.room.store.lifecycleControlState().paused, true);
+  assert.equal(h.room.store.lifecycleTurns(requestId)[0]!.status, "pending");
+  generation.resolve({ kind: "reply", segments: ["must not complete"] });
+  await h.room.whenIdle();
+  assert.equal(h.dispatches.length, 0);
+  assert.equal(h.synthesisCalls, 0);
+  assert.equal(h.room.store.lifecycleTurns(requestId)[0]!.status, "pending");
+  assert.equal(h.room.store.lifecycleSegments(h.room.store.lifecycleTurns(requestId)[0]!.turnId).length, 0);
+
+  h.room.store.setPaused(false);
+  await waitFor(() => h.dispatches.length === 1, "resumed generation delivery");
+  await h.room.whenIdle();
+  assert.equal(calls, 2);
+  assert.equal(h.room.store.lifecycleTurns(requestId)[0]!.status, "completed");
+  assert.equal(h.room.store.lifecycleSegments(h.room.store.lifecycleTurns(requestId)[0]!.turnId).length, 1);
+});
+
+test("ambient admission rejects an anchor superseded while the planner is in flight", async t => {
+  const base = Date.parse("2026-11-18T04:00:00Z");
+  let now = base;
+  const pending = deferred<unknown>();
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      limits: { ambientQuietMs: 60000, ambientCooldownMs: 1000, modelAttemptsPerHour: null },
+    }),
+    deps: { now: () => now },
+    ambientPlanner: { plan: async () => pending.promise },
+    model: { generate: async () => ({ kind: "reply", segments: ["must not generate"] }) },
+  });
+  assert.equal(h.receive("800", "/room mode ambient"), "control");
+  assert.equal(h.receive("801", "我今天终于跑通了离线测试，大家怎么看？"), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 60000;
+  const work = h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  await waitFor(() => h.ambientPlannerCalls.length === 1, "planner in flight");
+  assert.equal(h.receive("802", "新的公开消息，大家一起聊聊这个方案怎么样？"), "observed");
+  pending.resolve({ kind: "join", characterIds: ["character-a"] });
+  await work;
+  await flush();
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
+  assert.equal(h.room.store.ambientCursor()?.outcome, "technical_defer");
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.dispatches.length, 0);
+});
+
+test("ambient planner failure and timeout record one technical defer with no retry storm", async t => {
+  const base = Date.parse("2026-11-18T03:00:00Z");
+  let now = base;
+  const never = deferred<void>();
+  let call = 0;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      limits: { ambientQuietMs: 60000, ambientCooldownMs: 1000, modelAttemptsPerHour: null, requestTimeoutMs: 50 },
+    }),
+    deps: { now: () => now },
+    ambientPlanner: {
+      plan: async () => {
+        call++;
+        if (call === 1) throw new Error("synthetic planner failure");
+        return never.promise;
+      },
+    },
+    model: { generate: async () => ({ kind: "reply", segments: ["must not generate"] }) },
+  });
+  assert.equal(h.receive("600", "/room mode ambient"), "control");
+  assert.equal(h.receive("601", "我今天终于跑通了离线测试，大家怎么看？"), "observed");
+  const first = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 60000;
+  await h.room.ambientOpportunityForTest(first.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  assert.equal(h.room.store.ambientCursor()?.outcome, "technical_defer");
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
+  await h.room.ambientOpportunityForTest(first.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  assert.equal(h.room.store.counts().model, 1);
+
+  assert.equal(h.receive("602", "新的公开消息，大家一起聊聊这个方案怎么样？"), "observed");
+  const second = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 120000;
+  await h.room.ambientOpportunityForTest(second.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 2);
+  assert.equal(h.room.store.ambientCursor()?.outcome, "technical_defer");
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.dispatches.length, 0);
+});
+
+test("ambient invalid JSON records one technical defer and no generation", async t => {
+  const base = Date.parse("2026-11-18T03:30:00Z");
+  let now = base;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      limits: { ambientQuietMs: 60000, ambientCooldownMs: 1000, modelAttemptsPerHour: null },
+    }),
+    deps: { now: () => now },
+    ambientPlanner: { plan: async () => '{"kind":"skip"}' },
+    model: { generate: async () => ({ kind: "reply", segments: ["must not generate"] }) },
+  });
+  assert.equal(h.receive("650", "/room mode ambient"), "control");
+  assert.equal(h.receive("651", "我今天终于跑通了离线测试，大家怎么看？"), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 60000;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  assert.equal(h.room.store.ambientCursor()?.outcome, "technical_defer");
+  assert.equal(h.room.store.counts().model, 1);
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.dispatches.length, 0);
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  assert.equal(h.room.store.counts().model, 1);
+});
+
+test("ambient offline and cooldown policy gates never spend or plan", async t => {
+  const base = Date.parse("2026-11-18T03:45:00Z");
+  let offlineNow = base;
+  const offline = await lifecycleHarness(t, {
+    config: roomConfig({ limits: { ambientQuietMs: 60000, ambientCooldownMs: 1000 } }),
+    deps: { now: () => offlineNow },
+    ambientPlanner: { plan: async () => ({ kind: "skip" }) },
+    model: { generate: async () => ({ kind: "reply", segments: ["unused"] }) },
+  });
+  assert.equal(offline.receive("660", "/room mode ambient"), "control");
+  assert.equal(offline.receive("661", "我今天终于跑通了离线测试，大家怎么看？"), "observed");
+  const offlineAnchor = offline.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  offline.room.setOnline("account-a", false);
+  offlineNow = base + 60000;
+  await offline.room.ambientOpportunityForTest(offlineAnchor.id, QUEUE);
+  assert.equal(offline.ambientPlannerCalls.length, 0);
+  assert.equal(offline.room.store.counts().model, 0);
+  assert.equal(offline.room.store.ambientCursor(), null);
+
+  let cooldownNow = base;
+  const cooldown = await lifecycleHarness(t, {
+    config: roomConfig({ limits: { ambientQuietMs: 60000, ambientCooldownMs: 120000 } }),
+    deps: { now: () => cooldownNow },
+    ambientPlanner: { plan: async () => ({ kind: "skip" }) },
+    model: { generate: async () => ({ kind: "reply", segments: ["unused"] }) },
+  });
+  assert.equal(cooldown.receive("670", "/room mode ambient"), "control");
+  assert.equal(cooldown.receive("671", "我今天终于跑通了离线测试，大家怎么看？"), "observed");
+  const cooldownAnchor = cooldown.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  cooldownNow = base + 60000;
+  cooldown.room.store.ambientAttempt(cooldownNow);
+  await cooldown.room.ambientOpportunityForTest(cooldownAnchor.id, QUEUE);
+  assert.equal(cooldown.ambientPlannerCalls.length, 0);
+  assert.equal(cooldown.room.store.counts().model, 0);
+  assert.equal(cooldown.room.store.ambientCursor(), null);
+});
+
+test("ambient cooldown advances after skip and technical defer", async t => {
+  const base = Date.parse("2026-11-18T03:50:00Z");
+  let now = base;
+  let calls = 0;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      limits: { ambientQuietMs: 60000, ambientCooldownMs: 200000, modelAttemptsPerHour: null },
+    }),
+    deps: { now: () => now },
+    ambientPlanner: {
+      plan: async () => {
+        calls++;
+        if (calls === 1) return { kind: "skip" };
+        if (calls === 2) throw new Error("synthetic technical defer");
+        return { kind: "skip" };
+      },
+    },
+    model: { generate: async () => ({ kind: "reply", segments: ["must not generate"] }) },
+  });
+  assert.equal(h.receive("680", "/room mode ambient"), "control");
+  assert.equal(h.receive("681", "我今天终于跑通了离线测试，大家怎么看？"), "observed");
+  const first = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 60000;
+  await h.room.ambientOpportunityForTest(first.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  assert.equal(h.room.store.ambientCursor()?.outcome, "skip");
+  assert.equal(h.room.store.state().ambient_at, now);
+  assert.equal(h.room.store.counts().model, 1);
+
+  assert.equal(h.receive("682", "新的公开消息，大家一起聊聊这个方案怎么样？"), "observed");
+  const second = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 120000;
+  await h.room.ambientOpportunityForTest(second.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  assert.equal(h.room.store.counts().model, 1);
+
+  now = base + 270000;
+  await h.room.ambientOpportunityForTest(second.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 2);
+  assert.equal(h.room.store.ambientCursor()?.outcome, "technical_defer");
+  assert.equal(h.room.store.state().ambient_at, now);
+  assert.equal(h.room.store.counts().model, 2);
+
+  assert.equal(h.receive("683", "还有一个新的公开消息，大家觉得这个方案如何？"), "observed");
+  const third = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 330000;
+  await h.room.ambientOpportunityForTest(third.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 2);
+  assert.equal(h.room.store.counts().model, 2);
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.dispatches.length, 0);
+});
+
+test("ambient planner is single-flight and the validated cursor suppresses repeats", async t => {
+  const base = Date.parse("2026-11-18T04:00:00Z");
+  let now = base;
+  const pending = deferred<unknown>();
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ limits: { ambientQuietMs: 60000 } }),
+    deps: { now: () => now },
+    ambientPlanner: { plan: async () => pending.promise },
+    model: { generate: async () => ({ kind: "reply", segments: ["unused"] }) },
+  });
+  assert.equal(h.receive("700", "/room mode ambient"), "control");
+  assert.equal(h.receive("701", "我今天终于跑通了离线测试，大家怎么看？"), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 60000;
+  const first = h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  await waitFor(() => h.ambientPlannerCalls.length === 1, "single-flight planner");
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  pending.resolve({ kind: "skip" });
+  await first;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  assert.equal(h.room.store.counts().model, 1);
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
+});
+
+test("ambient cursor survives reopen in room_meta and schema remains version 9", async t => {
+  const root = mkdtempSync(join(tmpdir(), "pa-ambient-cursor-"));
+  const file = join(root, "room.sqlite");
+  const config = checkRoomConfig(roomConfig());
+  let store = new RoomStore(file, config);
+  assert.equal(store.schemaVersion(), 9);
+  const contextKey = "a".repeat(64);
+  store.recordAmbientCursor(contextKey, "technical_defer", Date.parse("2026-11-18T05:00:00Z"));
+  store.close();
+  store = new RoomStore(file, config);
+  assert.equal(store.schemaVersion(), 9);
+  assert.deepEqual(store.ambientCursor(), {
+    contextKey,
+    outcome: "technical_defer",
+    updatedAt: Date.parse("2026-11-18T05:00:00Z"),
+  });
+  store.close();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+});
+
+test("an active direct request blocks the ambient planner without spending another model row", async t => {
+  const base = Date.parse("2026-11-18T06:00:00Z");
+  let now = base;
+  const direct = deferred<RoomLifecycleAnswer>();
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ limits: { ambientQuietMs: 1000, modelAttemptsPerHour: null } }),
+    deps: { now: () => now },
+    ambientPlanner: { plan: async () => ({ kind: "skip" }) },
+    model: { generate: async () => direct.promise },
+  });
+  assert.equal(h.receive("800", "/room mode ambient"), "control");
+  assert.equal(h.receive("801", "direct request", ["10002"]), "scheduled");
+  await waitFor(() => h.prompts.length === 1, "direct generation");
+  assert.equal(h.receive("802", "我今天终于跑通了离线测试，大家怎么看？"), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 2000;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  assert.equal(h.ambientPlannerCalls.length, 0);
+  assert.equal(h.room.store.counts().model, 1);
+  direct.resolve({ kind: "reply", segments: ["direct reply"] });
+  await h.room.whenIdle();
+  assert.equal(h.dispatches.length, 1);
+});
+
+test("Owner /room pause remains fail-closed for ordinary ingress", async t => {
+  const root = mkdtempSync(join(tmpdir(), "pa-owner-pause-"));
+  const forbidden = async (): Promise<never> => { throw new Error("synthetic-legacy-forbidden"); };
+  const room = new VoiceRoom(join(root, "room.sqlite"), checkRoomConfig(roomConfig()), {
+    now: () => Date.parse("2026-11-18T07:00:00Z"),
+    persona: character => `# ${character.name}\nSynthetic public persona.`,
+    generate: forbidden,
+    synthesize: forbidden,
+    sendText: forbidden,
+    sendAudio: forbidden,
+    permitsText: () => true,
+  });
+  t.after(async () => {
+    await room.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  for (const character of room.config.characters) room.setOnline(character.accountKey, true);
+  assert.equal(room.receive(roomInput("900", "/room pause")), "control");
+  assert.equal(room.store.state().paused, 1);
+  assert.equal(room.receive(roomInput("901", "ordinary message", ["10002"])), "paused");
+});
+
+test("production startRoomQq wires the ambient planner into the lifecycle FIFO", async t => {
+  const root = mkdtempSync(join(tmpdir(), "pa-production-ambient-"));
+  let plannerCalls = 0;
+  let lifecycleCalls = 0;
+  let messageId = 880000;
+  const settings: RoomQqSettings = {
+    room: checkRoomConfig(roomConfig({ limits: { ambientQuietMs: 100, ambientCooldownMs: 1000 } })),
+    dataDir: root,
+    port: 0,
+    apiTimeoutMs: 1000,
+    accounts: [
+      { accountKey: "account-a", token: "synthetic-production-token-a", personaFile: "unused-a" },
+      { accountKey: "account-b", token: "synthetic-production-token-b", personaFile: "unused-b" },
+    ],
+    execution: "worker",
+    workerQueue: QUEUE,
+    closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 100, releaseMs: 100, writeWaitMs: 50 },
+  };
+  const lifecycleModel: RoomLifecycleWorker["model"] = {
+    generate: async (prompt, _signal, _maxChars) => {
+      if (prompt.systemPrompt.includes("Ambient 参与度规划器")) {
+        plannerCalls++;
+        return { kind: "reply", segments: [JSON.stringify({ kind: "join", characterIds: ["character-a"] })] };
+      }
+      lifecycleCalls++;
+      return { kind: "reply", segments: ["production ambient reply"] };
+    },
+  };
+  const bridge = await startRoomQq(settings, {
+    persona: character => `# ${character.name}\nSynthetic public persona.`,
+    permitsText: () => true,
+    permitsPrompt: () => true,
+    lifecycleModel,
+  });
+  const sockets: WebSocket[] = [];
+  const open = async (accountKey: string, selfId: string, token: string) => {
+    const socket = new WebSocket(`${bridge.url}/room/${accountKey}`, { headers: {
+      "x-client-role": "Universal", "x-self-id": selfId, Authorization: `Bearer ${token}`,
+    } });
+    sockets.push(socket);
+    socket.on("message", raw => {
+      let value: any;
+      try { value = JSON.parse(raw.toString()); } catch { return; }
+      if (value && typeof value.echo === "string" && typeof value.action === "string") {
+        socket.send(JSON.stringify({ echo: value.echo, status: "ok", retcode: 0,
+          data: { message_id: String(++messageId) } }));
+      }
+    });
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+    return socket;
+  };
+  const send = (socket: WebSocket, id: string, text: string) => socket.send(JSON.stringify({
+    post_type: "message", message_type: "group", sub_type: "normal",
+    self_id: "10002", group_id: "10000", user_id: "10001", message_id: id,
+    message: [{ type: "text", data: { text } }],
+  }));
+  t.after(async () => {
+    for (const socket of sockets) { try { socket.terminate(); } catch { /* already closed */ } }
+    await bridge.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const peerA = await open("account-a", "10002", settings.accounts[0]!.token);
+  await open("account-b", "10003", settings.accounts[1]!.token);
+  await waitFor(() => bridge.room.ready && bridge.status().online === 2,
+    "production lifecycle worker ready", 5000);
+  send(peerA, "880001", "/room mode ambient");
+  await waitFor(() => bridge.room.store.lifecycleControlState().mode === "ambient", "ambient mode", 5000);
+  send(peerA, "880002", "我今天终于跑通了离线测试，大家怎么看？");
+  await waitFor(() => plannerCalls === 1 && bridge.room.store.lifecycleRequests().length === 1,
+    "production ambient opportunity", 5000);
+  await waitFor(() => bridge.room.store.lifecycleRequests()[0]?.status === "completed",
+    "production ambient lifecycle completion", 5000);
+  assert.equal(lifecycleCalls, 1);
+  assert.equal(bridge.room.store.counts().model, 2);
+  const request = bridge.room.store.lifecycleRequests()[0]!;
+  const turn = bridge.room.store.lifecycleTurns(request.requestId)[0]!;
+  assert.equal(bridge.room.store.lifecycleSegments(turn.turnId)[0]!.text, "production ambient reply");
 });

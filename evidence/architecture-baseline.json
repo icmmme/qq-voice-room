@@ -3,7 +3,7 @@
   "rulesetId": "m1-architecture-guard-v1",
   "baseHead": "ec8db7ba6991e4ef61efc949eec6c48968b6ff49",
   "baseTree": "d4fe1d8aee4682823b0bffa9c056f3606295cd67",
-  "entryCount": 42,
+  "entryCount": 43,
   "policy": {
     "baselineScope": "per-file inventory of the fixed legacy Q tree",
     "newUnlayeredSource": "FAIL",
@@ -313,6 +313,17 @@
       "sha256": "433EACAEF78D554BAA2ECA4D44A31A5BCECB9DDFF0590E065B1BB44A12EA9DB7"
     },
     {
+      "path": "src/voice-room/participation-planner.ts",
+      "classification": "LEGACY_UNLAYERED_DEBT",
+      "owner": "Architecture migration owner (M3-M5)",
+      "reason": "Clean-room M3 Ambient planner; flat placement is explicitly allowed by the M3 contract and accepted as temporary unlayered debt until target layering is completed before M5 RC",
+      "exitPhase": "M5",
+      "m1Treatment": "READ_ONLY_INVENTORY_ONLY",
+      "gitBlobSha1": "e789f3c3f77c707ca7196de861ecc260b5862120",
+      "bytes": 6859,
+      "sha256": "20360FEDAFC931D88807AF91D51C6E4FA26B19C91F337CAFC91326FF950D3B9E"
+    },
+    {
       "path": "src/voice-room/participation-policy.ts",
       "classification": "LEGACY_UNLAYERED_DEBT",
       "owner": "Architecture migration owner (M2/M3)",
@@ -374,9 +385,9 @@
       "reason": "Inherited unlayered source in the approved base tree; layering is not established in M1",
       "exitPhase": "M2/M3",
       "m1Treatment": "READ_ONLY_INVENTORY_ONLY",
-      "gitBlobSha1": "0d3a7c20ed2575c4987f15ed4a3aa98a7a72a55b",
-      "bytes": 13941,
-      "sha256": "07FEE44BD5CD3794A5D1607320F2CE810995D19A0FD71E34540C487383E7AA55"
+      "gitBlobSha1": "51f37a888ac1bde14d20c7d869e71ba1a51ffaed",
+      "bytes": 16087,
+      "sha256": "C7CC43B9E3B9DEE3973564EE8203B8B6A869D33E1C92776C52825C2A8AEB5181"
     },
     {
       "path": "src/voice-room/response-planner.ts",
@@ -396,9 +407,9 @@
       "reason": "Inherited unlayered source in the approved base tree; layering is not established in M1",
       "exitPhase": "M2/M3",
       "m1Treatment": "READ_ONLY_INVENTORY_ONLY",
-      "gitBlobSha1": "c4b0a09079de1b0c63de9d201ba923e592c1c1f9",
-      "bytes": 108450,
-      "sha256": "316C10C15B0FEA47E41A2ABD28EABF5CBBE4300B18DF456CF687EA3A8C95B380"
+      "gitBlobSha1": "32d123f1653c8577c5791ea4c0a7589918afde1b",
+      "bytes": 120205,
+      "sha256": "2434B13C57FA1900D15090CDF65FF7C2072F191D2A3FF49D95FC0F813DCB5043"
     },
     {
       "path": "src/voice-room/store.ts",
@@ -407,9 +418,9 @@
       "reason": "Inherited unlayered source in the approved base tree; layering is not established in M1",
       "exitPhase": "M2/M3",
       "m1Treatment": "READ_ONLY_INVENTORY_ONLY",
-      "gitBlobSha1": "f93e5256f0bf6586711f6e4dc96e8b4a7a16b0aa",
-      "bytes": 187622,
-      "sha256": "68A05EAD65969D393ED6ED33D2F23333AEE639ADB6F9AEB9AF17861FE2A1009E"
+      "gitBlobSha1": "56fba46d6ca2041902dbff4ce1e2acd2749d085c",
+      "bytes": 199229,
+      "sha256": "4DFDF33E93590C18E1FDDEFB57461535B5E331D9CE593BCA14AB09B6FB87CB78"
     },
     {
       "path": "src/voice-room/tools.ts",

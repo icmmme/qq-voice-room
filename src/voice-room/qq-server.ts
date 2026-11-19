@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
 import { join } from "node:path";
@@ -9,8 +9,12 @@ import { parseRoomQqMessage } from "./qq-message.js";
 import type { RoomQqSettings } from "./qq-config.js";
 import { checkedWorkerQueue } from "./qq-config.js";
 import { VoiceRoom, type RoomLifecycleModelPort } from "./runtime.js";
-import { RoomSendError, type RoomControlAction, type RoomDependencies, type RoomInput, type RoomParticipationMode } from "./types.js";
+import type { RoomAmbientPlanner } from "./participation-planner.js";
+import { RoomSendError, type RoomControlAction, type RoomDependencies, type RoomInput,
+  type RoomParticipationMode, type RoomPrompt } from "./types.js";
 import { roomRecord } from "./fish.js";
+
+const AMBIENT_PLANNER_TRANSPORT_MAX_CHARS = 1000;
 
 export interface RoomQqNotice {
   type: "connected" | "disconnected" | "rejected" | "received" | "error" | "participation" | "voice-preparation";
@@ -36,6 +40,39 @@ export async function startRoomQq(settings: RoomQqSettings,
     throw new Error("room-worker-config-invalid");
   }
   const workerQueue = workerSelected ? checkedWorkerQueue(settings.workerQueue) : undefined;
+  // Reuse the lifecycle model endpoint through its existing JSON envelope. This
+  // keeps production on the same model/config as lifecycle generation and adds
+  // no second provider, dependency, config field or test-only entry point.
+  const ambientPlanner: RoomAmbientPlanner | undefined = workerSelected && deps.lifecycleModel
+    ? {
+        plan: async (_input, prompt, signal) => {
+          const character = config.characters[0]!;
+          const maxChars = AMBIENT_PLANNER_TRANSPORT_MAX_CHARS;
+          const roomPrompt: RoomPrompt = Object.freeze({
+            systemPrompt: prompt.systemPrompt,
+            messages: Object.freeze([{ role: "user" as const,
+              content: `${prompt.messages[0].content}\n\nAmbient planner transport protocol: `
+                + `return exactly {"kind":"reply","segments":["<planner decision JSON>"]}. `
+                + `The single segment must be the planner decision JSON object, for example `
+                + `{"kind":"skip"} or {"kind":"join","characterIds":["configured-id"]}. `
+                + `Do not return a lifecycle skip for this request.` }]) as RoomPrompt["messages"],
+            tools: Object.freeze([]) as readonly [],
+            personaHash: createHash("sha256").update(prompt.systemPrompt).digest("hex"),
+            characterId: character.id,
+            accountKey: character.accountKey,
+            voiceKey: character.voiceKey,
+            targetId: 0,
+          });
+          const answer = await deps.lifecycleModel!.generate(roomPrompt, signal, maxChars);
+          if (answer.kind === "skip") return Object.freeze({ kind: "skip" as const });
+          if (answer.segments.length !== 1) throw new Error("room-ambient-planner-envelope-invalid");
+          let decision: unknown;
+          try { decision = JSON.parse(answer.segments[0]!); }
+          catch { throw new Error("room-ambient-planner-decision-invalid"); }
+          return decision;
+        },
+      }
+    : undefined;
   if (!Number.isInteger(settings.port) || settings.port < 0 || settings.port > 65535
     || !Number.isInteger(settings.apiTimeoutMs) || settings.apiTimeoutMs < 100 || settings.apiTimeoutMs > 60000
     || settings.accounts.length !== config.characters.length
@@ -143,7 +180,8 @@ export async function startRoomQq(settings: RoomQqSettings,
       room.setOnline(account.accountKey, true);
       if (workerSelected && !workerStarted && peers.size === config.characters.length) {
         workerStarted = true;
-        void room.startLifecycleProductionWorker({ model: deps.lifecycleModel!, apiTimeoutMs: settings.apiTimeoutMs,
+        void room.startLifecycleProductionWorker({ model: deps.lifecycleModel!, ambientPlanner,
+          apiTimeoutMs: settings.apiTimeoutMs,
           closePolicy, dispatch: async request => {
             if (closing || request.signal.aborted) throw new RoomSendError("rejected");
             const peer = peers.get(request.attempt.accountKey);
