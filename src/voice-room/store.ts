@@ -1717,11 +1717,12 @@ export class RoomStore {
     const failed = settledTurns.some(t => ["failed","unknown","cancelled","blocked"].includes(t.status))
       || segments.some(s => ["failed","unknown","cancelled","blocked"].includes(s.state));
     const status: LifecycleRequestStatus = failed ? "failed" : "completed";
+    const degraded = segments.find(s => typeof s.reason === "string" && s.reason.startsWith("tts_text_only"));
     const reason = failed
       ? settledTurns.find(t => ["failed","unknown","cancelled","blocked"].includes(t.status))?.reason
         ?? segments.find(s => ["failed","unknown","cancelled","blocked"].includes(s.state))?.reason
         ?? "lifecycle_failed"
-      : "all_obligations_terminal";
+      : degraded?.reason ?? "all_obligations_terminal";
     this.db.prepare("UPDATE room_lifecycle_requests SET status=?,outcome_reason=?,updated_at=? WHERE request_id=? AND status IN ('generating','delivering')")
       .run(status, reason, now, requestId);
   }
@@ -2287,6 +2288,30 @@ export class RoomStore {
         }
       }
       this.lifecycleSettleRequest(requestId, now);
+    });
+  }
+
+  /**
+   * A `both`-mode segment whose text is already acknowledged degrades to a
+   * text-only delivery when audio cannot be produced. The failure stays visible
+   * in the reason, but the segment and its request are not reported as failed.
+   */
+  settleLifecycleTextOnly(segmentId: string, reason: string, ownerToken: string, now: number): boolean {
+    if (!code(reason)) throw new Error("room-lifecycle-segment-invalid");
+    const prefixed = `tts_text_only_${reason}`;
+    const settled = prefixed.length <= 80 ? prefixed : "tts_text_only";
+    return this.transaction(() => {
+      this.assertLifecycleOwner(ownerToken, now);
+      const row = this.db.prepare(`SELECT s.turn_id,s.state,s.delivery_mode,t.request_id
+        FROM room_lifecycle_segments s JOIN room_lifecycle_turns t ON t.turn_id=s.turn_id
+        WHERE s.segment_id=?`).get(segmentId);
+      if (!row || row.state !== "text_sent" || row.delivery_mode !== "both") return false;
+      const changed = this.db.prepare(`UPDATE room_lifecycle_segments SET state='completed',reason=?,updated_at=?
+        WHERE segment_id=? AND state='text_sent'`).run(settled, now, segmentId).changes;
+      if (changed !== 1) return false;
+      this.lifecycleSettleTurn(String(row.turn_id), now);
+      this.lifecycleSettleRequest(String(row.request_id), now);
+      return true;
     });
   }
   applyLifecycleMode(mode: "mention_only" | "ambient", eventKey: string, expectedEpoch: number, ownerToken: string, now: number): RoomControlResult {

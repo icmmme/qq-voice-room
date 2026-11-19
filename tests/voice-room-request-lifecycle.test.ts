@@ -1037,8 +1037,9 @@ test("text plus voice is tools-free, text-only skips TTS, and translation failur
   assert.equal(translated.synthesisCalls, 0);
   const request = translated.room.store.lifecycleRequests()[0]!;
   const turn = translated.room.store.lifecycleTurns(request.requestId)[0]!;
-  assert.equal(turn.status, "failed");
-  assert.equal(translated.room.store.lifecycleSegments(turn.turnId)[0]!.reason, "voice_translation_unavailable");
+  assert.equal(turn.status, "completed");
+  assert.equal(translated.room.store.lifecycleSegments(turn.turnId)[0]!.reason,
+    "tts_text_only_voice_translation_unavailable");
   assert.ok(translated.room.store.history().some(row => row.speakerType === "bot" && row.text === "text retained"));
 });
 
@@ -1809,4 +1810,187 @@ test("production startRoomQq wires the ambient planner into the lifecycle FIFO",
   const request = bridge.room.store.lifecycleRequests()[0]!;
   const turn = bridge.room.store.lifecycleTurns(request.requestId)[0]!;
   assert.equal(bridge.room.store.lifecycleSegments(turn.turnId)[0]!.text, "production ambient reply");
+});
+
+test("TTS failure after an acknowledged text segment settles the segment text-only, not failed", async t => {
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["spoken text"] }) },
+    synthesize: async () => { throw new Error("fish-tts-network"); },
+  });
+  assert.equal(h.receive("90", "speak", ["10002"]), "scheduled");
+  await waitFor(() => h.room.store.lifecycleRequests()[0]?.status === "completed",
+    "text-only fallback completion");
+  const request = h.room.store.lifecycleRequests()[0]!;
+  const segment = h.room.store.lifecycleSegments(h.room.store.lifecycleTurns(request.requestId)[0]!.turnId)[0]!;
+  assert.equal(segment.state, "completed");
+  assert.equal(segment.reason, "tts_text_only_fish-tts-network");
+  assert.equal(request.outcomeReason, "tts_text_only_fish-tts-network");
+  assert.deepEqual(h.dispatches.map(item => item.medium), ["text"]);
+});
+
+test("TTS failure without an acknowledged text segment still settles the segment failed", async t => {
+  let textAttempts = 0;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["spoken text"] }) },
+    synthesize: async () => { throw new Error("fish-tts-network"); },
+    dispatch: async (request) => {
+      if (request.medium === "text" && ++textAttempts === 1) throw new Error("transport_rejected");
+      request.beforeSend();
+      await request.observe({ kind: "ack", messageId: "880001" });
+      request.released();
+      return "880001";
+    },
+  });
+  assert.equal(h.receive("91", "speak", ["10002"]), "scheduled");
+  await waitFor(() => h.room.store.lifecycleRequests()[0]?.status === "failed", "text failure");
+  const request = h.room.store.lifecycleRequests()[0]!;
+  const segment = h.room.store.lifecycleSegments(h.room.store.lifecycleTurns(request.requestId)[0]!.turnId)[0]!;
+  assert.notEqual(segment.state, "completed");
+  assert.ok(segment.state === "failed" || segment.state === "unknown");
+});
+
+test("a text-only fallback does not block the following segment", async t => {
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["first", "second"] }) },
+    synthesize: async () => { throw new Error("fish-tts-network"); },
+  });
+  assert.equal(h.receive("92", "speak", ["10002"]), "scheduled");
+  await waitFor(() => h.room.store.lifecycleRequests()[0]?.status === "completed", "both segments");
+  const request = h.room.store.lifecycleRequests()[0]!;
+  const segments = h.room.store.lifecycleSegments(h.room.store.lifecycleTurns(request.requestId)[0]!.turnId);
+  assert.equal(segments.length, 2);
+  for (const segment of segments) {
+    assert.equal(segment.state, "completed");
+    assert.equal(segment.reason, "tts_text_only_fish-tts-network");
+  }
+  assert.deepEqual(h.dispatches.map(item => item.medium), ["text", "text"]);
+});
+
+test("an overlong TTS failure code degrades to the bare text-only reason", async t => {
+  const longCode = "tts_" + "x".repeat(76);
+  assert.equal(longCode.length, 80);
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["spoken text"] }) },
+    synthesize: async () => { throw new Error(longCode); },
+  });
+  assert.equal(h.receive("93", "speak", ["10002"]), "scheduled");
+  await waitFor(() => h.room.store.lifecycleRequests()[0]?.status === "completed", "degraded completion");
+  const request = h.room.store.lifecycleRequests()[0]!;
+  const segment = h.room.store.lifecycleSegments(h.room.store.lifecycleTurns(request.requestId)[0]!.turnId)[0]!;
+  assert.equal(segment.state, "completed");
+  assert.equal(segment.reason, "tts_text_only");
+  assert.equal(request.outcomeReason, "tts_text_only");
+});
+
+test("a text-only fallback keeps the TTS cause visible at request level", async t => {
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["spoken text"] }) },
+    synthesize: async () => { throw new Error("fish-tts-network"); },
+  });
+  assert.equal(h.receive("94", "speak", ["10002"]), "scheduled");
+  await waitFor(() => h.room.store.lifecycleRequests()[0]?.status === "completed", "fallback completion");
+  const request = h.room.store.lifecycleRequests()[0]!;
+  assert.equal(request.outcomeReason, "tts_text_only_fish-tts-network");
+});
+
+test("a successful second segment after a text-only fallback still delivers audio", async t => {
+  let synthCalls = 0;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["first", "second"] }) },
+    synthesize: async () => {
+      synthCalls++;
+      if (synthCalls === 1) throw new Error("fish-tts-network");
+      return new Uint8Array([4, 5, 6]);
+    },
+  });
+  assert.equal(h.receive("95", "speak", ["10002"]), "scheduled");
+  await waitFor(() => h.room.store.lifecycleRequests()[0]?.status === "completed", "mixed completion");
+  const request = h.room.store.lifecycleRequests()[0]!;
+  const segments = h.room.store.lifecycleSegments(h.room.store.lifecycleTurns(request.requestId)[0]!.turnId);
+  assert.equal(segments.length, 2);
+  assert.equal(segments[0]!.state, "completed");
+  assert.equal(segments[0]!.reason, "tts_text_only_fish-tts-network");
+  assert.equal(segments[1]!.state, "completed");
+  assert.equal(segments[1]!.reason, null);
+  assert.deepEqual(h.dispatches.map(item => item.medium), ["text", "text", "audio"]);
+});
+
+test("pausing while audio synthesis is in flight never settles the segment text-only", async t => {
+  let synthesisStarted = false;
+  let synthesisCalls = 0;
+  let rejectAudio!: (error: Error) => void;
+  const audio = new Promise<Uint8Array>((_, reject) => { rejectAudio = reject; });
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["spoken text"] }) },
+    synthesize: async () => {
+      synthesisCalls++;
+      if (synthesisCalls === 1) {
+        synthesisStarted = true;
+        return audio;
+      }
+      throw new Error("fish-tts-network");
+    },
+  });
+  assert.equal(h.receive("96", "speak", ["10002"]), "scheduled");
+  await waitFor(() => synthesisStarted, "TTS start");
+
+  h.room.store.setPaused(true);
+  rejectAudio(new Error("fish-tts-network"));
+  await h.room.whenIdle();
+
+  const request = h.room.store.lifecycleRequests()[0]!;
+  const segment = h.room.store.lifecycleSegments(h.room.store.lifecycleTurns(request.requestId)[0]!.turnId)[0]!;
+  assert.equal(segment.state, "text_sent", JSON.stringify({ status: request.status, outcome: request.outcomeReason,
+    state: segment.state, reason: segment.reason, audit: h.room.store.lifecycleAudit() }));
+  assert.equal(segment.reason, null);
+  assert.notEqual(request.status, "completed");
+  assert.notEqual(request.outcomeReason, "tts_text_only_fish-tts-network");
+  assert.deepEqual(h.dispatches.map(item => item.medium), ["text"]);
+
+  h.room.store.setPaused(false);
+  await waitFor(() => h.room.store.lifecycleRequests()[0]?.status === "completed", "resumed fallback");
+  const resumed = h.room.store.lifecycleSegments(h.room.store.lifecycleTurns(request.requestId)[0]!.turnId)[0]!;
+  assert.equal(resumed.state, "completed");
+  assert.equal(resumed.reason, "tts_text_only_fish-tts-network");
+  assert.deepEqual(h.dispatches.map(item => item.medium), ["text"]);
+  assert.equal(synthesisCalls, 2);
+});
+
+test("losing the lifecycle owner during audio synthesis never settles the segment text-only", async t => {
+  let synthesisStarted = false;
+  let rejectAudio!: (error: Error) => void;
+  const audio = new Promise<Uint8Array>((_, reject) => { rejectAudio = reject; });
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["spoken text"] }) },
+    synthesize: async () => {
+      synthesisStarted = true;
+      return audio;
+    },
+  });
+  assert.equal(h.receive("97", "speak", ["10002"]), "scheduled");
+  await waitFor(() => synthesisStarted, "TTS start");
+  assert.equal(h.dispatches.map(item => item.medium).join(","), "text");
+
+  const control = h.room.store.lifecycleControlState();
+  h.room.store.initializeLifecycleControl(control.epoch, Date.parse("2026-11-13T00:00:00Z"), "replacement-owner",
+    Date.parse("2026-11-13T00:10:00Z"));
+  rejectAudio(new Error("fish-tts-network"));
+  await h.room.whenIdle();
+
+  const request = h.room.store.lifecycleRequests()[0]!;
+  const segment = h.room.store.lifecycleSegments(h.room.store.lifecycleTurns(request.requestId)[0]!.turnId)[0]!;
+  assert.notEqual(segment.state, "completed", JSON.stringify({ status: request.status, outcome: request.outcomeReason,
+    state: segment.state, reason: segment.reason }));
+  assert.equal(segment.reason?.startsWith("tts_text_only") ?? false, false);
+  assert.notEqual(request.status, "completed");
+  assert.equal(request.outcomeReason?.startsWith("tts_text_only") ?? false, false);
+  assert.deepEqual(h.dispatches.map(item => item.medium), ["text"]);
 });
