@@ -1994,3 +1994,927 @@ test("losing the lifecycle owner during audio synthesis never settles the segmen
   assert.equal(request.outcomeReason?.startsWith("tts_text_only") ?? false, false);
   assert.deepEqual(h.dispatches.map(item => item.medium), ["text"]);
 });
+
+test("send budget exhaustion settles only the limited sends and keeps the worker accepting the next request", async t => {
+  let now = Date.parse("2026-11-13T00:00:00Z");
+  let sent = 0;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both", limits: { turnsPerMinute: 6 } }),
+    model: { generate: async () => ({ kind: "reply", segments: ["budget one", "budget two"] }) },
+    deps: { now: () => now },
+    dispatch: async request => {
+      request.beforeSend();
+      const id = String(800000 + ++sent);
+      await request.observe({ kind: "ack", messageId: id });
+      if (request.medium === "audio") request.physicalSettled();
+      request.released();
+      return id;
+    },
+  });
+  assert.equal(h.receive("100", "both", ["10002", "10003"]), "scheduled");
+  await h.room.whenIdle();
+
+  const first = h.room.store.lifecycleRequests()[0]!;
+  assert.equal(h.room.store.counts().send, 6, "the six-send window is the hard limit");
+  assert.equal(sent, 6, "the transport sees exactly the budgeted attempts");
+  assert.equal(first.status, "failed");
+  assert.equal(h.room.workerStatusForTest().phase, "ready", "a send quota stop is not a worker fault");
+  assert.equal(h.room.workerStatusForTest().lastError, null);
+  assert.equal(first.outcomeReason, "send_budget_exhausted");
+
+  const limited = h.room.store.lifecycleAudit().filter(row => row.segmentStatus === "blocked");
+  assert.ok(limited.length >= 1, "the unstarted remainder stays unsent");
+  assert.ok(limited.every(row => row.segmentReason === "send_budget_exhausted"), JSON.stringify(limited));
+
+  now += 61_000;
+  sent = 0;
+  assert.equal(h.receive("101", "next", ["10002"]), "scheduled");
+  await h.room.whenIdle();
+  assert.equal(sent, 4, "two segments of text and audio send after the window");
+  assert.equal(h.room.store.lifecycleRequests()[1]!.status, "completed");
+});
+
+test("send budget exhaustion on audio keeps an acknowledged text as delivered text-only", async t => {
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both", limits: { turnsPerMinute: 3 } }),
+    model: { generate: async () => ({ kind: "reply", segments: ["spoken one", "spoken two"] }) },
+    dispatch: async request => {
+      request.beforeSend();
+      const id = String(810000 + (request.medium === "audio" ? 1 : 0));
+      await request.observe({ kind: "ack", messageId: id });
+      if (request.medium === "audio") request.physicalSettled();
+      request.released();
+      return id;
+    },
+  });
+  assert.equal(h.receive("110", "speak", ["10002"]), "scheduled");
+  await h.room.whenIdle();
+
+  const request = h.room.store.lifecycleRequests()[0]!;
+  const turn = h.room.store.lifecycleTurns(request.requestId)[0]!;
+  const segments = h.room.store.lifecycleSegments(turn.turnId);
+  assert.equal(segments.length, 2);
+  assert.equal(segments[0]!.state, "completed", "first segment delivered text and audio");
+  assert.equal(segments[0]!.reason, null);
+  assert.equal(segments[1]!.state, "completed", "second segment keeps its acknowledged text");
+  assert.equal(segments[1]!.reason, "tts_text_only_send_budget");
+  assert.equal(h.room.store.counts().send, 3, "only the three budgeted sends start");
+  assert.equal(h.room.workerStatusForTest().phase, "ready");
+  assert.equal(request.outcomeReason, "tts_text_only_send_budget");
+});
+test("an expiring head request leaves the queue instead of rewriting the same intent", async t => {
+  let now = Date.parse("2026-11-13T00:00:00Z");
+  const intents: string[] = [];
+  let dispatchCount = 0;
+  const h = await lifecycleHarness(t, {
+    model: { generate: async () => ({ kind: "reply", segments: ["expires one", "expires two"] }) },
+    deps: { now: () => now },
+    dispatch: async request => {
+      dispatchCount++;
+      if (dispatchCount === 1) {
+        request.beforeSend();
+        await request.observe({ kind: "ack", messageId: "820001" });
+        request.released();
+        now += QUEUE.ttlMs + 1000;
+        return "820001";
+      }
+      request.beforeSend();
+      await request.observe({ kind: "ack", messageId: "820002" });
+      if (request.medium === "audio") request.physicalSettled();
+      request.released();
+      return "820002";
+    },
+  });
+  const store = h.room.store as unknown as {
+    recordLifecycleIntent(segmentId: string, medium: "text" | "audio", ownerToken: string, now: number): unknown;
+  };
+  const original = store.recordLifecycleIntent.bind(h.room.store);
+  store.recordLifecycleIntent = (segmentId, medium, ownerToken, at) => {
+    intents.push(segmentId + ":" + medium);
+    return original(segmentId, medium, ownerToken, at);
+  };
+
+  assert.equal(h.receive("120", "expire", ["10002"]), "scheduled");
+  await h.room.whenIdle();
+
+  const request = h.room.store.lifecycleRequests()[0]!;
+  assert.equal(request.outcomeReason, "ttl_expired", JSON.stringify(request));
+  assert.equal(request.status, "cancelled", "the existing expiry path settles the remainder as cancelled");
+  assert.equal(intents.filter(entry => entry.endsWith(":text")).length, 1,
+    "the second segment never records a fresh intent after expiry: " + JSON.stringify(intents));
+  const turn = h.room.store.lifecycleTurns(request.requestId)[0]!;
+  const segments = h.room.store.lifecycleSegments(turn.turnId);
+  assert.equal(segments[0]!.state, "completed", "the acknowledged receipt stays delivered");
+  assert.equal(h.room.workerStatusForTest().phase, "ready");
+  assert.equal(h.room.store.lifecycleHeadRequest(), null, "the expired head leaves the FIFO");
+});
+
+test("a request that expires before its first intent still leaves the queue", async t => {
+  let now = Date.parse("2026-11-13T00:00:00Z");
+  let dispatchCount = 0;
+  const h = await lifecycleHarness(t, {
+    model: { generate: async () => ({ kind: "reply", segments: ["late"] }) },
+    deps: { now: () => now },
+    dispatch: async request => {
+      dispatchCount++;
+      request.beforeSend();
+      await request.observe({ kind: "ack", messageId: "830001" });
+      request.released();
+      return "830001";
+    },
+  });
+  assert.equal(h.receive("121", "expire early", ["10002"]), "scheduled");
+  now += QUEUE.ttlMs + 1000;
+  await h.room.whenIdle();
+  assert.equal(dispatchCount, 0, "no send starts after expiry");
+  const request = h.room.store.lifecycleRequests()[0]!;
+  assert.notEqual(request.status, "delivering", JSON.stringify(request));
+  assert.equal(request.outcomeReason, "ttl_expired");
+  assert.equal(h.room.store.lifecycleHeadRequest(), null);
+});
+test("a persistent fence read fault on the audio path faults the worker instead of parking it", async t => {
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["fence fault"] }) },
+  });
+  const store = h.room.store as unknown as {
+    lifecycleAudioFenceInfo(): unknown;
+  };
+  // The audio path reads the fence before recording an intent. A read fault
+  // that does not clear must surface as a worker fault, never as a silent
+  // "no progress" exit that leaves the worker reporting `ready`.
+  store.lifecycleAudioFenceInfo = () => { throw new Error("simulated-fence-read-fault"); };
+
+  assert.equal(h.receive("160", "fence fault", ["10002"]), "scheduled");
+  await waitFor(() => h.room.workerStatusForTest().phase !== "ready", "worker faults on the read error", 4000);
+
+  const status = h.room.workerStatusForTest();
+  assert.notEqual(status.phase, "ready",
+    "a persistent storage read fault must fault the worker: " + JSON.stringify(status));
+  assert.ok(typeof status.lastError === "string" && status.lastError.length > 0,
+    "the fault is reported: " + JSON.stringify(status));
+});
+
+test("a storage fault while settling a send-budget stop faults the worker instead of parking the request", async t => {
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ limits: { turnsPerMinute: 1 } }),
+    model: { generate: async () => ({ kind: "reply", segments: ["first", "second"] }) },
+    dispatch: async request => {
+      request.beforeSend();
+      const id = String(880000 + Math.floor(Math.random() * 1000));
+      await request.observe({ kind: "ack", messageId: id });
+      request.released();
+      return id;
+    },
+  });
+  // Fail only the settlement write, leaving the budget rejection itself intact.
+  const store = h.room.store as unknown as {
+    finishLifecycleSegment(...args: unknown[]): void;
+  };
+  const original = store.finishLifecycleSegment.bind(h.room.store);
+  let injected = false;
+  store.finishLifecycleSegment = (...args: unknown[]) => {
+    if (!injected) { injected = true; throw new Error("simulated-storage-fault"); }
+    return original(...args);
+  };
+
+  assert.equal(h.receive("150", "budget fault", ["10002"]), "scheduled");
+  await waitFor(() => h.room.workerStatusForTest().phase !== "ready"
+    || h.room.store.lifecycleHeadRequest() === null, "budget settlement outcome", 4000);
+
+  assert.equal(injected, true, "the settlement write was reached");
+  const status = h.room.workerStatusForTest();
+  assert.notEqual(status.phase, "ready",
+    "a real storage fault must not be swallowed as a concurrent cancellation: " + JSON.stringify(status));
+  assert.ok(typeof status.lastError === "string" && status.lastError.length > 0,
+    "the fault is reported: " + JSON.stringify(status));
+});
+
+test("an expiry race between the TTL check and the send intent still leaves the queue", async t => {
+  let now = Date.parse("2026-11-13T00:00:00Z");
+  let dispatchCount = 0;
+  const h = await lifecycleHarness(t, {
+    model: { generate: async () => ({ kind: "reply", segments: ["race"] }) },
+    deps: { now: () => now },
+    dispatch: async request => {
+      dispatchCount++;
+      request.beforeSend();
+      await request.observe({ kind: "ack", messageId: "890001" });
+      request.released();
+      return "890001";
+    },
+  });
+  // The delivery loop's expiry check has already passed when the intent
+  // transaction rejects. Simulate exactly that: cross the deadline and fail the
+  // intent, which is what `recordLifecycleIntent` does when it re-validates TTL.
+  const store = h.room.store as unknown as {
+    recordLifecycleIntent(...args: unknown[]): unknown;
+  };
+  const original = store.recordLifecycleIntent.bind(h.room.store);
+  let crossed = false;
+  store.recordLifecycleIntent = (...args: unknown[]) => {
+    if (!crossed) {
+      crossed = true;
+      now += QUEUE.ttlMs + 1;
+      throw new Error("room-lifecycle-attempt-invalid");
+    }
+    return original(...args);
+  };
+
+  assert.equal(h.receive("151", "race", ["10002"]), "scheduled");
+  await waitFor(() => h.room.store.lifecycleHeadRequest() === null, "expired head leaves the FIFO", 4000);
+
+  assert.equal(crossed, true, "the intent transaction observed the crossed deadline");
+  assert.equal(dispatchCount, 0, "no physical send starts for an expired request");
+  const request = h.room.store.lifecycleRequests()[0]!;
+  assert.equal(request.outcomeReason, "ttl_expired", JSON.stringify(request));
+  assert.equal(h.room.workerStatusForTest().phase, "ready");
+});
+
+test("expiry in the moment before a send never starts that attempt", async t => {
+  let now = Date.parse("2026-11-13T00:00:00Z");
+  let dispatchCount = 0;
+  const h = await lifecycleHarness(t, {
+    model: { generate: async () => ({ kind: "reply", segments: ["too late"] }) },
+    deps: { now: () => now },
+    dispatch: async request => {
+      dispatchCount++;
+      // The deadline passes between the intent and the physical send check.
+      now += QUEUE.ttlMs + 1;
+      request.beforeSend();
+      await request.observe({ kind: "ack", messageId: "860001" });
+      request.released();
+      return "860001";
+    },
+  });
+  assert.equal(h.receive("140", "late", ["10002"]), "scheduled");
+  await h.room.whenIdle();
+  assert.equal(dispatchCount, 1, "the dispatcher is entered once");
+  const request = h.room.store.lifecycleRequests()[0]!;
+  assert.notEqual(request.status, "delivering", JSON.stringify(request));
+  assert.equal(h.room.store.lifecycleHeadRequest(), null, "the expired request leaves the FIFO");
+  assert.equal(h.room.workerStatusForTest().phase, "ready");
+});
+
+test("audio preparation that crosses the deadline delivers no audio", async t => {
+  let now = Date.parse("2026-11-13T00:00:00Z");
+  const media: string[] = [];
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["spoken late"] }) },
+    deps: { now: () => now },
+    synthesize: async () => {
+      // Synthesis itself outlives the request deadline.
+      now += QUEUE.ttlMs + 1000;
+      return new Uint8Array([9, 9, 9]);
+    },
+    dispatch: async request => {
+      media.push(request.medium);
+      request.beforeSend();
+      await request.observe({ kind: "ack", messageId: request.medium === "audio" ? "870002" : "870001" });
+      if (request.medium === "audio") request.physicalSettled();
+      request.released();
+      return request.medium === "audio" ? "870002" : "870001";
+    },
+  });
+  assert.equal(h.receive("141", "speak late", ["10002"]), "scheduled");
+  await h.room.whenIdle();
+  assert.deepEqual(media, ["text"], "no audio attempt starts after the deadline");
+  const request = h.room.store.lifecycleRequests()[0]!;
+  const turn = h.room.store.lifecycleTurns(request.requestId)[0]!;
+  const segment = h.room.store.lifecycleSegments(turn.turnId)[0]!;
+  assert.equal(segment.state, "failed", JSON.stringify(segment));
+  assert.equal(segment.reason, "ttl_expired", "the acknowledged text fact is preserved, the audio part expires");
+  assert.equal(request.outcomeReason, "ttl_expired");
+  assert.equal(h.room.store.lifecycleHeadRequest(), null);
+  assert.equal(h.room.workerStatusForTest().phase, "ready");
+});
+
+test("a restart with an unknown audio result still lets new text and both-mode text deliver", async t => {
+  const config = roomConfig({ deliveryMode: "both" });
+  let stuckAttemptId = "";
+  const h = await lifecycleHarness(t, {
+    config,
+    model: { generate: async () => ({ kind: "reply", segments: ["stuck audio"] }) },
+    dispatch: async request => {
+      request.beforeSend();
+      if (request.medium === "text") {
+        await request.observe({ kind: "ack", messageId: "840001" });
+        request.released();
+        return "840001";
+      }
+      stuckAttemptId = request.attempt.attemptId;
+      // Physical send started, the completion result is never persisted.
+      return new Promise<string>(() => {});
+    },
+  });
+  assert.equal(h.receive("130", "stuck", ["10002"]), "scheduled");
+  await waitFor(() => stuckAttemptId !== "", "audio attempt start");
+  await waitFor(() => h.room.store.lifecycleAudioFence() === stuckAttemptId, "audio fence held");
+  await h.room.close();
+
+  const reopened = new VoiceRoom(join(h.root, "room.sqlite"), config, {
+    now: () => Date.parse("2026-11-13T00:00:00Z"),
+    persona: character => `# ${character.name}\nSynthetic public persona.`,
+    generate: async () => { throw new Error("synthetic-legacy-forbidden"); },
+    synthesize: async () => new Uint8Array([5, 5, 5]),
+    sendText: async () => { throw new Error("synthetic-legacy-forbidden"); },
+    sendAudio: async () => { throw new Error("synthetic-legacy-forbidden"); },
+    permitsText: () => true,
+    permitsPrompt: () => true,
+  }, { execution: "lifecycle" });
+  try {
+    for (const character of config.characters) reopened.setOnline(character.accountKey, true);
+    const sent: Array<{ medium: string; text: string; requestId: string }> = [];
+    let replyIndex = 0;
+    await reopened.startLifecycleProductionWorker({
+      // Each request gets its own text so the assertions below cannot be
+      // satisfied by an earlier request's dispatch.
+      model: { generate: async () => ({ kind: "reply", segments: [`after restart ${++replyIndex}`] }) },
+      apiTimeoutMs: 100,
+      closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 100, releaseMs: 100, writeWaitMs: 50 },
+      dispatch: async request => {
+        request.beforeSend();
+        const id = String(850000 + sent.length);
+        sent.push({ medium: request.medium, text: request.item.segment.text, requestId: request.item.request.requestId });
+        await request.observe({ kind: "ack", messageId: id });
+        if (request.medium === "audio") request.physicalSettled();
+        request.released();
+        return id;
+      },
+      beginClose: () => {},
+      sealObservations: async () => {},
+    });
+
+    assert.equal(reopened.store.lifecycleAudioFence(), stuckAttemptId,
+      "the unknown legacy audio keeps its fence and identifier");
+    assert.equal(reopened.receiveLifecycle(roomInput("131", "text only", ["10002"]), QUEUE), "scheduled");
+    await waitFor(() => sent.length >= 1, "text after restart");
+    assert.equal(sent[0]!.medium, "text");
+    assert.equal(sent[0]!.text, "after restart 1", "the plain-text request carries its own text");
+    const textOnlyRequestId = sent[0]!.requestId;
+
+    reopened.store.setDeliveryMode("both");
+    assert.equal(reopened.receiveLifecycle(roomInput("132", "both after restart", ["10002"]), QUEUE), "scheduled");
+    await waitFor(() => sent.some(item => item.requestId !== textOnlyRequestId && item.medium === "text"),
+      "both-mode text from its own request");
+    const bothText = sent.find(item => item.requestId !== textOnlyRequestId && item.medium === "text")!;
+    assert.equal(bothText.text, "after restart 2", "the both-mode request delivered its own text");
+    assert.equal(sent.filter(item => item.requestId === textOnlyRequestId && item.medium === "text").length, 1,
+      "the earlier text-only request is not re-delivered");
+    assert.equal(sent.some(item => item.medium === "audio" && item.requestId !== textOnlyRequestId), false,
+      "the legacy fence still blocks new audio");
+    await reopened.whenIdle();
+  } finally {
+    await reopened.close();
+  }
+});
+
+test("a persistent send-intent write fault faults the worker instead of parking two queued requests", async t => {
+  let now = Date.parse("2026-11-13T00:00:00Z");
+  let intentCalls = 0;
+  const h = await lifecycleHarness(t, {
+    model: { generate: async () => ({ kind: "reply", segments: ["first queued", "second queued"] }) },
+    deps: { now: () => now },
+  });
+  // Simulate a durable write failure (SQLITE_IOERR-style) that never clears.
+  // This is not one of the three codes the intent transaction raises for a
+  // re-validated rejection, so it must reach `faultWorker`.
+  const store = h.room.store as unknown as {
+    recordLifecycleIntent(...args: unknown[]): unknown;
+  };
+  store.recordLifecycleIntent = () => {
+    intentCalls++;
+    throw new Error("simulated-storage-io-fault");
+  };
+
+  assert.equal(h.receive("170", "first", ["10002"]), "scheduled");
+  assert.equal(h.receive("171", "second", ["10002"]), "scheduled");
+  await waitFor(() => h.room.workerStatusForTest().phase !== "ready",
+    "worker faults on the persistent intent write failure", 4000);
+
+  const status = h.room.workerStatusForTest();
+  assert.notEqual(status.phase, "ready",
+    "a persistent storage fault must not leave the worker reporting ready: " + JSON.stringify(status));
+  assert.ok(typeof status.lastError === "string" && status.lastError.length > 0,
+    "the fault reason is observable: " + JSON.stringify(status));
+  assert.equal(h.dispatches.length, 0, "no physical send starts when the intent cannot be written");
+  assert.equal(h.room.store.counts().send, 0, "no send budget is charged for an intent that never started");
+  assert.equal(intentCalls, 1, "the pump does not tight-loop the failing write: " + intentCalls);
+
+  const requests = h.room.store.lifecycleRequests();
+  assert.equal(requests.length, 2);
+  for (const request of requests) {
+    assert.ok(!["queued", "generating", "delivering"].includes(request.status),
+      "the fault path settles the request instead of leaving it delivering: " + JSON.stringify(request));
+    assert.equal(request.outcomeReason, "lifecycle_fault");
+  }
+  assert.equal(h.room.store.lifecycleHeadRequest(), null, "the FIFO head leaves the queue");
+  assert.equal(h.room.store.lifecycleAudit().some(row => row.startedAt !== null), false,
+    "no attempt was recorded as started, so nothing is reported as sent");
+
+  // Crossing the TTL afterwards must not resurrect the requests or the worker.
+  now += QUEUE.ttlMs + 1000;
+  await new Promise<void>(resolve => setTimeout(resolve, 20));
+  assert.equal(h.room.workerStatusForTest().phase, "faulted", "the worker stays faulted");
+  assert.equal(h.room.store.lifecycleHeadRequest(), null, "no request returns to the FIFO");
+  assert.equal(intentCalls, 1, "the failing write is not retried after the deadline");
+});
+
+test("an audio send-intent write fault faults the worker instead of degrading to text-only", async t => {
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["audio intent fault"] }) },
+    dispatch: async request => {
+      request.beforeSend();
+      const id = "890001";
+      await request.observe({ kind: "ack", messageId: id });
+      request.released();
+      return id;
+    },
+  });
+  const store = h.room.store as unknown as {
+    recordLifecycleIntent(segmentId: string, medium: "text" | "audio", ownerToken: string, now: number): unknown;
+  };
+  const original = store.recordLifecycleIntent.bind(h.room.store);
+  let audioIntentCalls = 0;
+  store.recordLifecycleIntent = (segmentId, medium, ownerToken, at) => {
+    if (medium === "audio") {
+      audioIntentCalls++;
+      throw new Error("simulated-storage-io-fault");
+    }
+    return original(segmentId, medium, ownerToken, at);
+  };
+
+  assert.equal(h.receive("172", "audio fault", ["10002"]), "scheduled");
+  await waitFor(() => h.room.workerStatusForTest().phase !== "ready",
+    "worker faults on the audio intent write failure", 4000);
+
+  assert.equal(audioIntentCalls, 1, "the audio intent write is attempted exactly once");
+  assert.equal(h.dispatches.filter(item => item.medium === "audio").length, 0, "no audio is dispatched");
+  const status = h.room.workerStatusForTest();
+  assert.notEqual(status.phase, "ready",
+    "a storage fault must not be recorded as a TTS degradation: " + JSON.stringify(status));
+  const turn = h.room.store.lifecycleTurns(h.room.store.lifecycleRequests()[0]!.requestId)[0]!;
+  const segments = h.room.store.lifecycleSegments(turn.turnId);
+  assert.equal(segments.some(segment => (segment.reason ?? "").startsWith("tts_text_only")), false,
+    "the storage fault is not misreported as a TTS fallback: " + JSON.stringify(segments));
+});
+
+test("a storage read fault while settling an audio intent rejection faults instead of completing text-only", async t => {
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["rejected audio intent"] }) },
+    dispatch: async request => {
+      request.beforeSend();
+      const id = "895001";
+      await request.observe({ kind: "ack", messageId: id });
+      request.released();
+      return id;
+    },
+  });
+  const store = h.room.store as unknown as {
+    recordLifecycleIntent(segmentId: string, medium: "text" | "audio", ownerToken: string, now: number): unknown;
+    lifecycleRequestById(requestId: string): unknown;
+  };
+  const originalIntent = store.recordLifecycleIntent.bind(h.room.store);
+  const originalRead = store.lifecycleRequestById.bind(h.room.store);
+  let audioIntentCalls = 0;
+  let armed = false;
+  store.recordLifecycleIntent = (segmentId, medium, ownerToken, at) => {
+    if (medium === "audio") {
+      audioIntentCalls++;
+      // A genuine re-validated rejection: the intent never starts.
+      armed = true;
+      throw new Error("room-lifecycle-attempt-invalid");
+    }
+    return originalIntent(segmentId, medium, ownerToken, at);
+  };
+  store.lifecycleRequestById = (requestId: string) => {
+    if (armed) {
+      armed = false;
+      throw new Error("simulated-read-fault");
+    }
+    return originalRead(requestId);
+  };
+
+  assert.equal(h.receive("173", "rejected audio", ["10002"]), "scheduled");
+  await waitFor(() => h.room.workerStatusForTest().phase !== "ready",
+    "worker faults when the rejection cannot be settled", 4000);
+
+  assert.equal(audioIntentCalls, 1, "the audio intent was reached exactly once");
+  const status = h.room.workerStatusForTest();
+  assert.notEqual(status.phase, "ready",
+    "a read fault during rejection settlement must not be absorbed as a TTS fallback: "
+      + JSON.stringify(status));
+  const turn = h.room.store.lifecycleTurns(h.room.store.lifecycleRequests()[0]!.requestId)[0]!;
+  const segments = h.room.store.lifecycleSegments(turn.turnId);
+  assert.equal(segments.some(segment => segment.state === "completed"), false,
+    "an audio intent that never started is never reported as completed: " + JSON.stringify(segments));
+  assert.equal(segments.some(segment => (segment.reason ?? "").startsWith("tts_text_only")), false,
+    "the read fault is not misreported as a TTS fallback: " + JSON.stringify(segments));
+  assert.equal(h.dispatches.filter(item => item.medium === "audio").length, 0, "no audio was dispatched");
+});
+
+test("an unexpired intent rejection that cannot make progress faults instead of parking the head", async t => {
+  const h = await lifecycleHarness(t, {
+    model: { generate: async () => ({ kind: "reply", segments: ["parked head"] }) },
+  });
+  const store = h.room.store as unknown as {
+    recordLifecycleIntent(...args: unknown[]): unknown;
+  };
+  // Nothing about the request actually changed: it is not expired, the owner
+  // and revision are live, and it is still the FIFO head. A rejection in that
+  // state can never be woken into progress, so it must surface as a fault.
+  store.recordLifecycleIntent = () => { throw new Error("room-lifecycle-attempt-invalid"); };
+
+  assert.equal(h.receive("174", "unexpired", ["10002"]), "scheduled");
+  await waitFor(() => h.room.workerStatusForTest().phase !== "ready",
+    "worker faults instead of parking an unexpired head", 4000);
+
+  const status = h.room.workerStatusForTest();
+  assert.notEqual(status.phase, "ready",
+    "an unexpired rejection with no possible progress must not stay ready: " + JSON.stringify(status));
+  assert.ok(typeof status.lastError === "string" && status.lastError.length > 0,
+    "the fault reason is observable: " + JSON.stringify(status));
+  assert.equal(h.dispatches.length, 0, "no physical send starts");
+});
+
+test("an owner read fault while judging an audio intent rejection faults instead of completing text-only", async t => {
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["owner read fault"] }) },
+    dispatch: async request => {
+      request.beforeSend();
+      const id = "896001";
+      await request.observe({ kind: "ack", messageId: id });
+      request.released();
+      return id;
+    },
+  });
+  const store = h.room.store as unknown as {
+    recordLifecycleIntent(segmentId: string, medium: "text" | "audio", ownerToken: string, now: number): unknown;
+    lifecycleOwnerValid(token: string, now: number): boolean;
+  };
+  const originalIntent = store.recordLifecycleIntent.bind(h.room.store);
+  const originalOwner = store.lifecycleOwnerValid.bind(h.room.store);
+  let armed = false;
+  store.recordLifecycleIntent = (segmentId, medium, ownerToken, at) => {
+    if (medium === "audio") {
+      armed = true;
+      throw new Error("room-lifecycle-attempt-invalid");
+    }
+    return originalIntent(segmentId, medium, ownerToken, at);
+  };
+  // The settlement path asks "is the owner still live?" to decide whether some
+  // other path will wake this head. A read fault there must not look like
+  // "owner changed", which would silently park the request.
+  store.lifecycleOwnerValid = (token: string, now: number) => {
+    if (armed) {
+      armed = false;
+      throw new Error("simulated-owner-read-fault");
+    }
+    return originalOwner(token, now);
+  };
+
+  assert.equal(h.receive("175", "owner read fault", ["10002"]), "scheduled");
+  await waitFor(() => h.room.workerStatusForTest().phase !== "ready",
+    "worker faults on the owner read fault", 4000);
+
+  const status = h.room.workerStatusForTest();
+  assert.notEqual(status.phase, "ready",
+    "an owner read fault must not be absorbed as a TTS fallback: " + JSON.stringify(status));
+  const turn = h.room.store.lifecycleTurns(h.room.store.lifecycleRequests()[0]!.requestId)[0]!;
+  const segments = h.room.store.lifecycleSegments(turn.turnId);
+  assert.equal(segments.some(segment => segment.state === "completed"), false,
+    "a never-started audio intent is never reported as completed: " + JSON.stringify(segments));
+  assert.equal(segments.some(segment => (segment.reason ?? "").startsWith("tts_text_only")), false,
+    "the owner read fault is not misreported as a TTS fallback: " + JSON.stringify(segments));
+});
+
+test("a control read fault while judging an audio intent rejection faults instead of parking the head", async t => {
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["control read fault"] }) },
+    dispatch: async request => {
+      request.beforeSend();
+      const id = "897001";
+      await request.observe({ kind: "ack", messageId: id });
+      request.released();
+      return id;
+    },
+  });
+  const store = h.room.store as unknown as {
+    recordLifecycleIntent(segmentId: string, medium: "text" | "audio", ownerToken: string, now: number): unknown;
+    lifecycleControlState(): unknown;
+  };
+  const originalIntent = store.recordLifecycleIntent.bind(h.room.store);
+  const originalControl = store.lifecycleControlState.bind(h.room.store);
+  let armed = false;
+  store.recordLifecycleIntent = (segmentId, medium, ownerToken, at) => {
+    if (medium === "audio") {
+      armed = true;
+      throw new Error("room-lifecycle-attempt-invalid");
+    }
+    return originalIntent(segmentId, medium, ownerToken, at);
+  };
+  store.lifecycleControlState = () => {
+    if (armed) {
+      armed = false;
+      throw new Error("simulated-control-read-fault");
+    }
+    return originalControl();
+  };
+
+  assert.equal(h.receive("176", "control read fault", ["10002"]), "scheduled");
+  await waitFor(() => h.room.workerStatusForTest().phase !== "ready",
+    "worker faults on the control read fault", 4000);
+
+  const status = h.room.workerStatusForTest();
+  assert.notEqual(status.phase, "ready",
+    "a control read fault must not look like a revision change: " + JSON.stringify(status));
+  assert.equal(h.dispatches.filter(item => item.medium === "audio").length, 0, "no audio was dispatched");
+  assert.equal(h.room.store.lifecycleHeadRequest()?.status === "delivering", false,
+    "the head is not silently parked in delivering");
+});
+
+test("a storage fault while preparing audio never becomes a text-only degradation", async t => {
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["prepare fault"] }) },
+    dispatch: async request => {
+      request.beforeSend();
+      const id = "898001";
+      await request.observe({ kind: "ack", messageId: id });
+      request.released();
+      return id;
+    },
+  });
+  const store = h.room.store as unknown as {
+    prepareLifecycleVoice(...args: unknown[]): void;
+  };
+  let prepareCalls = 0;
+  store.prepareLifecycleVoice = () => {
+    prepareCalls++;
+    throw new Error("simulated-prepare-write-fault");
+  };
+
+  assert.equal(h.receive("177", "prepare fault", ["10002"]), "scheduled");
+  await waitFor(() => h.room.workerStatusForTest().phase !== "ready",
+    "worker faults on the prepare write fault", 4000);
+
+  assert.equal(prepareCalls, 1, "the prepare write is attempted exactly once");
+  const status = h.room.workerStatusForTest();
+  assert.notEqual(status.phase, "ready",
+    "a prepare write fault must not be recorded as a TTS degradation: " + JSON.stringify(status));
+  const turn = h.room.store.lifecycleTurns(h.room.store.lifecycleRequests()[0]!.requestId)[0]!;
+  const segments = h.room.store.lifecycleSegments(turn.turnId);
+  assert.equal(segments.some(segment => (segment.reason ?? "").startsWith("tts_text_only")), false,
+    "the prepare fault is not misreported as a TTS fallback: " + JSON.stringify(segments));
+});
+
+test("a storage read fault on the refreshed delivery items never becomes a text-only degradation", async t => {
+  const textReceiptId = "899001";
+  let armed = false;
+  let injectedReads = 0;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["items read fault"] }) },
+    synthesize: async () => {
+      armed = true;
+      return new Uint8Array([1, 2, 3]);
+    },
+    dispatch: async request => {
+      request.beforeSend();
+      await request.observe({ kind: "ack", messageId: textReceiptId });
+      request.released();
+      return textReceiptId;
+    },
+  });
+  const store = h.room.store;
+  const original = store.lifecycleDeliveryItems.bind(store);
+  store.lifecycleDeliveryItems = (requestId: string) => {
+    if (armed) {
+      armed = false;
+      injectedReads++;
+      throw new Error("simulated-items-read-fault");
+    }
+    return original(requestId);
+  };
+
+  assert.equal(h.receive("178", "items read fault", ["10002"]), "scheduled");
+  await waitFor(() => h.room.workerStatusForTest().phase === "faulted"
+    || store.lifecycleRequests()[0]?.status === "completed", "worker faults or request completes", 4000);
+
+  assert.equal(injectedReads, 1, "one post-synthesis read fault was injected");
+  const turn = store.lifecycleTurns(store.lifecycleRequests()[0]!.requestId)[0]!;
+  const segments = store.lifecycleSegments(turn.turnId);
+  assert.equal(segments.some(segment => (segment.reason ?? "").startsWith("tts_text_only")), false,
+    "the read fault is not misreported as a TTS fallback: " + JSON.stringify(segments));
+  assert.equal(h.room.workerStatusForTest().phase, "faulted");
+  assert.deepEqual(h.dispatches.map(item => item.medium), ["text"]);
+  assert.ok(store.historyPage(10).some(row => row.platformId === textReceiptId && row.medium === "text"),
+    "the acknowledged text remains committed");
+});
+
+test("a classified storage fault survives a failing liveness probe on the audio path", async t => {
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["probe fault"] }) },
+    dispatch: async request => {
+      request.beforeSend();
+      const id = "899501";
+      await request.observe({ kind: "ack", messageId: id });
+      request.released();
+      return id;
+    },
+  });
+  const store = h.room.store as unknown as {
+    prepareLifecycleVoice(...args: unknown[]): void;
+    lifecycleOwnerValid(token: string, now: number): boolean;
+  };
+  const originalOwner = store.lifecycleOwnerValid.bind(h.room.store);
+  let armed = false;
+  let probeFaults = 0;
+  store.prepareLifecycleVoice = () => {
+    armed = true;
+    throw new Error("simulated-prepare-write-fault");
+  };
+  // The catch must rethrow the classified fault before probing liveness. If it
+  // probes first, this read failure turns into `false` and the fault vanishes.
+  store.lifecycleOwnerValid = (token: string, now: number) => {
+    // One-shot: a single probe failure must be enough to lose the fault. A
+    // persistent failure would eventually surface through another call site and
+    // mask the ordering bug this test exists to catch.
+    if (armed) {
+      armed = false;
+      probeFaults++;
+      throw new Error("simulated-owner-read-fault");
+    }
+    return originalOwner(token, now);
+  };
+
+  assert.equal(h.receive("179", "probe fault", ["10002"]), "scheduled");
+  await waitFor(() => h.room.workerStatusForTest().phase !== "ready",
+    "worker faults even when the liveness probe also fails", 4000);
+
+  assert.equal(probeFaults, 0,
+    "the classified fault is rethrown before any liveness probe reads the store");
+  const status = h.room.workerStatusForTest();
+  assert.notEqual(status.phase, "ready",
+    "a classified storage fault must not be discarded by a failing probe: " + JSON.stringify(status));
+  assert.ok(typeof status.lastError === "string" && status.lastError.length > 0,
+    "the fault reason survives: " + JSON.stringify(status));
+});
+
+for (const fault of ["dispatch request read", "attempt start write", "alternate ACK commit",
+  "provider rejection with owner read", "provider rejection with control read"] as const) {
+  test(`an audio ${fault} storage fault stops the delivery pump`, async t => {
+    const sent: { medium: "text" | "audio"; attemptId: string; messageId: string }[] = [];
+    const lateAck = fault === "alternate ACK commit";
+    let audioIntentId: string | undefined;
+    let requestReadArmed = false;
+    let providerReadArmed = false;
+    let audioAcked = false;
+    let synthesisCalls = 0;
+    let injections = 0;
+    const checkingAudioFallback = () => providerReadArmed && new Error().stack?.includes("deliverLifecycleAudio");
+    const fail = (): never => {
+      injections++;
+      throw new Error("simulated-audio-storage-fault");
+    };
+    const h = await lifecycleHarness(t, {
+      config: roomConfig({ deliveryMode: "both" }),
+      model: { generate: async () => ({ kind: "reply", segments: ["audio storage fault"] }) },
+      synthesize: async () => {
+        synthesisCalls++;
+        if (fault === "provider rejection with owner read" || fault === "provider rejection with control read") {
+          providerReadArmed = true;
+          throw new Error("synthetic-provider-failure");
+        }
+        return new Uint8Array([1, 2, 3]);
+      },
+      dispatch: async request => {
+        try {
+          request.beforeSend();
+        } catch (error) {
+          if (request.medium === "audio" && fault === "attempt start write") {
+            request.released();
+            throw new RoomSendError("rejected");
+          }
+          throw error;
+        }
+        const messageId = request.medium === "text" ? "899601" : "899602";
+        sent.push({ medium: request.medium, attemptId: request.attempt.attemptId, messageId });
+        await request.observe({ kind: "ack", messageId });
+        if (request.medium === "audio") request.physicalSettled();
+        request.released();
+        if (request.medium === "audio" && lateAck) {
+          audioAcked = true;
+          throw new Error("synthetic-dispatch-rejection-after-ack");
+        }
+        return messageId;
+      },
+    });
+    const store = h.room.store;
+    if (fault === "dispatch request read" || fault === "attempt start write") {
+      const intent = store.recordLifecycleIntent.bind(store);
+      store.recordLifecycleIntent = (...args) => {
+        const attempt = intent(...args);
+        if (attempt.medium === "audio") {
+          audioIntentId = attempt.attemptId;
+          requestReadArmed = true;
+        }
+        return attempt;
+      };
+    }
+    if (fault === "dispatch request read") {
+      const readRequest = store.lifecycleRequestById.bind(store);
+      store.lifecycleRequestById = (...args) => {
+        if (requestReadArmed) {
+          requestReadArmed = false;
+          fail();
+        }
+        return readRequest(...args);
+      };
+    } else if (fault === "attempt start write") {
+      const recordStarted = store.recordLifecycleStarted.bind(store);
+      store.recordLifecycleStarted = (...args) => {
+        if (args[0] === audioIntentId && injections === 0) fail();
+        return recordStarted(...args);
+      };
+    } else if (lateAck) {
+      const commitVoice = store.commitLifecycleVoice.bind(store);
+      store.commitLifecycleVoice = (...args) => {
+        if (audioAcked && injections === 0) fail();
+        return commitVoice(...args);
+      };
+    } else if (fault === "provider rejection with owner read") {
+      const readOwner = store.lifecycleOwnerValid.bind(store);
+      store.lifecycleOwnerValid = (...args) => {
+        if (checkingAudioFallback()) fail();
+        return readOwner(...args);
+      };
+    } else {
+      const readControl = store.lifecycleControlState.bind(store);
+      store.lifecycleControlState = (...args) => {
+        if (checkingAudioFallback()) fail();
+        return readControl(...args);
+      };
+    }
+
+    assert.equal(h.receive("180", "audio storage fault", ["10002"]), "scheduled");
+    try {
+      await h.room.whenIdle();
+      assert.equal(synthesisCalls, 1);
+      if (providerReadArmed) assert.ok(injections > 0, "the sustained read fault was reached");
+      else assert.equal(injections, 1, "the one-shot fault was reached");
+      assert.equal(h.room.workerStatusForTest().phase, "faulted");
+      assert.equal(h.room.workerStatusForTest().lastError, "room-lifecycle-delivery-pump-failed");
+      assert.equal(h.receive("181", "new ingress", ["10002"]), "rejected");
+    } finally {
+      providerReadArmed = false;
+    }
+
+    assert.deepEqual(sent.map(({ medium }) => medium), lateAck ? ["text", "audio"] : ["text"]);
+    assert.ok(store.historyPage(10).some(row => row.platformId === "899601" && row.medium === "text"));
+    if (audioIntentId) assert.equal(store.lifecycleAttempt(audioIntentId)?.startedAt, null);
+    for (const { attemptId, messageId } of sent) {
+      assert.deepEqual(store.lifecycleReceipts(attemptId).map(receipt => [receipt.kind, receipt.messageId]),
+        [["ack", messageId]]);
+    }
+    const [request] = store.lifecycleRequests();
+    const [turn] = store.lifecycleTurns(request!.requestId);
+    assert.doesNotMatch(request!.outcomeReason ?? "", /^tts_text_only_/);
+    for (const segment of store.lifecycleSegments(turn!.turnId)) {
+      assert.doesNotMatch(segment.reason ?? "", /^tts_text_only_/);
+    }
+  });
+}
+
+test("an immutable audio ACK wins when the transport promise later rejects", async t => {
+  const sent: string[] = [];
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: { generate: async () => ({ kind: "reply", segments: ["acknowledged before rejection"] }) },
+    dispatch: async request => {
+      request.beforeSend();
+      const messageId = request.medium === "text" ? "899701" : "899702";
+      sent.push(request.medium);
+      await request.observe({ kind: "ack", messageId });
+      if (request.medium === "audio") request.physicalSettled();
+      request.released();
+      if (request.medium === "audio") throw new RoomSendError("uncertain");
+      return messageId;
+    },
+  });
+
+  assert.equal(h.receive("182", "durable audio ack", ["10002"]), "scheduled");
+  await h.room.whenIdle();
+
+  assert.deepEqual(sent, ["text", "audio"]);
+  assert.deepEqual(h.room.store.historyPage(10).filter(row => row.speakerType === "bot")
+    .map(row => [row.medium, row.platformId]), [["text", "899701"], ["voice", "899702"]]);
+  assert.equal(h.room.store.lifecycleRequests()[0]?.status, "completed");
+  assert.equal(h.room.workerStatusForTest().phase, "ready");
+});

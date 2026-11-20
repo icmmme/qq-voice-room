@@ -88,6 +88,19 @@ const SESSION_MAX_MS = 30 * 60 * 1000;
 const LIFECYCLE_GENERATION_LIMIT = 4;
 const LIFECYCLE_OWNER_LEASE_MS = 5 * 60 * 1000;
 
+/**
+ * Marks a storage/execution-authority failure inside lifecycle delivery. It
+ * exists so per-request degradation handlers can rethrow it instead of
+ * recording a delivery outcome for what is really an infrastructure fault.
+ */
+class RoomLifecycleStorageError extends Error {
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+  }
+}
+
+class RoomLifecycleVoiceError extends Error {}
+
 /** One Room lifecycle and consumer; adapters supply model, voice and transport operations. */
 export class VoiceRoom {
   readonly config: CheckedRoomConfig;
@@ -868,6 +881,31 @@ export class VoiceRoom {
         && (accountKey === undefined || this.online.has(accountKey));
     } catch { return false; }
   }
+  /**
+   * Strict reads let the delivery pump distinguish a storage outage from a
+   * genuine execution fence that already owns settlement.
+   */
+  private lifecycleOwnerLiveStrict(now = this.now()): boolean {
+    const token = this.lifecycleOwnerToken;
+    if (!token || this.consumer !== "lifecycle" || this.workerPhase !== "ready" || this.closed) return false;
+    try {
+      return this.store.lifecycleOwnerValid(token, now);
+    } catch (error) {
+      throw new RoomLifecycleStorageError("lifecycle_owner_read_failed", error);
+    }
+  }
+  private lifecycleRevisionLiveStrict(revision: number, accountKey?: string): boolean {
+    let control: ReturnType<VoiceRoom["lifecycleControl"]>;
+    try {
+      control = this.lifecycleControl();
+    } catch (error) {
+      throw new RoomLifecycleStorageError("lifecycle_control_read_failed", error);
+    }
+    return this.lifecycleOwnerLiveStrict() && !control.paused && control.executionRevision === revision
+      && control.epoch === this.readyEpoch
+      && this.config.characters.every(character => this.online.has(character.accountKey))
+      && (accountKey === undefined || this.online.has(accountKey));
+  }
   private onLifecyclePauseChange(paused: boolean): void {
     if (this.consumer !== "lifecycle" || this.closed) return;
     try { this.executionRevision = this.lifecycleControl().executionRevision; }
@@ -1221,7 +1259,11 @@ export class VoiceRoom {
     while (this.workerPhase === "ready" && !this.closed && !this.lifecycleDelivery) {
       this.lifecycleDeliveryWakeRequested = false;
       if (this.lifecycleControl().paused) return;
-      if (this.store.hasUnresolvedLifecycleDelivery()) return;
+      // Only this process's own in-flight audio serializes the loop. A fence
+      // that survived a restart means one old audio result is unknown; it keeps
+      // blocking new audio, but it must not stall unrelated text delivery.
+      if (this.lifecycleAudioInFlight()) return;
+      this.store.settleExpiredLifecycle(this.now());
       const token = this.lifecycleOwnerToken;
       if (!token) throw new Error("room-lifecycle-owner-lost");
       const head = this.store.lifecycleHeadRequest();
@@ -1233,6 +1275,7 @@ export class VoiceRoom {
       }
       const controller = new AbortController();
       const entry = { requestId: head.requestId, controller, promise: Promise.resolve() };
+      const fingerprint = this.lifecycleDeliveryFingerprint(head.requestId);
       entry.promise = this.runLifecycleDelivery(head.requestId, token, controller.signal);
       this.lifecycleDelivery = entry;
       try {
@@ -1240,171 +1283,261 @@ export class VoiceRoom {
       } finally {
         if (this.lifecycleDelivery === entry) this.lifecycleDelivery = undefined;
       }
+      // A step that neither settled anything nor advanced the head must not
+      // re-enter the same work; wait for the next explicit wake instead.
+      const after = this.store.lifecycleHeadRequest();
+      if (after && after.requestId === head.requestId
+        && this.lifecycleDeliveryFingerprint(head.requestId) === fingerprint) return;
+    }
+  }
+  private lifecycleDeliveryFingerprint(requestId: string): string {
+    // Deliberately not swallowed: a read failure here must surface as a worker
+    // fault rather than a stable "no progress" fingerprint that parks the pump.
+    const items = this.store.lifecycleDeliveryItems(requestId);
+    return `${items[0]?.segment.segmentId ?? "-"}:${items[0]?.segment.state ?? "-"}:${items.length}`;
+  }
+  /**
+   * True only while this process owns an audio physical call that has not
+   * reported a result yet. A fence left by an earlier process is deliberately
+   * excluded: it must keep blocking new audio, but it must not serialize text.
+   */
+  private lifecycleAudioInFlight(): boolean {
+    // The in-memory observation set is the only accurate "this process is still
+    // waiting on an audio call" signal: it is populated in `beforeSend` and
+    // cleared on every terminal path (physicalSettled, released, notSent, and
+    // the dispatch promise's settle/reject). The durable fence is deliberately
+    // not consulted here - it can outlive its own call (unknown result,
+    // restart), and its owner token proves only who started it, not that it
+    // finished. The store still blocks new audio in `recordLifecycleStarted`.
+    return this.lifecycleAudioObservations.size > 0;
+  }
+  private readLifecycleAudioFence(): ReturnType<VoiceRoom["store"]["lifecycleAudioFenceInfo"]> {
+    return this.lifecycleStore("lifecycle_fence_read_failed", () => this.store.lifecycleAudioFenceInfo());
+  }
+  private lifecycleStore<T>(code: string, operation: () => T): T {
+    try {
+      return operation();
+    } catch (error) {
+      if (error instanceof RoomLifecycleStorageError) throw error;
+      throw new RoomLifecycleStorageError(code, error);
     }
   }
   private async runLifecycleDelivery(requestId: string, ownerToken: string, signal: AbortSignal): Promise<void> {
     while (this.workerPhase === "ready" && !this.closed && !signal.aborted) {
-      if (!this.lifecycleOwnerLive()) return;
+      if (!this.lifecycleOwnerLiveStrict()) return;
       const request = this.store.lifecycleRequestById(requestId);
       if (!request || !["queued", "generating", "delivering"].includes(request.status)) return;
-      if (this.store.hasUnresolvedLifecycleDelivery()) return;
+      // An expired request must leave the head. Settling it here uses the same
+      // cancellation path as recovery, so a confirmed receipt is preserved and
+      // only the unstarted remainder is terminated.
+      if (request.expiresAt <= this.now()) {
+        this.store.settleExpiredLifecycle(this.now());
+        return;
+      }
+      if (this.lifecycleAudioInFlight()) return;
       const item = this.store.lifecycleDeliveryItems(requestId)[0];
       if (!item) return;
+      const before = this.lifecycleDeliveryFingerprint(requestId);
       if (item.segment.state === "pending") await this.deliverLifecycleText(item, ownerToken, signal);
       else await this.deliverLifecycleAudio(item, ownerToken, signal);
-      if (this.store.hasUnresolvedLifecycleDelivery()) return;
+      if (this.lifecycleAudioInFlight()) return;
+      // No settlement and no head movement means this step cannot make
+      // progress; wait for the next explicit wake rather than re-enter.
+      if (this.lifecycleDeliveryFingerprint(requestId) === before) return;
     }
   }
   private async deliverLifecycleText(item: Readonly<LifecycleDeliveryItem>, ownerToken: string,
     signal: AbortSignal): Promise<void> {
-    if (!this.lifecycleRevisionLive(item.request.executionRevision, item.character.accountKey)) return;
+    if (!this.lifecycleRevisionLiveStrict(item.request.executionRevision, item.character.accountKey)) return;
     let attempt: LifecycleAttempt;
     try {
       attempt = this.store.recordLifecycleIntent(item.segment.segmentId, "text", ownerToken, this.now());
-    } catch {
+    } catch (error) {
+      // The intent transaction re-checks expiry and FIFO position. A rejection
+      // is therefore a per-request outcome, not a reason to leave an expired
+      // head parked in the queue: settle it and let the pump move on.
+      // Anything else (a write that keeps failing) is a storage fault and must
+      // reach `faultWorker`; swallowing it would park the head with the worker
+      // still reporting `ready` and no deadline to recover it.
+      if (!this.isLifecycleIntentRejection(error)) throw error;
+      this.settleLifecycleIntentRejection(item, ownerToken);
       return;
     }
-    let receipt: string | undefined, failure: unknown, preflightFailure: unknown;
-    try {
-      receipt = await this.dispatchLifecycleAttempt(item, attempt, "text", undefined, ownerToken, signal,
-        value => { preflightFailure = value; });
-    } catch (error) {
-      failure = error;
-    }
-    if (receipt !== undefined) {
-      if (!this.lifecycleRevisionLive(attempt.revision, item.character.accountKey)) {
-        try { this.store.abandonLifecycleAttempt(attempt.attemptId, "delivery_cancelled", this.now()); }
-        catch { /* Preserve the immutable receipt for recovery. */ }
-        return;
-      }
-      try {
-        this.store.commitLifecycleText(attempt.attemptId, receipt, ownerToken, this.now());
-        this.wakeLifecycleDelivery();
-        return;
-      } catch (error) {
-        if (!this.lifecycleOwnerLive()) {
-          try { this.store.abandonLifecycleAttempt(attempt.attemptId, "delivery_cancelled", this.now()); }
-          catch { /* Preserve the durable attempt/receipt for recovery. */ }
-          return;
-        }
-        throw error;
-      }
-    }
-    if (preflightFailure !== undefined) throw preflightFailure;
-    this.settleLifecycleAttemptFailure(attempt, "text", failure, signal, ownerToken);
+    await this.sendLifecycleDelivery(item, attempt, undefined, ownerToken, signal);
   }
   private async deliverLifecycleAudio(item: Readonly<LifecycleDeliveryItem>, ownerToken: string,
     signal: AbortSignal): Promise<void> {
-    if (!this.lifecycleRevisionLive(item.request.executionRevision, item.character.accountKey)) return;
+    if (!this.lifecycleRevisionLiveStrict(item.request.executionRevision, item.character.accountKey)) return;
     const character = item.character;
     const language = this.config.characterLanguages[character.id]!;
     let voiceText = item.segment.text;
+    let audio: Uint8Array;
     try {
       if (language.translateForVoice) {
-        if (!this.deps.translateVoice) throw new Error("voice_translation_unavailable");
-        const prompt = this.lifecyclePrompts.get(item.turn.turnId) ?? this.lifecyclePrompt(character, item.request);
+        if (!this.deps.translateVoice) throw new RoomLifecycleVoiceError("voice_translation_unavailable");
+        const prompt = this.lifecyclePrompts.get(item.turn.turnId) ?? this.lifecycleStore(
+          "lifecycle_audio_prompt_failed", () => this.lifecyclePrompt(character, item.request));
         const translation = buildVoiceTranslationPrompt(prompt, item.segment.text, { ...this.config.limits,
           maxTextChars: this.config.limits.maxTextChars, outputTokens: 2048 });
-        if (!this.permitsPrompt(translation) || !this.store.spend("model", this.now())) {
-          throw new Error("voice_translation_blocked");
+        if (!this.permitsPrompt(translation)
+          || !this.lifecycleStore("lifecycle_audio_translation_spend_failed", () => this.store.spend("model", this.now()))) {
+          throw new RoomLifecycleVoiceError("voice_translation_blocked");
         }
-        voiceText = await this.callLifecycle(signal, Math.max(1, Math.min(this.config.limits.requestTimeoutMs,
-          item.request.expiresAt - this.now())), child => this.deps.translateVoice!(translation, child));
-        if (!validJapaneseVoice(voiceText, item.segment.text)) throw new Error("voice_translation_invalid");
+        voiceText = await this.callLifecycleVoice(signal, item.request.expiresAt,
+          child => this.deps.translateVoice!(translation, child));
+        if (!validJapaneseVoice(voiceText, item.segment.text)) throw new RoomLifecycleVoiceError("voice_translation_invalid");
       }
       if (!this.permits(voiceText) || !voiceText.trim() || [...voiceText.trim()].length > 1000) {
-        throw new Error("voice_text_limit");
+        throw new RoomLifecycleVoiceError("voice_text_limit");
       }
-      this.store.prepareLifecycleVoice(item.segment.segmentId, voiceText.trim(), language.voiceLanguage,
-        ownerToken, this.now(), text => this.permits(text));
-      if (!this.store.spend("tts", this.now())) throw new Error("tts_budget");
+      this.lifecycleStore("lifecycle_audio_prepare_failed", () =>
+        this.store.prepareLifecycleVoice(item.segment.segmentId, voiceText.trim(), language.voiceLanguage,
+          ownerToken, this.now(), text => this.permits(text)));
+      if (!this.lifecycleStore("lifecycle_audio_tts_spend_failed", () => this.store.spend("tts", this.now()))) {
+        throw new RoomLifecycleVoiceError("tts_budget");
+      }
       const delivery: RoomDelivery = Object.freeze({ accountKey: character.accountKey, characterId: character.id,
         voiceKey: character.voiceKey, turnId: item.turn.turnId, text: item.segment.text,
         voiceText: voiceText.trim(), voiceLanguage: language.voiceLanguage });
-      const audio = await this.callLifecycle(signal, Math.max(1, Math.min(this.config.limits.requestTimeoutMs,
-        item.request.expiresAt - this.now())), child => this.deps.synthesize(delivery, child));
+      audio = await this.callLifecycleVoice(signal, item.request.expiresAt, child => this.deps.synthesize(delivery, child));
       if (!(audio instanceof Uint8Array) || !audio.byteLength || audio.byteLength > 10 * 1024 * 1024) {
-        throw new Error("voice_audio_invalid");
+        throw new RoomLifecycleVoiceError("voice_audio_invalid");
       }
-      const refreshed = this.store.lifecycleDeliveryItems(item.request.requestId)
-        .find(candidate => candidate.segment.segmentId === item.segment.segmentId);
-      if (!refreshed) return;
-      const attempt = this.store.recordLifecycleIntent(item.segment.segmentId, "audio", ownerToken, this.now());
-      let receipt: string | undefined, failure: unknown, preflightFailure: unknown;
-      try {
-        receipt = await this.dispatchLifecycleAttempt(refreshed, attempt, "audio", audio, ownerToken, signal,
-          value => { preflightFailure = value; });
-      } catch (error) {
-        failure = error;
-      }
-      if (receipt !== undefined) {
-        if (!this.lifecycleRevisionLive(attempt.revision, item.character.accountKey)) {
-          try { this.store.abandonLifecycleAttempt(attempt.attemptId, "delivery_cancelled", this.now()); }
-          catch { /* Preserve the immutable receipt for recovery. */ }
-          return;
-        }
-        try {
-          this.store.commitLifecycleVoice(attempt.attemptId, receipt, ownerToken, this.now());
-          this.lifecyclePrompts.delete(item.turn.turnId);
-          this.wakeLifecycleDelivery();
-          return;
-        } catch (error) {
-          if (!this.lifecycleOwnerLive()) {
-            try { this.store.abandonLifecycleAttempt(attempt.attemptId, "delivery_cancelled", this.now()); }
-            catch { /* Preserve the durable attempt/receipt for recovery. */ }
-            return;
-          }
-          throw error;
-        }
-      }
-      if (preflightFailure !== undefined) throw preflightFailure;
-      this.settleLifecycleAttemptFailure(attempt, "audio", failure, signal, ownerToken);
     } catch (error) {
-      if (signal.aborted || !this.lifecycleRevisionLive(item.request.executionRevision, character.accountKey)) return;
+      if (!(error instanceof RoomLifecycleVoiceError)) throw error;
+      if (signal.aborted || !this.lifecycleRevisionLiveStrict(item.request.executionRevision, character.accountKey)) return;
+      const now = this.now();
+      if (item.request.expiresAt <= now) {
+        this.lifecycleStore("lifecycle_audio_expiry_failed", () => this.store.settleExpiredLifecycle(now));
+        return;
+      }
+      const reason = error.message;
+      const failureCode = reason === "tts_budget" ? "tts_budget_exhausted" : reason;
+      this.settleLifecycleDelivery(item, "lifecycle_audio_degrade_failed", () => {
+        if (!this.store.settleLifecycleTextOnly(item.segment.segmentId, failureCode, ownerToken, now)) {
+          this.store.finishLifecycleSegment(item.segment.segmentId, "failed", failureCode, ownerToken, now);
+        }
+      });
+      this.lifecyclePrompts.delete(item.turn.turnId);
+      return;
+    }
+    const refreshed = this.lifecycleStore("lifecycle_audio_items_read_failed", () =>
+      this.store.lifecycleDeliveryItems(item.request.requestId)
+        .find(candidate => candidate.segment.segmentId === item.segment.segmentId));
+    if (!refreshed) return;
+    const now = this.now();
+    if (item.request.expiresAt <= now) {
+      this.lifecycleStore("lifecycle_audio_expiry_failed", () => this.store.settleExpiredLifecycle(now));
+      return;
+    }
+    if (this.settleLifecycleLegacyAudioFence(refreshed, ownerToken)) return;
+    let attempt: LifecycleAttempt;
+    try {
+      attempt = this.store.recordLifecycleIntent(item.segment.segmentId, "audio", ownerToken, this.now());
+    } catch (error) {
+      if (!this.isLifecycleIntentRejection(error)) throw new RoomLifecycleStorageError("lifecycle_audio_intent_failed", error);
+      this.settleLifecycleIntentRejection(refreshed, ownerToken);
+      return;
+    }
+    await this.sendLifecycleDelivery(refreshed, attempt, audio, ownerToken, signal);
+  }
+  private async callLifecycleVoice<T>(signal: AbortSignal, expiresAt: number,
+    operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const remaining = Math.max(1, Math.min(this.config.limits.requestTimeoutMs, expiresAt - this.now()));
+    try {
+      return await this.callLifecycle(signal, remaining, operation);
+    } catch (error) {
       const reason = error instanceof Error && /^[a-z][a-z0-9_-]{0,79}$/.test(error.message)
         ? error.message : "voice_preparation_failed";
-      try {
-        const failureCode = reason === "tts_budget" ? "tts_budget_exhausted" : reason;
-        // Text already reached the platform in `both` mode; only the audio part failed.
-        if (this.store.settleLifecycleTextOnly(item.segment.segmentId, failureCode, ownerToken, this.now())) {
-          this.lifecyclePrompts.delete(item.turn.turnId);
-          return;
-        }
-        this.store.finishLifecycleSegment(item.segment.segmentId, "failed", failureCode, ownerToken, this.now());
-      } catch {
-        /* A concurrent cancellation or owner change already settled this segment. */
-      }
+      throw new RoomLifecycleVoiceError(reason);
     }
   }
+  private settleLifecycleLegacyAudioFence(item: Readonly<LifecycleDeliveryItem>, ownerToken: string): boolean {
+    const fence = this.readLifecycleAudioFence();
+    if (!fence || this.lifecycleAudioObservations.has(fence.attemptId)) return false;
+    const reason = "audio_blocked_legacy_unknown";
+    this.settleLifecycleDelivery(item, "lifecycle_audio_blocked_settle_failed", () => {
+      const now = this.now();
+      if (!this.store.settleLifecycleAudioBlocked(item.segment.segmentId, reason, ownerToken, now)) {
+        this.store.finishLifecycleSegment(item.segment.segmentId, "blocked", reason, ownerToken, now);
+      }
+    });
+    this.lifecyclePrompts.delete(item.turn.turnId);
+    return true;
+  }
+  private async sendLifecycleDelivery(item: Readonly<LifecycleDeliveryItem>, attempt: LifecycleAttempt,
+    bytes: Uint8Array | undefined, ownerToken: string, signal: AbortSignal): Promise<void> {
+    let receipt: string | undefined, preflightFailure: unknown;
+    const delivery = this.dispatchLifecycleAttempt(item, attempt, bytes, ownerToken, signal,
+      error => { preflightFailure = error; });
+    try {
+      receipt = await delivery;
+    } catch (error) {
+      if (error instanceof RoomLifecycleStorageError) throw error;
+    }
+    if (preflightFailure instanceof RoomLifecycleStorageError) throw preflightFailure;
+    if (receipt !== undefined) {
+      this.commitLifecycleDeliveryAck(attempt, receipt, ownerToken);
+      return;
+    }
+    if (this.isLifecycleSendBudgetStop(preflightFailure)) {
+      this.settleLifecycleSendBudget(item, ownerToken);
+      return;
+    }
+    if (this.isLifecycleIntentRejection(preflightFailure)) {
+      this.settleLifecycleIntentRejection(item, ownerToken);
+      return;
+    }
+    if (preflightFailure instanceof Error && preflightFailure.message === "room-lifecycle-audio-busy"
+      && (this.lifecycleAudioInFlight() || this.settleLifecycleLegacyAudioFence(item, ownerToken))) return;
+    this.settleLifecycleAttemptFailure(attempt, signal, ownerToken);
+  }
   private dispatchLifecycleAttempt(item: Readonly<LifecycleDeliveryItem>, attempt: LifecycleAttempt,
-    medium: "text" | "audio", bytes: Uint8Array | undefined, ownerToken: string, signal: AbortSignal,
+    bytes: Uint8Array | undefined, ownerToken: string, signal: AbortSignal,
     onPreflightFailure: (error: unknown) => void): Promise<string> {
-    const request = this.store.lifecycleRequestById(item.request.requestId);
-    if (!request) return Promise.reject(new Error("room-lifecycle-request-missing"));
+    const request = this.lifecycleStore("lifecycle_delivery_request_read_failed", () =>
+      this.store.lifecycleRequestById(item.request.requestId));
+    if (!request) throw new RoomLifecycleStorageError("lifecycle_delivery_request_missing");
+    const medium = attempt.medium;
     const remaining = Math.max(1, Math.min(this.config.limits.requestTimeoutMs, request.expiresAt - this.now()));
     return this.callLifecycle(signal, remaining, child => {
       const call = Promise.resolve().then(() => this.lifecycleWorker!.dispatch({ item, attempt, medium, bytes,
         signal: child,
         beforeSend: () => {
-          if (child.aborted || !this.store.lifecycleCanSend(item.segment.segmentId, ownerToken, this.now())) {
-            throw new RoomSendError("rejected");
-          }
           try {
+            if (child.aborted || !this.lifecycleStore("lifecycle_delivery_start_check_failed", () =>
+              this.store.lifecycleCanSend(item.segment.segmentId, ownerToken, this.now()))) {
+              throw new RoomSendError("rejected");
+            }
             this.store.recordLifecycleStarted(attempt.attemptId, ownerToken, this.now());
             if (medium === "audio") this.lifecycleAudioObservations.add(attempt.attemptId);
           } catch (error) {
-            onPreflightFailure(error);
-            throw error;
+            const failure = error instanceof RoomLifecycleStorageError || error instanceof RoomSendError
+              || this.isLifecycleIntentRejection(error) || this.isLifecycleSendBudgetStop(error)
+              || (medium === "audio" && error instanceof Error && error.message === "room-lifecycle-audio-busy")
+              ? error : new RoomLifecycleStorageError("lifecycle_delivery_start_failed", error);
+            onPreflightFailure(failure);
+            throw failure;
           }
         },
         observe: async value => {
-          this.store.recordLifecycleObservation(attempt.attemptId, value, ownerToken, this.now());
+          try {
+            this.store.recordLifecycleObservation(attempt.attemptId, value, ownerToken, this.now());
+          } catch (error) {
+            this.faultWorker("room-lifecycle-delivery-observation-failed");
+            throw error;
+          }
         },
         released: () => {
           this.lifecycleAudioObservations.delete(attempt.attemptId);
           this.wakeLifecycleDelivery();
         },
         physicalSettled: () => {
+          // The socket send callback proves this write's physical result is
+          // known. Release the in-flight marker here rather than waiting for
+          // observer-capacity release, which can trail by a full timeout and
+          // would otherwise delay the next text/audio behind a settled call.
+          this.lifecycleAudioObservations.delete(attempt.attemptId);
           try { this.store.releaseLifecycleAudioFence(attempt.attemptId, true); }
           catch { this.faultWorker("room-lifecycle-audio-release-failed"); }
           this.wakeLifecycleDelivery();
@@ -1429,40 +1562,136 @@ export class VoiceRoom {
     }).then(receipt => {
       this.lifecycleAudioObservations.delete(attempt.attemptId);
       return receipt;
+    }, error => {
+      // A rejected/uncertain attempt must not keep the loop serialized behind
+      // an observer that is still holding capacity.
+      this.lifecycleAudioObservations.delete(attempt.attemptId);
+      this.wakeLifecycleDelivery();
+      throw error;
     });
   }
-  private settleLifecycleAttemptFailure(attempt: LifecycleAttempt, medium: "text" | "audio",
-    failure: unknown, signal: AbortSignal, ownerToken: string): void {
-    const current = this.store.lifecycleAttempt(attempt.attemptId);
+  private commitLifecycleDeliveryAck(attempt: LifecycleAttempt, receipt: string, ownerToken: string): void {
+    if (this.lifecycleRevisionLiveStrict(attempt.revision, attempt.accountKey)) {
+      try {
+        if (attempt.medium === "text") this.store.commitLifecycleText(attempt.attemptId, receipt, ownerToken, this.now());
+        else this.store.commitLifecycleVoice(attempt.attemptId, receipt, ownerToken, this.now());
+        if (attempt.medium === "audio") this.lifecyclePrompts.delete(attempt.turnId);
+        this.wakeLifecycleDelivery();
+        return;
+      } catch (error) {
+        if (!this.isLifecycleIntentRejection(error)
+          || this.lifecycleRevisionLiveStrict(attempt.revision, attempt.accountKey)) {
+          throw new RoomLifecycleStorageError("lifecycle_delivery_ack_commit_failed", error);
+        }
+      }
+    }
+    this.lifecycleStore("lifecycle_delivery_ack_abandon_failed", () =>
+      this.store.abandonLifecycleAttempt(attempt.attemptId, "delivery_cancelled", this.now()));
+  }
+  private settleLifecycleAttemptFailure(attempt: LifecycleAttempt, signal: AbortSignal, ownerToken: string): void {
+    const current = this.lifecycleStore("lifecycle_delivery_attempt_read_failed", () =>
+      this.store.lifecycleAttempt(attempt.attemptId));
     if (!current) return;
-    const receipts = this.store.lifecycleReceipts(attempt.attemptId);
+    const receipts = this.lifecycleStore("lifecycle_delivery_receipt_read_failed", () =>
+      this.store.lifecycleReceipts(attempt.attemptId));
     const ack = receipts.find(receipt => receipt.kind === "ack");
     if (ack?.messageId) {
-      if (this.lifecycleOwnerLive()) {
-        if (medium === "text") this.store.commitLifecycleText(attempt.attemptId, ack.messageId, ownerToken, this.now());
-        else this.store.commitLifecycleVoice(attempt.attemptId, ack.messageId, ownerToken, this.now());
-      } else {
-        try { this.store.abandonLifecycleAttempt(attempt.attemptId, "delivery_cancelled", this.now()); }
-        catch { /* Keep the immutable receipt for the next recovery audit. */ }
-      }
+      this.commitLifecycleDeliveryAck(attempt, ack.messageId, ownerToken);
       return;
     }
     if (current.startedAt === null) {
-      const outcome = signal.aborted ? "cancelled" : "failed";
-      try {
-        this.store.finishLifecycleAttempt(attempt.attemptId, outcome,
-          signal.aborted ? "delivery_cancelled" : "delivery_failed", ownerToken, this.now());
-      } catch { /* A newer revision already settled the request. */ }
+      this.lifecycleStore("lifecycle_delivery_attempt_settle_failed", () =>
+        this.store.finishLifecycleAttempt(attempt.attemptId, signal.aborted ? "cancelled" : "failed",
+          signal.aborted ? "delivery_cancelled" : "delivery_failed", ownerToken, this.now()));
       return;
     }
     const rejected = receipts.some(receipt => receipt.kind === "rejected");
-    const uncertain = receipts.some(receipt => receipt.kind === "uncertain") || !rejected;
+    this.lifecycleStore("lifecycle_delivery_attempt_settle_failed", () =>
+      this.store.finishLifecycleAttempt(attempt.attemptId, rejected ? "failed" : "unknown",
+        rejected ? "delivery_rejected" : "delivery_unknown", ownerToken, this.now()));
+  }
+  private isLifecycleSendBudgetStop(failure: unknown): boolean {
+    return failure instanceof Error && failure.message === "room-delivery-send-budget";
+  }
+  /**
+   * `recordLifecycleIntent` throws these only after re-validating expiry, FIFO
+   * head, owner and execution revision inside its own transaction. They are
+   * per-request outcomes. Any other failure is a storage or authority fault and
+   * must not be mistaken for one: swallowing it would leave the head parked
+   * with the worker still reporting `ready`.
+   */
+  private isLifecycleIntentRejection(failure: unknown): boolean {
+    if (!(failure instanceof Error)) return false;
+    return failure.message === "room-lifecycle-attempt-invalid"
+      || failure.message === "room-lifecycle-fifo-blocked"
+      || failure.message === "room-lifecycle-owner-lost";
+  }
+  /**
+   * `recordLifecycleIntent` re-validates expiry, FIFO head, revision and owner
+   * inside its own transaction, so a rejection there means this attempt may
+   * never start. Settle the underlying request through the existing expiry
+   * path when it is past its deadline; otherwise leave it for the next wake so
+   * an owner/revision change is not misreported as an expiry.
+   */
+  private settleLifecycleIntentRejection(item: Readonly<LifecycleDeliveryItem>, ownerToken: string): void {
+    // Every read and write here is infrastructure, not a delivery outcome. They
+    // are wrapped so the audio path's TTS-degradation catch cannot mistake a
+    // storage fault for a synthesis failure and mark a never-started segment as
+    // `completed` / `tts_text_only_*`.
+    let current: ReturnType<VoiceRoom["store"]["lifecycleRequestById"]>;
     try {
-      this.store.finishLifecycleAttempt(attempt.attemptId, rejected ? "failed" : uncertain ? "unknown" : "failed",
-        rejected ? "delivery_rejected" : uncertain ? "delivery_unknown"
-          : failure instanceof RoomSendError && failure.outcome === "rejected" ? "delivery_rejected" : "delivery_failed",
-        ownerToken, this.now());
-    } catch { /* A mode/disconnect cancellation already preserved the started fact. */ }
+      current = this.store.lifecycleRequestById(item.request.requestId);
+    } catch (error) {
+      throw new RoomLifecycleStorageError("lifecycle_intent_rejection_read_failed", error);
+    }
+    if (!current) return;
+    if (current.expiresAt <= this.now()) {
+      try {
+        this.store.settleExpiredLifecycle(this.now());
+      } catch (error) {
+        throw new RoomLifecycleStorageError("lifecycle_intent_rejection_settle_failed", error);
+      }
+      return;
+    }
+    // A revision/owner change already fenced this work; those paths own their
+    // own settlement and wake-ups, so a rejection there is not a fault.
+    if (!this.lifecycleOwnerLiveStrict()
+      || !this.lifecycleRevisionLiveStrict(current.executionRevision, item.character.accountKey)) return;
+    // Still open, still authorized and still the head: the rejection cannot
+    // make progress and no deadline or wake-up would ever free it. Surface it
+    // instead of leaving the worker reporting `ready` with a parked head.
+    let head: ReturnType<VoiceRoom["store"]["lifecycleHeadRequest"]>;
+    try {
+      head = this.store.lifecycleHeadRequest();
+    } catch (error) {
+      throw new RoomLifecycleStorageError("lifecycle_intent_rejection_read_failed", error);
+    }
+    if (head && head.requestId === current.requestId) {
+      throw new RoomLifecycleStorageError("lifecycle_intent_rejected_without_progress");
+    }
+  }
+  private settleLifecycleDelivery(item: Readonly<LifecycleDeliveryItem>, code: string, settle: () => void): void {
+    try {
+      settle();
+    } catch (error) {
+      if (error instanceof Error && error.message === "room-lifecycle-owner-lost"
+        && !this.lifecycleRevisionLiveStrict(item.request.executionRevision, item.character.accountKey)) {
+        return;
+      }
+      throw new RoomLifecycleStorageError(code, error);
+    }
+  }
+  private settleLifecycleSendBudget(item: Readonly<LifecycleDeliveryItem>, ownerToken: string): void {
+    this.settleLifecycleDelivery(item, "lifecycle_send_budget_settle_failed", () => {
+      const now = this.now();
+      if (item.segment.state === "text_sent"
+        && this.store.settleLifecycleTextOnly(item.segment.segmentId, "send_budget", ownerToken, now)) {
+        this.lifecyclePrompts.delete(item.turn.turnId);
+        return;
+      }
+      this.store.finishLifecycleSegment(item.segment.segmentId, "blocked", "send_budget_exhausted",
+        ownerToken, now);
+    });
   }
   private async callLifecycle<T>(signal: AbortSignal, timeoutMs: number,
     operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
