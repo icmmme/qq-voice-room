@@ -1717,7 +1717,11 @@ export class RoomStore {
     const failed = settledTurns.some(t => ["failed","unknown","cancelled","blocked"].includes(t.status))
       || segments.some(s => ["failed","unknown","cancelled","blocked"].includes(s.state));
     const status: LifecycleRequestStatus = failed ? "failed" : "completed";
-    const degraded = segments.find(s => typeof s.reason === "string" && s.reason.startsWith("tts_text_only"));
+    // Surface the first degraded cause at request level: a TTS fallback or a
+    // legacy unknown-audio block. The two stay distinguishable by their reason
+    // string, so neither is silently merged into the other's metric.
+    const degraded = segments.find(s => typeof s.reason === "string"
+      && (s.reason.startsWith("tts_text_only") || s.reason === "audio_blocked_legacy_unknown"));
     const reason = failed
       ? settledTurns.find(t => ["failed","unknown","cancelled","blocked"].includes(t.status))?.reason
         ?? segments.find(s => ["failed","unknown","cancelled","blocked"].includes(s.state))?.reason
@@ -1733,6 +1737,23 @@ export class RoomStore {
       const requestId = String(row.request_id);
       this.cancelLifecycleRequests("all-for-request", "ttl_expired", now, requestId);
     }
+  }
+  /**
+   * Public expiry seam for the delivery loop. The loop must leave an expired
+   * head instead of rewriting the same send intent, so it asks the store to
+   * settle the request through the existing cancellation path.
+   */
+  settleExpiredLifecycle(now: number): number {
+    if (!timestamp(now)) throw new Error("room-lifecycle-recovery-invalid");
+    return this.transaction(() => {
+      const outstanding = () => Number(this.db.prepare(`SELECT count(*) AS n FROM room_lifecycle_requests
+        WHERE status IN ('queued','generating','delivering') AND expires_at<=?`).get(now)!.n);
+      const before = outstanding();
+      if (!before) return 0;
+      this.expireLifecycleRequests(now);
+      // Report what this call actually settled, not how many were outstanding.
+      return before - outstanding();
+    });
   }
   private blockDependentLifecycleSegments(turnId: string, afterSegmentId: string, reason: string, now: number): void {
     this.db.prepare(`UPDATE room_lifecycle_segments SET state='blocked',reason=?,updated_at=?
@@ -2314,6 +2335,28 @@ export class RoomStore {
       return true;
     });
   }
+  /**
+   * `both`-mode segment whose text is already acknowledged degrades to a
+   * completed text-only delivery because a pre-restart audio result is unknown.
+   * This is deliberately distinct from `settleLifecycleTextOnly`: the cause is
+   * not a TTS failure, so it must not be aggregated into `tts_text_only_*`.
+   */
+  settleLifecycleAudioBlocked(segmentId: string, reason: string, ownerToken: string, now: number): boolean {
+    if (!code(reason)) throw new Error("room-lifecycle-segment-invalid");
+    return this.transaction(() => {
+      this.assertLifecycleOwner(ownerToken, now);
+      const row = this.db.prepare(`SELECT s.turn_id,s.state,s.delivery_mode,t.request_id
+        FROM room_lifecycle_segments s JOIN room_lifecycle_turns t ON t.turn_id=s.turn_id
+        WHERE s.segment_id=?`).get(segmentId);
+      if (!row || row.state !== "text_sent" || row.delivery_mode !== "both") return false;
+      const changed = this.db.prepare(`UPDATE room_lifecycle_segments SET state='completed',reason=?,updated_at=?
+        WHERE segment_id=? AND state='text_sent'`).run(reason, now, segmentId).changes;
+      if (changed !== 1) return false;
+      this.lifecycleSettleTurn(String(row.turn_id), now);
+      this.lifecycleSettleRequest(String(row.request_id), now);
+      return true;
+    });
+  }
   applyLifecycleMode(mode: "mention_only" | "ambient", eventKey: string, expectedEpoch: number, ownerToken: string, now: number): RoomControlResult {
     if ((mode !== "mention_only" && mode !== "ambient") || typeof eventKey !== "string"
       || !/^[0-9a-f]{64}$/.test(eventKey) || !timestamp(now)) throw new Error("room-lifecycle-mode-invalid");
@@ -2652,6 +2695,27 @@ export class RoomStore {
   lifecycleAudioFence(): string | null {
     const row = this.db.prepare("SELECT attempt_id FROM room_lifecycle_audio_fence WHERE id=1").get();
     return row ? String(row.attempt_id) : null;
+  }
+  /**
+   * Identity of the durable audio fence. A fence that survives a restart keeps
+   * blocking new audio (its physical result is unknown), but text delivery must
+   * not be held hostage by it; callers need the attempt id and start time to
+   * report that state instead of silently stalling the FIFO.
+   */
+  lifecycleAudioFenceInfo(): Readonly<{ attemptId: string; startedAt: number; ownerToken: string | null;
+    reason: string }> | null {
+    const row = this.db.prepare(`SELECT f.attempt_id AS attemptId,f.started_at AS startedAt,a.owner_token AS ownerToken
+      FROM room_lifecycle_audio_fence f
+      LEFT JOIN room_lifecycle_attempts a ON a.attempt_id=f.attempt_id
+      WHERE f.id=1`).get() as { attemptId: unknown; startedAt: unknown; ownerToken: unknown } | undefined;
+    if (!row) return null;
+    // The owning execution token is the durable discriminator between "this
+    // process is still waiting on its own audio call" and "a previous process
+    // left an unknown result behind". A restarted process mints a fresh token,
+    // so the old fence reads as foreign without any in-memory bookkeeping.
+    return Object.freeze({ attemptId: String(row.attemptId), startedAt: Number(row.startedAt),
+      ownerToken: row.ownerToken === null || row.ownerToken === undefined ? null : String(row.ownerToken),
+      reason: "audio_result_unknown" });
   }
   hasUnresolvedLifecycleDelivery(): boolean {
     // ACK/rejected/uncertain receipts settle the durable delivery fact. Only
