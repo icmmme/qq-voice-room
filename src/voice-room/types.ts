@@ -1,4 +1,4 @@
-import type { ParticipationNotice } from "./participation-policy.js";
+import type { ParticipationNotice, ParticipationReason } from "./participation-policy.js";
 import type { RoomPageReadProvider, RoomSearchProvider } from "./websearch.js";
 import type { RoomGitHubReadProvider } from "./github.js";
 import type { RoomContextWindowSource } from "../prompting/context-budget.js";
@@ -286,6 +286,11 @@ export interface RoomDelivery extends PreparedReply {
   turnId: string;
   text: string;
 }
+export interface RoomAmbientParticipationNotice {
+  readonly code: `ambient_rule_${ParticipationReason}` | "ambient_planner_skip" | "ambient_stale_anchor";
+  readonly anchorRowId: number;
+}
+
 export interface RoomDependencies {
   now?: () => number;
   /** Injected monotonic clock for deadline tests; production defaults to performance.now(). */
@@ -316,6 +321,7 @@ export interface RoomDependencies {
   permitsPrompt?: (prompt: RoomPrompt) => boolean;
   /** Fixed policy metadata only; never include input text or raw platform IDs. */
   onParticipation?: (notice: ParticipationNotice) => void;
+  onAmbientParticipation?: (notice: RoomAmbientParticipationNotice) => void;
   onVoicePreparation?: (notice: { code: "translated" | "failed" | "budget" | "unavailable" | "cancelled"; elapsedMs: number }) => void;
 }
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -9,8 +9,8 @@ import { QqPeer, type QqAttemptOptions } from "../src/qq-peer.js";
 import type { ModelConfig } from "../src/config.js";
 import { checkRoomConfig } from "../src/voice-room/config.js";
 import { parseRoomQqMessage } from "../src/voice-room/qq-message.js";
-import type { RoomQqSettings } from "../src/voice-room/qq-config.js";
-import { startRoomQq } from "../src/voice-room/qq-server.js";
+import { readRoomQqSettings, type RoomQqSettings } from "../src/voice-room/qq-config.js";
+import { startRoomQq, type RoomQqNotice } from "../src/voice-room/qq-server.js";
 import { roomPublicPolicy } from "../src/voice-room/public-policy.js";
 import {
   VoiceRoom,
@@ -1164,6 +1164,286 @@ test("offline single @ acceptance path joins real parser, checked config, lifecy
   assert.equal(h.prompts.length, 1);
 });
 
+async function ambientCompletionFixture(t: TestContext, options: Parameters<typeof lifecycleHarness>[1]) {
+  const base = Date.parse("2026-11-18T00:00:00Z");
+  let now = base;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both", limits: { ambientQuietMs: 60000, ambientCooldownMs: 1 } }),
+    ambientPlanner: { plan: async () => ({ kind: "join", characterIds: ["character-a"] }) },
+    ...options,
+    deps: { ...options.deps, now: () => now },
+  });
+  const admit = async () => {
+    assert.equal(h.receive("940001", "/room mode ambient"), "control");
+    assert.equal(h.receive("940002", "大家怎么看这个测试？ INPUT_PRIVATE_CANARY"), "observed");
+    const anchor = h.room.store.historyPage(50).at(-1)!;
+    now += 60000;
+    await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+    return h.room.store.lifecycleRequests()[0]!;
+  };
+  return { ...h, admit, expire: () => { now += QUEUE.ttlMs; } };
+}
+
+for (const superseded of [false, true]) {
+  test(`Fix-2 Ambient generator skip stays silent ${superseded ? "after a newer human line" : "on the current anchor"}`, async t => {
+    const answer = deferred<RoomLifecycleAnswer>();
+    const sends: DispatchRecord[] = [];
+    let modelCalls = 0;
+    const h = await ambientCompletionFixture(t, {
+      model: { generate: async () => (++modelCalls === 1 ? answer.promise : { kind: "skip" }) },
+      dispatch: async request => {
+        request.beforeSend();
+        sends.push({ characterId: request.item.character.id, requestId: request.item.request.requestId,
+          medium: request.medium, text: request.item.segment.text });
+        const messageId = String(949000 + sends.length);
+        await request.observe({ kind: "ack", messageId });
+        request.physicalSettled?.();
+        request.released();
+        return messageId;
+      },
+    });
+    const candidate = await h.admit();
+    await waitFor(() => modelCalls === 1, "ambient generator called");
+    if (superseded) assert.equal(h.receive("940003", "new human line"), "observed");
+    answer.resolve({ kind: "skip" });
+    await h.room.whenIdle();
+    assert.equal(sends.length, 0, "ambient skip never reaches an external send");
+    assert.equal(h.synthesisCalls, 0);
+    const audit = h.room.store.lifecycleAudit().filter(row => row.requestId === candidate.requestId);
+    assert.equal(audit.length, 1);
+    assert.equal(audit[0]!.turnStatus, "skipped");
+    assert.equal(audit[0]!.turnReason, "ambient_model_skip");
+    assert.equal(audit[0]!.attemptId, null);
+
+    assert.equal(h.receive("940004", "I mentioned the bot", ["10002"]), "scheduled");
+    await h.room.whenIdle();
+    assert.equal(modelCalls, 2);
+    assert.deepEqual(sends.map(item => item.medium), ["text", "audio"]);
+    assert.ok(sends.every(item => item.text === WORKER_EXPLICIT_NO_ANSWER_FALLBACK.text));
+  });
+}
+
+test("Fix-2 Ambient generation cancels a reply to a superseded anchor and clears FIFO", async t => {
+  const answer = deferred<RoomLifecycleAnswer>();
+  let modelCalls = 0;
+  const sent: string[] = [];
+  const h = await ambientCompletionFixture(t, {
+    model: { generate: async () => (++modelCalls === 1 ? answer.promise : { kind: "reply", segments: ["next"] }) },
+    dispatch: async request => {
+      request.beforeSend();
+      sent.push(request.item.request.requestId);
+      const messageId = String(949100 + sent.length);
+      await request.observe({ kind: "ack", messageId });
+      request.physicalSettled?.();
+      request.released();
+      return messageId;
+    },
+  });
+  const candidate = await h.admit();
+  await waitFor(() => modelCalls === 1, "ambient generator called");
+  assert.equal(h.receive("941003", "new human line"), "observed");
+  answer.resolve({ kind: "reply", segments: ["OUTPUT_PRIVATE_CANARY"] });
+  await h.room.whenIdle();
+  assert.deepEqual(sent, []);
+  assert.equal(h.room.store.lifecycleHeadRequest(), null);
+  const outcome = h.room.store.lifecycleRequestById(candidate.requestId)!;
+  assert.equal(outcome.status, "cancelled");
+  assert.equal(outcome.outcomeReason, "stale_anchor");
+  assert.equal(h.room.store.lifecycleTurns(candidate.requestId)[0]!.segmentCount, 0);
+  assert.equal(h.receive("941004", "next FIFO request", ["10002"]), "scheduled");
+  await h.room.whenIdle();
+  const next = h.room.store.lifecycleRequests().at(-1)!;
+  assert.deepEqual(sent, [next.requestId, next.requestId]);
+  assert.equal(next.status, "completed");
+});
+
+test("Fix-2 Ambient sibling skip remains skipped when another generation is stale", async t => {
+  const stale = deferred<RoomLifecycleAnswer>();
+  const skip = deferred<RoomLifecycleAnswer>();
+  const h = await ambientCompletionFixture(t, {
+    ambientPlanner: { plan: async () => ({ kind: "join", characterIds: ["character-a", "character-b"] }) },
+    model: { generate: async prompt => prompt.characterId === "character-a" ? stale.promise : skip.promise },
+  });
+  const candidate = await h.admit();
+  await waitFor(() => h.prompts.length === 2, "both ambient generators called");
+  assert.equal(h.receive("941005", "new human line"), "observed");
+  stale.resolve({ kind: "reply", segments: ["OUTPUT_PRIVATE_CANARY"] });
+  await waitFor(() => h.room.store.lifecycleTurns(candidate.requestId)[0]?.status === "cancelled",
+    "stale character settles before its sibling").finally(() => skip.resolve({ kind: "skip" }));
+  await h.room.whenIdle();
+  assert.equal(h.room.store.lifecycleRequestById(candidate.requestId)!.outcomeReason, "stale_anchor");
+  assert.deepEqual(h.room.store.lifecycleTurns(candidate.requestId).map(turn => [turn.status, turn.reason]), [
+    ["cancelled", "stale_anchor"], ["skipped", "ambient_model_skip"],
+  ]);
+  assert.equal(h.dispatches.length, 0);
+});
+
+for (const reason of ["stale_anchor", "ttl_expired"] as const) {
+  test(`Fix-2 Ambient ${reason} at the physical send guard makes no visible send`, async t => {
+    const atPreflight = deferred<void>();
+    const proceed = deferred<void>();
+    const visible: string[] = [];
+    const h = await ambientCompletionFixture(t, {
+      model: { generate: async () => ({ kind: "reply", segments: ["OUTPUT_PRIVATE_CANARY"] }) },
+      dispatch: async request => {
+        if (request.item.request.source === "ambient") {
+          atPreflight.resolve();
+          await proceed.promise;
+        }
+        request.beforeSend();
+        visible.push(request.item.request.requestId);
+        const messageId = String(949200 + visible.length);
+        await request.observe({ kind: "ack", messageId });
+        request.physicalSettled?.();
+        request.released();
+        return messageId;
+      },
+    });
+    const candidate = await h.admit();
+    await atPreflight.promise;
+    if (reason === "stale_anchor") assert.equal(h.receive("942003", "new human line"), "observed");
+    else h.expire();
+    proceed.resolve();
+    await h.room.whenIdle();
+    assert.deepEqual(visible, []);
+    assert.equal(h.room.store.lifecycleHeadRequest(), null);
+    const audit = h.room.store.lifecycleAudit().find(row => row.requestId === candidate.requestId)!;
+    assert.equal(audit.requestStatus, "cancelled");
+    assert.equal(audit.requestReason, reason);
+    assert.equal(audit.medium, "text");
+    assert.equal(audit.startedAt, null);
+    assert.deepEqual(audit.receipts, []);
+    assert.equal(h.room.store.counts().send, 0);
+    assert.equal(h.receive("942004", "next FIFO request", ["10002"]), "scheduled");
+    await h.room.whenIdle();
+    const next = h.room.store.lifecycleRequests().at(-1)!;
+    assert.deepEqual(visible, [next.requestId, next.requestId]);
+    assert.equal(next.status, "completed");
+    assert.equal(h.room.workerStatusForTest().phase, "ready");
+  });
+}
+
+for (const medium of ["text", "audio"] as const) {
+  for (const direct of [false, true]) {
+    test(`Fix-2 Ambient durable ${medium} ACK survives ${direct ? "direct-request cancellation" : "a newer human line"}`, async t => {
+      const visible: { requestId: string; medium: string; messageId: string }[] = [];
+      let interrupted = false;
+      const h = await ambientCompletionFixture(t, {
+        model: { generate: async () => ({ kind: "reply", segments: ["first canary", "unstarted canary"] }) },
+        dispatch: async request => {
+          request.beforeSend();
+          const messageId = String(949300 + visible.length);
+          visible.push({ requestId: request.item.request.requestId, medium: request.medium, messageId });
+          await request.observe({ kind: "ack", messageId });
+          if (!interrupted && request.item.request.source === "ambient" && request.medium === medium) {
+            interrupted = true;
+            assert.equal(h.receive("943003", "new human line", direct ? ["10002"] : []),
+              direct ? "scheduled" : "observed");
+          }
+          request.physicalSettled?.();
+          request.released();
+          return messageId;
+        },
+      });
+      const candidate = await h.admit();
+      await h.room.whenIdle();
+      const oldSends = visible.filter(send => send.requestId === candidate.requestId);
+      assert.deepEqual(oldSends.map(send => send.medium), medium === "text" ? ["text"] : ["text", "audio"]);
+      const audit = h.room.store.lifecycleAudit().filter(row => row.requestId === candidate.requestId && row.attemptId);
+      assert.equal(audit.length, oldSends.length);
+      for (const attempt of audit) {
+        assert.ok(attempt.startedAt !== null);
+        assert.deepEqual(attempt.receipts, ["ack"]);
+      }
+      const history = h.room.store.history();
+      for (const send of oldSends) {
+        const confirmed = history.filter(row => row.platformId === send.messageId);
+        assert.equal(confirmed.length, 1);
+        assert.equal(confirmed[0]!.targetId, candidate.messageRowId);
+        assert.equal(confirmed[0]!.medium, send.medium === "text" ? "text" : "voice");
+      }
+      assert.equal(h.room.workerStatusForTest().phase, "ready");
+      if (!direct) {
+        assert.equal(h.room.store.lifecycleHeadRequest(), null);
+        assert.equal(h.receive("943004", "next FIFO request", ["10002"]), "scheduled");
+        await h.room.whenIdle();
+      }
+      const next = h.room.store.lifecycleRequests().at(-1)!;
+      assert.notEqual(next.requestId, candidate.requestId);
+      assert.equal(next.status, "completed");
+      assert.equal(visible.filter(send => send.requestId === candidate.requestId).length, oldSends.length);
+    });
+  }
+}
+
+test("Fix-2 Ambient observable rule rejection, stale opportunity and planner skip use only internal anchors", async t => {
+  let now = Date.parse("2026-11-18T00:00:00Z");
+  const notices: unknown[] = [];
+  const deps = {
+    now: () => now,
+    persona: () => "PROMPT_PRIVATE_CANARY MEMORY_PRIVATE_CANARY",
+    onAmbientParticipation: (notice: unknown) => notices.push(notice),
+  };
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ limits: { ambientQuietMs: 60000, ambientCooldownMs: 1 } }),
+    deps,
+    ambientPlanner: { plan: async () => ({ kind: "skip" }) },
+    model: { generate: async () => ({ kind: "reply", segments: ["OUTPUT_PRIVATE_CANARY"] }) },
+  });
+  assert.equal(h.receive("944001", "/room mode ambient"), "control");
+  assert.equal(h.receive("944002", "大家怎么看？ INPUT_PRIVATE_CANARY", [], { senderId: "944099" }), "observed");
+  const blocked = h.room.store.historyPage(50).at(-1)!;
+  now += 60000;
+  await h.room.ambientOpportunityForTest(blocked.id, QUEUE, true);
+  assert.equal(h.receive("944003", "大家觉得怎么样？ TOKEN_PRIVATE_CANARY", [], { senderId: "944099" }), "observed");
+  const skipped = h.room.store.historyPage(50).at(-1)!;
+  now += 60000;
+  await h.room.ambientOpportunityForTest(skipped.id, QUEUE);
+  await h.room.ambientOpportunityForTest(blocked.id, QUEUE);
+  assert.deepEqual(notices, [
+    { code: "ambient_rule_other-conversation", anchorRowId: blocked.id },
+    { code: "ambient_planner_skip", anchorRowId: skipped.id },
+    { code: "ambient_stale_anchor", anchorRowId: blocked.id },
+  ]);
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
+});
+
+test("Fix-2 Ambient observable delivery failure retains safe scoped audit metadata", async t => {
+  const h = await ambientCompletionFixture(t, {
+    deps: { persona: () => "PROMPT_PRIVATE_CANARY MEMORY_PRIVATE_CANARY" },
+    model: { generate: async () => ({ kind: "reply", segments: ["OUTPUT_PRIVATE_CANARY"] }) },
+    dispatch: async request => {
+      request.beforeSend();
+      await request.observe({ kind: "rejected" });
+      request.released();
+      throw new Error("token_private_canary");
+    },
+  });
+  const candidate = await h.admit();
+  await h.room.whenIdle();
+  const audit = h.room.store.lifecycleAudit().filter(row => row.requestId === candidate.requestId);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0]!.requestReason, "delivery_rejected");
+  assert.equal(audit[0]!.segmentReason, "delivery_rejected");
+  assert.deepEqual(audit[0]!.receipts, ["rejected"]);
+  assert.doesNotMatch(JSON.stringify(audit), /private_canary|940002|10001|member-|messageId|senderId/i);
+});
+
+test("Fix-2 Ambient audio preparation failure keeps confirmed text and withholds opaque provider codes", async t => {
+  const h = await ambientCompletionFixture(t, {
+    model: { generate: async () => ({ kind: "reply", segments: ["OUTPUT_PRIVATE_CANARY"] }) },
+    synthesize: async () => { throw new Error("token_private_canary"); },
+  });
+  const candidate = await h.admit();
+  await h.room.whenIdle();
+  const audit = h.room.store.lifecycleAudit().filter(row => row.requestId === candidate.requestId);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0]!.segmentReason, "tts_text_only_voice_preparation_failed");
+  assert.equal(audit[0]!.medium, "text");
+  assert.deepEqual(audit[0]!.receipts, ["ack"]);
+  assert.doesNotMatch(JSON.stringify(audit), /private_canary/i);
+});
+
 test("ambient initiation boundary is exact and planner input is public and bounded", async t => {
   const base = Date.parse("2026-11-18T00:00:00Z");
   let now = base;
@@ -1730,13 +2010,9 @@ test("Owner /room pause remains fail-closed for ordinary ingress", async t => {
   assert.equal(room.receive(roomInput("901", "ordinary message", ["10002"])), "paused");
 });
 
-test("production startRoomQq wires the ambient planner into the lifecycle FIFO", async t => {
-  const root = mkdtempSync(join(tmpdir(), "pa-production-ambient-"));
-  let plannerCalls = 0;
-  let lifecycleCalls = 0;
-  let messageId = 880000;
-  const settings: RoomQqSettings = {
-    room: checkRoomConfig(roomConfig({ limits: { ambientQuietMs: 100, ambientCooldownMs: 1000 } })),
+function qqWorkerSettings(root: string, config = roomConfig()): RoomQqSettings {
+  return {
+    room: checkRoomConfig(config),
     dataDir: root,
     port: 0,
     apiTimeoutMs: 1000,
@@ -1748,25 +2024,30 @@ test("production startRoomQq wires the ambient planner into the lifecycle FIFO",
     workerQueue: QUEUE,
     closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 100, releaseMs: 100, writeWaitMs: 50 },
   };
-  const lifecycleModel: RoomLifecycleWorker["model"] = {
-    generate: async (prompt, _signal, _maxChars) => {
-      if (prompt.systemPrompt.includes("Ambient 参与度规划器")) {
-        plannerCalls++;
-        return { kind: "reply", segments: [JSON.stringify({ kind: "join", characterIds: ["character-a"] })] };
-      }
-      lifecycleCalls++;
-      return { kind: "reply", segments: ["production ambient reply"] };
-    },
-  };
-  const bridge = await startRoomQq(settings, {
+}
+
+async function qqWorkerFixture(t: TestContext, settings: RoomQqSettings,
+  lifecycleModel: RoomLifecycleWorker["model"], voice?: { synthesize: RoomDependencies["synthesize"] }) {
+  const notices: RoomQqNotice[] = [];
+  const media: string[] = [];
+  const sockets: WebSocket[] = [];
+  let messageId = 880000;
+  let bridge: Awaited<ReturnType<typeof startRoomQq>> | undefined;
+  t.after(async () => {
+    for (const socket of sockets) socket.terminate();
+    await bridge?.close();
+    rmSync(settings.dataDir, { recursive: true, force: true });
+  });
+  const started = bridge = await startRoomQq(settings, {
     persona: character => `# ${character.name}\nSynthetic public persona.`,
     permitsText: () => true,
     permitsPrompt: () => true,
     lifecycleModel,
-  });
-  const sockets: WebSocket[] = [];
-  const open = async (accountKey: string, selfId: string, token: string) => {
-    const socket = new WebSocket(`${bridge.url}/room/${accountKey}`, { headers: {
+  }, notice => notices.push(notice), voice);
+  const open = async (index: number) => {
+    const { accountKey, token } = settings.accounts[index]!;
+    const { selfId } = settings.room.characters[index]!;
+    const socket = new WebSocket(`${started.url}/room/${accountKey}`, { headers: {
       "x-client-role": "Universal", "x-self-id": selfId, Authorization: `Bearer ${token}`,
     } });
     sockets.push(socket);
@@ -1774,6 +2055,7 @@ test("production startRoomQq wires the ambient planner into the lifecycle FIFO",
       let value: any;
       try { value = JSON.parse(raw.toString()); } catch { return; }
       if (value && typeof value.echo === "string" && typeof value.action === "string") {
+        if (value.action === "send_group_msg") media.push(value.params.message[0].type);
         socket.send(JSON.stringify({ echo: value.echo, status: "ok", retcode: 0,
           data: { message_id: String(++messageId) } }));
       }
@@ -1784,18 +2066,31 @@ test("production startRoomQq wires the ambient planner into the lifecycle FIFO",
     });
     return socket;
   };
-  const send = (socket: WebSocket, id: string, text: string) => socket.send(JSON.stringify({
+  const send = (socket: WebSocket, id: string, text: string, mentions: readonly string[] = []) => socket.send(JSON.stringify({
     post_type: "message", message_type: "group", sub_type: "normal",
     self_id: "10002", group_id: "10000", user_id: "10001", message_id: id,
-    message: [{ type: "text", data: { text } }],
+    message: [...mentions.map(qq => ({ type: "at", data: { qq } })), { type: "text", data: { text } }],
   }));
-  t.after(async () => {
-    for (const socket of sockets) { try { socket.terminate(); } catch { /* already closed */ } }
-    await bridge.close();
-    rmSync(root, { recursive: true, force: true });
+  return { bridge: started, open, send, media, notices };
+}
+
+test("production startRoomQq wires the ambient planner into the lifecycle FIFO", async t => {
+  const root = mkdtempSync(join(tmpdir(), "pa-production-ambient-"));
+  let plannerCalls = 0;
+  let lifecycleCalls = 0;
+  const settings = qqWorkerSettings(root, roomConfig({ limits: { ambientQuietMs: 100, ambientCooldownMs: 1000 } }));
+  const { bridge, open, send } = await qqWorkerFixture(t, settings, {
+    generate: async prompt => {
+      if (prompt.systemPrompt.includes("Ambient 参与度规划器")) {
+        plannerCalls++;
+        return { kind: "reply", segments: [JSON.stringify({ kind: "join", characterIds: ["character-a"] })] };
+      }
+      lifecycleCalls++;
+      return { kind: "reply", segments: ["production ambient reply"] };
+    },
   });
-  const peerA = await open("account-a", "10002", settings.accounts[0]!.token);
-  await open("account-b", "10003", settings.accounts[1]!.token);
+  const peerA = await open(0);
+  await open(1);
   await waitFor(() => bridge.room.ready && bridge.status().online === 2,
     "production lifecycle worker ready", 5000);
   send(peerA, "880001", "/room mode ambient");
@@ -1810,6 +2105,177 @@ test("production startRoomQq wires the ambient planner into the lifecycle FIFO",
   const request = bridge.room.store.lifecycleRequests()[0]!;
   const turn = bridge.room.store.lifecycleTurns(request.requestId)[0]!;
   assert.equal(bridge.room.store.lifecycleSegments(turn.turnId)[0]!.text, "production ambient reply");
+});
+
+const QQ_WORKER_REPLY: RoomLifecycleWorker["model"] = {
+  generate: async () => ({ kind: "reply", segments: ["synthetic-worker-reply-canary"] }),
+};
+const QQ_WORKER_TTS = { synthesize: async () => new Uint8Array([0x49, 0x44, 0x33, 0]) };
+const QQ_WORKER_MODE_ERROR = /deliveryMode.*text.*both/;
+
+for (const mode of ["voice", "auto"] as const) {
+  test(`B2-04 ${mode} is rejected by settings and the bridge before startup`, async t => {
+    const root = mkdtempSync(join(tmpdir(), "pa-unsupported-worker-mode-"));
+    const settings = qqWorkerSettings(root, roomConfig({ deliveryMode: mode }));
+    const fixture = qqWorkerConfigFixture(t, mode);
+    await t.test("server entry", async nested => {
+      await assert.rejects(async () => { await qqWorkerFixture(nested, settings, QQ_WORKER_REPLY, QQ_WORKER_TTS); },
+        QQ_WORKER_MODE_ERROR);
+      assert.equal(existsSync(join(root, "room.sqlite")), false);
+    });
+    await t.test("settings reader", () => {
+      assert.throws(() => readRoomQqSettings(fixture.file, fixture.env), QQ_WORKER_MODE_ERROR);
+    });
+  });
+}
+
+function qqWorkerConfigFixture(t: TestContext, deliveryMode: RoomConfig["deliveryMode"]) {
+  const root = mkdtempSync(join(tmpdir(), "pa-worker-cli-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const file = join(root, "room.json");
+  const env = { ROOM_QQ_A_TOKEN: "synthetic-token-a-canary", ROOM_QQ_B_TOKEN: "synthetic-token-b-canary" };
+  const config = roomConfig({ deliveryMode });
+  const characters = config.characters.map((character, index) => {
+    const personaFile = `public-${index}.md`;
+    return { ...character, personaFile, tokenEnv: index === 0 ? "ROOM_QQ_A_TOKEN" : "ROOM_QQ_B_TOKEN" };
+  });
+  writeFileSync(file, JSON.stringify({ ...config, characters, dataDir: ".", port: 38437,
+    execution: "worker", workerQueue: QUEUE }));
+  return { file, env };
+}
+
+for (const mode of ["text", "both"] as const) {
+  for (const tts of [false, true]) {
+    test(`B2-04 ${mode} with TTS ${tts} reports effective mode and sends the expected media`, async t => {
+      const root = mkdtempSync(join(tmpdir(), "pa-effective-worker-mode-"));
+      const settings = qqWorkerSettings(root, roomConfig({ deliveryMode: mode }));
+      const { bridge, media, open, send } = await qqWorkerFixture(t, settings, QQ_WORKER_REPLY,
+        tts ? QQ_WORKER_TTS : undefined);
+      const fixture = qqWorkerConfigFixture(t, mode);
+      const expectedMode = mode === "both" && tts ? "both" : "text";
+      assert.equal(readRoomQqSettings(fixture.file, fixture.env).room.deliveryMode, mode);
+      const peerA = await open(0);
+      await open(1);
+      await waitFor(() => bridge.room.ready, "worker ready");
+      send(peerA, "880005", "synthetic mention", ["10002"]);
+      await waitFor(() => bridge.room.store.lifecycleRequests()[0]?.status === "completed", "direct mention completed");
+      assert.deepEqual(media, expectedMode === "both" ? ["text", "record"] : ["text"]);
+      assert.equal(bridge.status().deliveryMode, expectedMode);
+      assert.partialDeepStrictEqual(bridge.status(), { worker: {
+        configuredDeliveryMode: mode, effectiveDeliveryMode: expectedMode, audioCapable: expectedMode === "both",
+        audioBlockReason: expectedMode === "both" ? null : mode === "text" ? "text_mode" : "tts_unavailable",
+      } });
+    });
+  }
+}
+
+for (const storedMode of ["text", "both"] as const) {
+  test(`B2-04 omitting deliveryMode preserves stored ${storedMode} with TTS`, async t => {
+    const root = mkdtempSync(join(tmpdir(), "pa-stored-worker-mode-"));
+    const settings = qqWorkerSettings(root, roomConfig({ deliveryMode: undefined }));
+    const store = new RoomStore(join(root, "room.sqlite"), settings.room, { lifecycle: "connection" });
+    try { store.setDeliveryMode(storedMode); } finally { store.close(); }
+    let synthesisCalls = 0;
+    const { bridge, media, open, send } = await qqWorkerFixture(t, settings, QQ_WORKER_REPLY, {
+      synthesize: async () => {
+        synthesisCalls++;
+        return QQ_WORKER_TTS.synthesize();
+      },
+    });
+    const initialMode = bridge.room.store.deliveryMode();
+    const peerA = await open(0);
+    await open(1);
+    await waitFor(() => bridge.room.ready, "worker ready from stored mode");
+    send(peerA, "880007", "synthetic mention with stored mode", ["10002"]);
+    await waitFor(() => bridge.room.store.lifecycleRequests()[0]?.status === "completed", "stored-mode mention completed");
+    assert.deepEqual({ initialMode, media, synthesisCalls }, {
+      initialMode: storedMode, media: storedMode === "text" ? ["text"] : ["text", "record"],
+      synthesisCalls: storedMode === "text" ? 0 : 1,
+    });
+    assert.equal(bridge.room.store.deliveryMode(), storedMode);
+    assert.partialDeepStrictEqual(bridge.status(), { worker: {
+      configuredDeliveryMode: null, effectiveDeliveryMode: storedMode,
+      audioBlockReason: storedMode === "text" ? "text_mode" : null,
+    } });
+  });
+}
+
+test("B2-04 omitting deliveryMode rejects an unsupported stored mode with TTS before listening", async t => {
+  const root = mkdtempSync(join(tmpdir(), "pa-unsupported-stored-worker-mode-"));
+  const settings = qqWorkerSettings(root, roomConfig({ deliveryMode: undefined }));
+  const store = new RoomStore(join(root, "room.sqlite"), settings.room, { lifecycle: "connection" });
+  try { store.setDeliveryMode("voice"); } finally { store.close(); }
+  await assert.rejects(async () => { await qqWorkerFixture(t, settings, QQ_WORKER_REPLY, QQ_WORKER_TTS); },
+    QQ_WORKER_MODE_ERROR);
+  assert.equal(existsSync(join(root, "room.sqlite.worker.lock")), false);
+  const persisted = new RoomStore(join(root, "room.sqlite"), settings.room, { lifecycle: "connection" });
+  try { assert.equal(persisted.deliveryMode(), "voice"); } finally { persisted.close(); }
+});
+
+test("B2-05 bridge status follows connectivity and pause while an old audio fence leaves text available", async t => {
+  const config = roomConfig({ deliveryMode: "both" });
+  const h = await lifecycleHarness(t, {
+    config, model: QQ_WORKER_REPLY,
+    dispatch: async request => {
+      request.beforeSend();
+      if (request.medium === "audio") return new Promise<string>(() => {});
+      await request.observe({ kind: "ack", messageId: "880011" });
+      request.released();
+      return "880011";
+    },
+  });
+  assert.equal(h.receive("880010", "synthetic-fence-ingress-canary", ["10002"]), "scheduled");
+  await waitFor(() => h.room.store.lifecycleAudioFence() !== null, "audio fence persisted");
+  const oldFence = h.room.store.lifecycleAudioFence();
+  await h.room.close();
+  const root = mkdtempSync(join(tmpdir(), "pa-worker-status-"));
+  copyFileSync(join(h.root, "room.sqlite"), join(root, "room.sqlite"));
+  const { bridge, media, notices, open, send } = await qqWorkerFixture(t, qqWorkerSettings(root, config),
+    QQ_WORKER_REPLY, QQ_WORKER_TTS);
+  const initial = bridge.status();
+  const peerA = await open(0);
+  const oneAccount = bridge.status();
+  const peerB = await open(1);
+  await waitFor(() => bridge.room.ready, "worker ready");
+  const ready = bridge.status();
+  assert.equal(bridge.control("pause", roomInput("880012", "/room pause")).kind, "applied");
+  const paused = bridge.status();
+  assert.equal(bridge.control("resume", roomInput("880013", "/room resume")).kind, "applied");
+  send(peerA, "880014", "synthetic-fence-next-ingress-canary", ["10002"]);
+  await waitFor(() => bridge.room.store.lifecycleRequests()[1]?.status === "completed", "text through old audio fence");
+  assert.deepEqual(media, ["text"]);
+  assert.equal(bridge.room.store.lifecycleAudioFence(), oldFence);
+  assert.partialDeepStrictEqual(initial, { online: 0, worker: { connectedAccountCount: 0, phase: "starting",
+    ingressReady: false, textCanProgress: false, audioBlockReason: "audio_result_unknown" } });
+  assert.partialDeepStrictEqual(oneAccount, { online: 1, worker: { connectedAccountCount: 1, phase: "starting",
+    ingressReady: false, textCanProgress: false } });
+  assert.partialDeepStrictEqual(ready, { online: 2, worker: { connectedAccountCount: 2, phase: "ready",
+    paused: false, ingressReady: true, textCanProgress: true, audioBlockReason: "audio_result_unknown" } });
+  assert.partialDeepStrictEqual(paused, { worker: { phase: "ready", paused: true, ingressReady: false,
+    textCanProgress: false, audioBlockReason: "audio_result_unknown" } });
+  await waitFor(() => notices.some(notice => String(notice.type) === "runtime-status"
+    && Reflect.get(notice, "status")?.textCanProgress), "owner-facing ready status notice");
+  peerB.terminate();
+  await waitFor(() => bridge.status().online === 1, "peer disconnected");
+  assert.partialDeepStrictEqual(bridge.status(), { worker: { connectedAccountCount: 1, phase: "ready",
+    ingressReady: false, textCanProgress: false, audioBlockReason: "audio_result_unknown" } });
+  const statusNotices = notices.filter(notice => String(notice.type) === "runtime-status");
+  assert.doesNotMatch(JSON.stringify(statusNotices), /canary|account-a|account-b|1000[0-3]/);
+  assert.ok(!JSON.stringify(statusNotices).includes(oldFence!));
+});
+
+test("B2-05 bridge status distinguishes worker fault from full account connectivity", async t => {
+  const root = mkdtempSync(join(tmpdir(), "pa-worker-status-fault-"));
+  const { bridge, notices, open } = await qqWorkerFixture(t, qqWorkerSettings(root), QQ_WORKER_REPLY);
+  bridge.room.store.recoverLifecycle = () => { throw new Error("synthetic-worker-fault-canary"); };
+  await open(0);
+  await open(1);
+  await waitFor(() => bridge.room.workerStatusForTest().phase === "faulted", "worker startup faulted");
+  assert.partialDeepStrictEqual(bridge.status(), { online: 2, worker: { connectedAccountCount: 2,
+    phase: "faulted", ingressReady: false, textCanProgress: false, faultReason: "room-lifecycle-startup-failed" } });
+  await waitFor(() => notices.some(notice => String(notice.type) === "runtime-status"
+    && Reflect.get(notice, "status")?.phase === "faulted"), "owner-facing fault status notice");
+  assert.doesNotMatch(JSON.stringify(notices), /synthetic-worker-fault-canary/);
 });
 
 test("TTS failure after an acknowledged text segment settles the segment text-only, not failed", async t => {

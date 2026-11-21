@@ -17,6 +17,22 @@ export interface RoomQqSettings {
   closePolicy?: Readonly<RoomClosePolicy>;
   replyDeadlineSource?: "env" | "default";
 }
+
+export class RoomWorkerDeliveryError extends Error {
+  constructor(source: "configured" | "stored" = "configured") {
+    super(source === "stored"
+      ? "lifecycle Worker 的历史 deliveryMode 无法沿用，请在房间配置中明确设为 text 或 both 后重试。"
+      : "lifecycle Worker 的 deliveryMode 仅支持 text 或 both，请修改房间配置后重试。");
+  }
+}
+
+export function workerDeliveryModes(value: unknown, voiceAvailable: boolean) {
+  if (value !== undefined && value !== "text" && value !== "both") throw new RoomWorkerDeliveryError();
+  const configuredDeliveryMode = value ?? null;
+  const effectiveDeliveryMode = voiceAvailable ? configuredDeliveryMode : "text";
+  return { configuredDeliveryMode, effectiveDeliveryMode } as const;
+}
+
 const object = (v: unknown): v is Record<string, unknown> => Boolean(v && typeof v === "object" && !Array.isArray(v));
 export function checkedWorkerQueue(value: unknown): Readonly<RoomQueuePolicy> {
   const positive = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 0;
@@ -45,12 +61,13 @@ export function readRoomQqSettings(file: string, env: NodeJS.ProcessEnv = proces
       || replyDeadlineMs < 1000 || replyDeadlineMs > 600000)) throw new Error();
     const inputLimits = object(input.limits) ? { ...input.limits } : {};
     if (replyDeadlineMs !== undefined) inputLimits.replyDeadlineMs = replyDeadlineMs;
+    const execution = input.execution;
+    if (execution !== "worker") throw new Error();
+    workerDeliveryModes(input.deliveryMode, false);
     const room = checkRoomConfig({ roomId: input.roomId, groupId: input.groupId, ownerId: input.ownerId,
       ingressAccountKey: input.ingressAccountKey, characters, limits: inputLimits,
       participation: input.participation, characterLanguages: input.characterLanguages,
       deliveryMode: input.deliveryMode, workerResponseBudgets: input.workerResponseBudgets } as Parameters<typeof checkRoomConfig>[0]);
-    const execution = input.execution;
-    if (execution !== "worker") throw new Error();
     const workerQueue = checkedWorkerQueue(input.workerQueue);
     const closePolicy = checkClosePolicy(input.closePolicy as Partial<RoomClosePolicy> | undefined);
     const port = input.port ?? 3011, apiTimeoutMs = input.apiTimeoutMs ?? 10000;
@@ -69,7 +86,10 @@ export function readRoomQqSettings(file: string, env: NodeJS.ProcessEnv = proces
     return Object.freeze({ room, dataDir, port: Number(port), apiTimeoutMs: Number(apiTimeoutMs), accounts: Object.freeze(accounts),
       execution, workerQueue, closePolicy,
       replyDeadlineSource: replyDeadlineMs === undefined ? "default" : "env" });
-  } catch { throw new Error("房间配置无效：检查 JSON、两账号映射、独立数据目录及 ROOM_QQ_*_TOKEN 环境变量。"); }
+  } catch (error) {
+    if (error instanceof RoomWorkerDeliveryError) throw error;
+    throw new Error("房间配置无效：检查 JSON、两账号映射、独立数据目录及 ROOM_QQ_*_TOKEN 环境变量。");
+  }
 }
 
 export function readRoomModelConfig(env: NodeJS.ProcessEnv = process.env): ModelConfig {

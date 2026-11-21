@@ -7,7 +7,7 @@ import { QqPeer, QqApiError } from "../qq-peer.js";
 import { checkRoomConfig, checkClosePolicy } from "./config.js";
 import { parseRoomQqMessage } from "./qq-message.js";
 import type { RoomQqSettings } from "./qq-config.js";
-import { checkedWorkerQueue } from "./qq-config.js";
+import { checkedWorkerQueue, RoomWorkerDeliveryError, workerDeliveryModes } from "./qq-config.js";
 import { VoiceRoom, type RoomLifecycleModelPort } from "./runtime.js";
 import type { RoomAmbientPlanner } from "./participation-planner.js";
 import { RoomSendError, type RoomControlAction, type RoomDependencies, type RoomInput,
@@ -16,10 +16,21 @@ import { roomRecord } from "./fish.js";
 
 const AMBIENT_PLANNER_TRANSPORT_MAX_CHARS = 1000;
 
+type RoomQqWorkerStatus = Omit<ReturnType<VoiceRoom["lifecycleStatus"]>, "audioFenceReason">
+  & Pick<ReturnType<typeof workerDeliveryModes>, "configuredDeliveryMode"> & {
+    effectiveDeliveryMode: "text" | "both";
+    connectedAccountCount: number;
+    audioCapable: boolean;
+    audioBlockReason: ReturnType<VoiceRoom["lifecycleStatus"]>["audioFenceReason"]
+      | "text_mode" | "tts_unavailable" | "worker_not_ready";
+  };
+
 export interface RoomQqNotice {
-  type: "connected" | "disconnected" | "rejected" | "received" | "error" | "participation" | "voice-preparation";
+  type: "connected" | "disconnected" | "rejected" | "received" | "error" | "participation" | "voice-preparation" | "runtime-status";
   code: string;
   elapsedMs?: number;
+  anchorRowId?: number;
+  status?: RoomQqWorkerStatus;
 }
 const equal = (a: string, b: string) => {
   const left = Buffer.from(a), right = Buffer.from(b);
@@ -33,8 +44,12 @@ export async function startRoomQq(settings: RoomQqSettings,
     & { lifecycleModel?: RoomLifecycleModelPort },
   onNotice: (notice: RoomQqNotice) => void = () => {},
   voice?: { synthesize: RoomDependencies["synthesize"] }) {
-  const config = checkRoomConfig(settings.room);
-  const workerSelected = settings.execution === "worker", closePolicy = checkClosePolicy(settings.closePolicy);
+  const workerSelected = settings.execution === "worker";
+  const workerTts = typeof voice?.synthesize === "function";
+  const startupModes = workerSelected ? workerDeliveryModes(settings.room.deliveryMode, workerTts) : undefined;
+  const config = checkRoomConfig(startupModes
+    ? { ...settings.room, deliveryMode: startupModes.effectiveDeliveryMode ?? undefined } : settings.room);
+  const closePolicy = checkClosePolicy(settings.closePolicy);
   if ((settings.execution !== undefined && settings.execution !== "legacy" && !workerSelected)
     || (workerSelected && (!settings.workerQueue || typeof deps.lifecycleModel?.generate !== "function"))) {
     throw new Error("room-worker-config-invalid");
@@ -96,6 +111,7 @@ export async function startRoomQq(settings: RoomQqSettings,
     ...(deps.now ? { now: deps.now } : {}), ...(deps.onContextCompacted ? { onContextCompacted: deps.onContextCompacted } : {}),
     voiceAvailable: Boolean(voice), onParticipation: decision => notice("participation", decision.reason),
     onVoicePreparation: decision => notice("voice-preparation", decision.code, decision.elapsedMs),
+    onAmbientParticipation: ({ code, anchorRowId }) => onNotice({ type: "participation", code, anchorRowId }),
     synthesize: voice?.synthesize ?? (async () => { throw new Error("room-voice-unavailable"); }),
     sendAudio: async (delivery, bytes, signal) => {
       if (!voice || signal.aborted || closing) throw new RoomSendError("rejected");
@@ -118,6 +134,32 @@ export async function startRoomQq(settings: RoomQqSettings,
       }
     },
   }, { execution: workerSelected ? "lifecycle" : "legacy" });
+  let workerModes: Pick<RoomQqWorkerStatus, "configuredDeliveryMode" | "effectiveDeliveryMode"> | undefined;
+  if (startupModes) {
+    try {
+      const effectiveDeliveryMode = startupModes.effectiveDeliveryMode ?? room.store.deliveryMode();
+      if (effectiveDeliveryMode !== "text" && effectiveDeliveryMode !== "both") throw new RoomWorkerDeliveryError("stored");
+      workerModes = { configuredDeliveryMode: startupModes.configuredDeliveryMode, effectiveDeliveryMode };
+    } catch (error) { await room.close(); throw error; }
+  }
+  function workerStatus(): RoomQqWorkerStatus | undefined {
+    if (!workerModes) return;
+    const { audioFenceReason, ...runtime } = room.lifecycleStatus();
+    const audioCapable = workerModes.effectiveDeliveryMode === "both";
+    const audioBlockReason = audioFenceReason ?? (!audioCapable
+      ? workerTts || workerModes.configuredDeliveryMode === "text" ? "text_mode" : "tts_unavailable"
+      : !runtime.ingressReady ? "worker_not_ready" : null);
+    return { ...runtime, ...workerModes, connectedAccountCount: peers.size, audioCapable, audioBlockReason };
+  }
+  let lastWorkerStatus: string | undefined;
+  function publishWorkerStatus() {
+    const status = workerStatus();
+    if (!status) return;
+    const snapshot = JSON.stringify(status);
+    if (snapshot === lastWorkerStatus) return;
+    lastWorkerStatus = snapshot;
+    try { onNotice({ type: "runtime-status", code: "room-worker-status", status }); } catch { /* Observer only. */ }
+  }
   const server = createServer({ maxHeaderSize: 8192 }, (_req, res) => { res.writeHead(404, { Connection: "close" }); res.end(); });
   server.headersTimeout = 5000; server.requestTimeout = 5000;
   const connections = new Set<Socket>();
@@ -199,12 +241,14 @@ export async function startRoomQq(settings: RoomQqSettings,
         }).catch(() => notice("error", "room-worker-startup-failed"));
       }
       notice("connected", "account-online");
+      publishWorkerStatus();
       ws.once("close", () => {
         if (peers.get(account.accountKey) !== peer) return;
         peers.delete(account.accountKey);
         if (!closing) {
           try { room.setOnline(account.accountKey, false); } catch { notice("error", "disconnect-state-failed"); }
           notice("disconnected", "account-offline");
+          publishWorkerStatus();
         }
       });
     });
@@ -215,8 +259,9 @@ export async function startRoomQq(settings: RoomQqSettings,
     await new Promise<void>((resolve, reject) => { server.once("error", reject);
       server.listen(settings.port, "127.0.0.1", () => { server.off("error", reject); resolve(); }); });
   } catch (error) { sockets.close(); await room.close(); throw error; }
+  publishWorkerStatus();
   const poll = setInterval(() => {
-    if (workerSelected) return;
+    if (workerSelected) { publishWorkerStatus(); return; }
     try { room.tick(); } catch { notice("error", "room-tick-failed"); try { room.stop(); room.store.setPaused(true); } catch {} }
   }, 500);
   const heartbeat = setInterval(() => {
@@ -226,7 +271,7 @@ export async function startRoomQq(settings: RoomQqSettings,
   const port = (server.address() as AddressInfo).port;
   return {
     room, url: `ws://127.0.0.1:${port}`,
-    status: () => ({ online: peers.size, ...room.status() }),
+    status: () => ({ online: peers.size, ...room.status(), ...(workerModes ? { worker: workerStatus() } : {}) }),
     /** Local deterministic control seam; production Legacy receive() still owns command parsing. */
     control: (action: RoomControlAction, input: RoomInput, mode?: RoomParticipationMode) => room.handleControl(action, input, mode),
     close(): Promise<void> {
