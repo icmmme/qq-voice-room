@@ -219,6 +219,36 @@ const burstStateSql = (expression: string) => "CASE " + expression + Object.entr
   .map(([work, burst]) => " WHEN '" + work + "' THEN '" + burst + "'").join("") + " ELSE '' END";
 const timestamp = (n: number) => Number.isSafeInteger(n) && n >= 0;
 const code = (s: string) => typeof s === "string" && /^[a-z][a-z0-9_-]{0,79}$/.test(s);
+const ROOM_HISTORY_RETENTION_MS = 7 * 86400000;
+const RETENTION_BODY_REDACTED = "[redacted:retention]";
+const ROOM_BODY_INVENTORY_ITEMS = [
+  { table: "room_messages", column: "text", timeColumn: "created_at", meaning: "message_body" },
+  { table: "room_deliveries", column: "semantic_text", timeColumn: "created_at", meaning: "generated_text" },
+  { table: "room_deliveries", column: "voice_text", timeColumn: "created_at", meaning: "voice_translation" },
+  { table: "room_work_items", column: "payload_json", timeColumn: "created_at", meaning: "request_body_json" },
+  { table: "room_lifecycle_requests", column: "payload_json", timeColumn: "created_at", meaning: "request_body_json" },
+  { table: "room_lifecycle_segments", column: "semantic_text", timeColumn: "created_at", meaning: "generated_text" },
+  { table: "room_lifecycle_segments", column: "voice_text", timeColumn: "created_at", meaning: "voice_translation" },
+] as const;
+export const ROOM_BODY_INVENTORY = Object.freeze(ROOM_BODY_INVENTORY_ITEMS.map(item => Object.freeze(item)));
+export type RoomBodyInventoryColumn = (typeof ROOM_BODY_INVENTORY_ITEMS)[number];
+export interface RoomRetentionCounts {
+  readonly messageBodiesRedacted: number;
+  readonly deliveryBodiesNulled: number;
+  readonly workPayloadsRedacted: number;
+  readonly lifecycleRequestPayloadsRedacted: number;
+  readonly lifecycleSegmentBodiesRedacted: number;
+}
+export interface RoomRetentionReport {
+  readonly cutoff: number;
+  readonly retentionMs: number;
+  readonly changed: boolean;
+  readonly preserved: Readonly<{ ids: true; times: true; statuses: true; reasons: true;
+    attempts: true; receipts: true; fences: true }>;
+  readonly counts: Readonly<RoomRetentionCounts>;
+  readonly reasons: readonly string[];
+  readonly inventory: readonly Readonly<{ table: string; column: string; meaning: string }>[];
+}
 const POST_MVP_SCHEMA_OBJECTS = [
   "room_work_items", "room_work_fifo", "room_work_member_window", "room_work_single_claim",
   "room_work_identity", "room_work_terminal", "room_burst_single_running", "room_work_initial",
@@ -1004,10 +1034,12 @@ export class RoomStore {
       const m = this.realWorkerProjection(binding, item);
       if (m.created_at !== fact.committedAt || createHash("sha256").update(String(m.text)).digest("hex") !== fact.textSHA256)
         throw new Error("room-worker-projection-invalid");
-    } else if (active || Object.keys(fact).sort().join() !== "committedAt,prunedAt,reason,receiptId,rowId,state,textSHA256,version"
-      || !timestamp(fact.prunedAt) || fact.prunedAt < fact.committedAt || !["age", "count"].includes(fact.reason)
-      || this.db.prepare("SELECT 1 FROM room_messages WHERE id=?").get(d.worker_text_row_id!))
-      throw new Error("room-worker-projection-invalid");
+    } else {
+      const retained = this.db.prepare("SELECT text FROM room_messages WHERE id=?").get(d.worker_text_row_id!);
+      if (active || Object.keys(fact).sort().join() !== "committedAt,prunedAt,reason,receiptId,rowId,state,textSHA256,version"
+        || !timestamp(fact.prunedAt) || fact.prunedAt < fact.committedAt || !["age", "count"].includes(fact.reason)
+        || (retained && retained.text !== RETENTION_BODY_REDACTED)) throw new Error("room-worker-projection-invalid");
+    }
   }
   private checkPlatformProjection(binding: WorkerTurnBinding, item: RoomWorkItem,
     d: Record<string, unknown>, fact: Record<string, unknown>, active: boolean): void {
@@ -1031,7 +1063,7 @@ export class RoomStore {
         || typeof row.text !== "string" || !row.text.trim() || [...row.text].length > binding.plan.budget.maxTextChars
         || createHash("sha256").update(row.text).digest("hex") !== fact.textSHA256
         || (d.semantic_text !== null && row.text !== d.semantic_text)) throw new Error("room-worker-projection-invalid");
-    } else if (fact.state !== "pruned" || active || row
+    } else if (fact.state !== "pruned" || active || (row && row.text !== RETENTION_BODY_REDACTED)
       || Object.keys(fact).sort().join() !== "committedAt,medium,prunedAt,reason,receiptId,rowId,state,textSHA256,version"
       || !timestamp(Number(fact.prunedAt)) || Number(fact.prunedAt) < Number(fact.committedAt)
       || !["age", "count"].includes(String(fact.reason))) throw new Error("room-worker-projection-invalid");
@@ -1099,7 +1131,9 @@ export class RoomStore {
     const identifier = (v: unknown) => typeof v === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(v);
     return Boolean(b && typeof b === "object" && Object.keys(b).sort().join(",") === "burstId,characterId,contextRevision,decision,eventKey,gate,grantId,plan,slotConsumed,slotReturned,targetHash,targetId,turnId,turnIndex,workItemId"
       && character && b.workItemId === item.workItemId && b.burstId === item.burstId && b.eventKey === item.eventKey
-      && b.targetId === item.payload?.messageRowId && b.targetHash === this.workerTargetHash(item)
+      && b.targetId === item.payload?.messageRowId
+      && (item.payload?.input.text === RETENTION_BODY_REDACTED
+        ? /^[a-f0-9]{64}$/.test(b.targetHash) : b.targetHash === this.workerTargetHash(item))
       && (b.turnIndex === 0 || b.turnIndex === 1) && item.payload.characterIds[b.turnIndex] === b.characterId
       && identifier(b.turnId) && identifier(b.grantId) && /^[a-f0-9]{64}$/.test(b.contextRevision)
       && validResponsePlan(b.plan) && b.decision && Object.keys(b.decision).sort().join(",") === "characterId,decisionId,decisionRevision,kind"
@@ -1625,25 +1659,32 @@ export class RoomStore {
       senderId: input.senderId, messageId: input.messageId, text: input.text.trim(), mentions,
       ...(input.replyToMessageId === undefined ? {} : { replyToMessageId: input.replyToMessageId }) };
   }
-  private lifecycleRequest(row: Record<string, unknown>): LifecycleRequest {
-    const payload = JSON.parse(String(row.payload_json)) as {
-      input?: unknown; characterIds?: unknown; messageRowId?: unknown; senderKey?: unknown;
-    };
+  private retainedLifecyclePayload(row: Record<string, unknown>): {
+    payload: Record<string, unknown>; characterIds: string[]; messageRowId: number; senderKey: string;
+  } {
+    const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
     if (!payload || typeof payload !== "object" || Array.isArray(payload)
       || !payload.input || typeof payload.input !== "object" || Array.isArray(payload.input)
       || !Array.isArray(payload.characterIds)
       || !payload.characterIds.every(id => typeof id === "string" && this.config.characters.some(c => c.id === id))
       || typeof payload.senderKey !== "string" || !/^member-[0-9a-f]{16}$/.test(payload.senderKey)
-      || !Number.isSafeInteger(payload.messageRowId) || Number(payload.messageRowId) <= 0) throw new Error("room-lifecycle-payload-invalid");
+      || !Number.isSafeInteger(payload.messageRowId) || Number(payload.messageRowId) <= 0) {
+      throw new Error("room-lifecycle-payload-invalid");
+    }
+    return { payload, characterIds: payload.characterIds as string[], messageRowId: Number(payload.messageRowId),
+      senderKey: payload.senderKey };
+  }
+  private lifecycleRequest(row: Record<string, unknown>): LifecycleRequest {
+    const { payload, characterIds, messageRowId, senderKey } = this.retainedLifecyclePayload(row);
     if (!["text", "both"].includes(String(row.delivery_mode))) throw new Error("room-lifecycle-payload-invalid");
     return Object.freeze({ requestId: String(row.request_id), eventKey: String(row.event_key),
       acceptSeq: Number(row.accept_seq), status: String(row.status) as LifecycleRequestStatus,
       outcomeReason: row.outcome_reason === null ? null : String(row.outcome_reason),
       source: String(row.source) as Trigger, executionEpoch: Number(row.execution_epoch),
       executionRevision: Number(row.execution_revision), expiresAt: Number(row.expires_at),
-      messageRowId: Number(row.message_row_id), characterIds: Object.freeze([...payload.characterIds]),
+      messageRowId: Number(row.message_row_id), characterIds: Object.freeze([...characterIds]),
       deliveryMode: String(row.delivery_mode) as LifecycleDeliveryMode,
-      senderKey: payload.senderKey,
+      senderKey,
       input: Object.freeze(payload.input as Omit<RoomInput, "senderId" | "unsupported">),
       createdAt: Number(row.created_at), updatedAt: Number(row.updated_at) });
   }
@@ -2736,6 +2777,249 @@ export class RoomStore {
       throw new Error("room-lifecycle-recovery-invalid");
     }
   }
+  /**
+   * The room-history window is the one retention clock for every persisted body.
+   * The inventory is deliberately explicit so an added body column cannot silently
+   * outlive this list. In-flight and unexpired requests are excluded before any
+   * body is changed; terminal records retain their identity and delivery facts.
+   */
+  cleanupBodyRetention(now: number): Readonly<RoomRetentionReport> {
+    if (!timestamp(now)) throw new Error("room-retention-time-invalid");
+    const cutoff = now - ROOM_HISTORY_RETENTION_MS;
+    return this.transaction(() => {
+      this.verifyBodyInventory();
+      const counts: RoomRetentionCounts = {
+        messageBodiesRedacted: 0,
+        deliveryBodiesNulled: 0,
+        workPayloadsRedacted: 0,
+        lifecycleRequestPayloadsRedacted: 0,
+        lifecycleSegmentBodiesRedacted: 0,
+      };
+      const mutableCounts: { -readonly [K in keyof RoomRetentionCounts]: RoomRetentionCounts[K] } = { ...counts };
+      const reasons = new Set<string>();
+
+      mutableCounts.messageBodiesRedacted = this.pruneExpiredHistory(cutoff, now);
+
+      mutableCounts.deliveryBodiesNulled = Number(this.db.prepare(`SELECT count(*) AS n FROM room_deliveries d
+        WHERE d.created_at < ? AND d.state NOT IN (${ACTIVE})
+          AND (semantic_text IS NOT NULL OR voice_text IS NOT NULL)`).get(cutoff)!.n);
+      this.db.prepare(`UPDATE room_deliveries AS d SET semantic_text=NULL,voice_text=NULL
+        WHERE d.created_at < ?
+          AND d.state NOT IN (${ACTIVE})
+          AND (d.semantic_text IS NOT NULL OR d.voice_text IS NOT NULL)`).run(cutoff);
+      if (mutableCounts.deliveryBodiesNulled) reasons.add("age");
+
+      mutableCounts.workPayloadsRedacted = this.redactExpiredWorkPayloads(cutoff, now);
+
+      mutableCounts.lifecycleRequestPayloadsRedacted = this.redactExpiredLifecycleRequestPayloads(cutoff, now);
+      mutableCounts.lifecycleSegmentBodiesRedacted = this.redactExpiredLifecycleSegmentBodies(cutoff, now);
+      if (mutableCounts.messageBodiesRedacted || mutableCounts.workPayloadsRedacted
+        || mutableCounts.lifecycleRequestPayloadsRedacted || mutableCounts.lifecycleSegmentBodiesRedacted) reasons.add("age");
+
+      this.verifyRetentionIntegrity(now);
+      return Object.freeze({
+        cutoff,
+        retentionMs: ROOM_HISTORY_RETENTION_MS,
+        changed: Object.values(mutableCounts).some(count => count > 0),
+        preserved: Object.freeze({ ids: true, times: true, statuses: true, reasons: true,
+          attempts: true, receipts: true, fences: true }),
+        counts: Object.freeze({ ...mutableCounts }),
+        reasons: Object.freeze([...reasons].sort()),
+        inventory: Object.freeze(ROOM_BODY_INVENTORY.map(item => Object.freeze({
+          table: item.table, column: item.column, meaning: item.meaning,
+        }))),
+      });
+    });
+  }
+  private verifyBodyInventory(): void {
+    const tables = this.db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name LIKE 'room_%'").all();
+    const actual = new Set<string>();
+    for (const table of tables) {
+      const name = String(table.name);
+      for (const column of this.db.prepare("SELECT name FROM pragma_table_info(?)").all(name)) {
+        actual.add(`${name}.${String(column.name)}`);
+      }
+    }
+    for (const item of ROOM_BODY_INVENTORY) {
+      if (!actual.has(`${item.table}.${item.column}`)) throw new Error("room-retention-inventory-invalid");
+    }
+    const relevant = /(?:^|_)(?:body|content|payload|prompt|response|reply|text|translation|voice)(?:_|$)/;
+    const metadata = new Set([
+      "room_state.voice",
+      "room_deliveries.voice_key",
+      "room_deliveries.text_id",
+      "room_deliveries.voice_language",
+      "room_deliveries.worker_text_row_id",
+      "room_work_items.payload_version",
+      "room_lifecycle_segments.voice_language",
+    ]);
+    const inventoried = new Set(ROOM_BODY_INVENTORY.map(item => `${item.table}.${item.column}`));
+    if ([...actual].some(name => relevant.test(name.slice(name.indexOf(".") + 1))
+      && !inventoried.has(name) && !metadata.has(name))) {
+      throw new Error("room-retention-inventory-incomplete");
+    }
+  }
+  private pruneExpiredHistory(cutoff: number, now: number): number {
+    const rows = this.db.prepare(`SELECT id FROM room_messages
+      WHERE created_at < ? AND text <> ? AND NOT EXISTS (
+        SELECT 1 FROM room_deliveries d
+        WHERE d.worker_text_row_id=room_messages.id AND d.state IN (${ACTIVE}))
+        AND NOT EXISTS (
+          SELECT 1 FROM room_lifecycle_requests r
+          WHERE r.message_row_id=room_messages.id
+            AND r.status IN ('queued','generating','delivering') AND r.expires_at>?)
+        AND NOT EXISTS (
+          SELECT 1 FROM room_work_items w
+          WHERE json_extract(w.payload_json,'$.messageRowId')=room_messages.id
+            AND w.status IN ('queued','claimed') AND w.expires_at>?)
+      ORDER BY id`).all(cutoff, RETENTION_BODY_REDACTED, now, now);
+    let cleaned = 0;
+    for (const row of rows) {
+      this.pruneWorkerMessages([Number(row.id)], "age", now);
+      cleaned++;
+    }
+    return cleaned;
+  }
+  private redactExpiredWorkPayloads(cutoff: number, now: number): number {
+    const rows = this.db.prepare(`SELECT * FROM room_work_items
+      WHERE created_at < ?
+      AND (status NOT IN ('queued','claimed') OR expires_at<=?)
+      AND payload_version=2 AND payload_json <> 'null'
+      AND json_extract(payload_json,'$.input.text') <> ?
+      ORDER BY work_item_id`).all(cutoff, now, RETENTION_BODY_REDACTED) as WorkRow[];
+    if (!rows.length) return 0;
+    const trigger = this.db.prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='room_work_terminal'")
+      .get()?.sql;
+    if (typeof trigger !== "string" || !trigger) throw new Error("room-retention-trigger-missing");
+    const redactedRows: string[] = [];
+    this.db.exec("DROP TRIGGER room_work_terminal");
+    try {
+      for (const row of rows) {
+        const payload = this.decodePayload(row);
+        if (!payload) continue;
+        const redacted = JSON.stringify({
+          input: { ...payload.input, senderKey: payload.input.senderKey, text: RETENTION_BODY_REDACTED },
+          characterIds: payload.characterIds,
+          messageRowId: payload.messageRowId,
+        });
+        if (this.db.prepare("UPDATE room_work_items SET payload_json=? WHERE work_item_id=? AND payload_json=?")
+          .run(redacted, row.work_item_id, row.payload_json).changes !== 1) {
+          throw new Error("room-retention-work-payload-conflict");
+        }
+        redactedRows.push(row.work_item_id);
+      }
+    } finally {
+      this.db.exec(trigger);
+    }
+    if (redactedRows.some(workItemId => this.db.prepare(
+      "SELECT 1 FROM room_work_items WHERE work_item_id=? AND json_extract(payload_json,'$.input.text')=?")
+      .get(workItemId, RETENTION_BODY_REDACTED) === undefined)) {
+      throw new Error("room-retention-work-payload-conflict");
+    }
+    return redactedRows.length;
+  }
+  private redactExpiredLifecycleRequestPayloads(cutoff: number, now: number): number {
+    const rows = this.db.prepare(`SELECT request_id,payload_json FROM room_lifecycle_requests r
+      WHERE r.created_at < ?
+        AND (r.status IN ('completed','failed','cancelled','restart_not_resumed') OR r.expires_at<=?)
+        AND (json_extract(r.payload_json,'$.input.text') IS NOT NULL
+          OR json_extract(r.payload_json,'$.input') IS NOT NULL)
+      ORDER BY request_id`).all(cutoff, now);
+    let redactedCount = 0;
+    for (const row of rows) {
+      const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
+      const input = payload.input as Record<string, unknown> | undefined;
+      if (!input || typeof input.text !== "string") continue;
+      if (input.text === RETENTION_BODY_REDACTED) continue;
+      const redacted = JSON.stringify({ ...payload, input: { ...input, text: RETENTION_BODY_REDACTED } });
+      if (this.db.prepare("UPDATE room_lifecycle_requests SET payload_json=? WHERE request_id=? AND payload_json=?")
+        .run(redacted, String(row.request_id), String(row.payload_json)).changes !== 1) {
+        throw new Error("room-retention-lifecycle-payload-conflict");
+      }
+      redactedCount++;
+    }
+    return redactedCount;
+  }
+  private redactExpiredLifecycleSegmentBodies(cutoff: number, now: number): number {
+    const rows = this.db.prepare(`SELECT DISTINCT s.segment_id FROM room_lifecycle_segments s
+      JOIN room_lifecycle_turns t ON t.turn_id=s.turn_id
+      JOIN room_lifecycle_requests r ON r.request_id=t.request_id
+      WHERE s.created_at < ?
+        AND (r.status IN ('completed','failed','cancelled','restart_not_resumed') OR r.expires_at<=?)
+        AND (s.semantic_text <> ? OR s.voice_text IS NOT NULL)
+      ORDER BY s.segment_id`).all(cutoff, now, RETENTION_BODY_REDACTED);
+    if (!rows.length) return 0;
+    this.db.prepare(`UPDATE room_lifecycle_segments SET semantic_text=?,voice_text=NULL
+      WHERE segment_id IN (${rows.map(() => "?").join(",")})
+        AND created_at < ?`)
+      .run(RETENTION_BODY_REDACTED, ...rows.map(row => String(row.segment_id)), cutoff);
+    return rows.length;
+  }
+  private verifyRetentionIntegrity(now: number): void {
+    const cutoff = now - ROOM_HISTORY_RETENTION_MS;
+    if (this.db.prepare("PRAGMA foreign_key_check").all().length) {
+      throw new Error("room-retention-fk-invalid");
+    }
+    if (this.db.prepare(`SELECT 1 FROM room_messages
+      WHERE created_at < ? AND text <> ?
+        AND NOT EXISTS (SELECT 1 FROM room_deliveries d
+          WHERE d.worker_text_row_id=room_messages.id AND d.state IN (${ACTIVE}))
+        AND NOT EXISTS (SELECT 1 FROM room_lifecycle_requests r
+          WHERE r.message_row_id=room_messages.id
+            AND r.status IN ('queued','generating','delivering') AND r.expires_at>?)
+        AND NOT EXISTS (SELECT 1 FROM room_work_items w
+          WHERE json_extract(w.payload_json,'$.messageRowId')=room_messages.id
+            AND w.status IN ('queued','claimed') AND w.expires_at>?)
+      LIMIT 1`).get(cutoff, RETENTION_BODY_REDACTED, now, now)) {
+      throw new Error("room-retention-message-incomplete");
+    }
+    if (this.db.prepare(`SELECT 1 FROM room_deliveries d
+      WHERE d.created_at < ? AND d.state NOT IN (${ACTIVE})
+        AND (d.semantic_text IS NOT NULL OR d.voice_text IS NOT NULL) LIMIT 1`).get(cutoff)) {
+      throw new Error("room-retention-delivery-incomplete");
+    }
+    if (this.db.prepare(`SELECT 1 FROM room_work_items
+      WHERE created_at < ? AND (status NOT IN ('queued','claimed') OR expires_at<=?)
+        AND json_extract(payload_json,'$.input.text') IS NOT NULL
+        AND json_extract(payload_json,'$.input.text') <> ?
+      LIMIT 1`).get(cutoff, now, RETENTION_BODY_REDACTED)) {
+      throw new Error("room-retention-work-incomplete");
+    }
+    if (this.db.prepare(`SELECT 1 FROM room_lifecycle_requests
+      WHERE created_at < ?
+        AND (status IN ('completed','failed','cancelled','restart_not_resumed') OR expires_at<=?)
+        AND json_extract(payload_json,'$.input.text') IS NOT NULL
+        AND json_extract(payload_json,'$.input.text') <> ?
+      LIMIT 1`).get(cutoff, now, RETENTION_BODY_REDACTED)) {
+      throw new Error("room-retention-request-incomplete");
+    }
+    if (this.db.prepare(`SELECT 1 FROM room_lifecycle_segments s
+      JOIN room_lifecycle_turns t ON t.turn_id=s.turn_id
+      JOIN room_lifecycle_requests r ON r.request_id=t.request_id
+      WHERE s.created_at < ?
+        AND (r.status IN ('completed','failed','cancelled','restart_not_resumed') OR r.expires_at<=?)
+        AND (s.semantic_text <> ? OR s.voice_text IS NOT NULL) LIMIT 1`)
+      .get(cutoff, now, RETENTION_BODY_REDACTED)) {
+      throw new Error("room-retention-segment-incomplete");
+    }
+    if (this.db.prepare(`SELECT 1 FROM room_work_items w
+      LEFT JOIN room_bursts b ON b.id=w.burst_id
+      WHERE w.burst_id IS NOT NULL AND b.id IS NULL LIMIT 1`).get()
+      || this.db.prepare(`SELECT 1 FROM room_lifecycle_turns t
+        LEFT JOIN room_lifecycle_requests r ON r.request_id=t.request_id
+        WHERE r.request_id IS NULL LIMIT 1`).get()
+      || this.db.prepare(`SELECT 1 FROM room_lifecycle_segments s
+        LEFT JOIN room_lifecycle_turns t ON t.turn_id=s.turn_id
+        WHERE t.turn_id IS NULL LIMIT 1`).get()
+      || this.db.prepare(`SELECT 1 FROM room_lifecycle_attempts a
+        LEFT JOIN room_lifecycle_segments s ON s.segment_id=a.segment_id
+        WHERE s.segment_id IS NULL LIMIT 1`).get()
+      || this.db.prepare(`SELECT 1 FROM room_lifecycle_receipts r
+        LEFT JOIN room_lifecycle_attempts a ON a.attempt_id=r.attempt_id
+        WHERE a.attempt_id IS NULL LIMIT 1`).get()) {
+      throw new Error("room-retention-integrity-invalid");
+    }
+  }
   releaseLifecycleAudioFence(attemptId: string, physicalSettled: boolean): boolean {
     if (!physicalSettled || typeof attemptId !== "string" || !attemptId) return false;
     const attempt = this.lifecycleAttempt(attemptId);
@@ -2825,11 +3109,12 @@ export class RoomStore {
         throw new Error("room-message-insert-conflict");
       // Validate BEFORE pruning: cleanup must never launder a missing/mismatched fact.
       this.checkWorkerBindings();
-      const age = this.db.prepare("SELECT id FROM room_messages WHERE created_at < ?").all(now - 7 * 86400000);
-      this.pruneWorkerMessages(age.map(r => Number(r.id)), "age", now);
-      const cutoff = now - 7 * 86400000;
-      this.db.prepare("UPDATE room_deliveries SET semantic_text=NULL,voice_text=NULL WHERE created_at < ?").run(cutoff);
-      if (this.db.prepare("SELECT 1 FROM room_deliveries WHERE created_at < ? AND (semantic_text IS NOT NULL OR voice_text IS NOT NULL)").get(cutoff))
+      const cutoff = now - ROOM_HISTORY_RETENTION_MS;
+      this.pruneExpiredHistory(cutoff, now);
+      this.db.prepare(`UPDATE room_deliveries SET semantic_text=NULL,voice_text=NULL
+        WHERE created_at < ? AND state NOT IN (${ACTIVE})`).run(cutoff);
+      if (this.db.prepare(`SELECT 1 FROM room_deliveries WHERE created_at < ?
+        AND state NOT IN (${ACTIVE}) AND (semantic_text IS NOT NULL OR voice_text IS NOT NULL)`).get(cutoff))
         throw new Error("room-message-prune-conflict");
       this.checkWorkerBindings();
       return id;
@@ -2847,8 +3132,11 @@ export class RoomStore {
           || this.db.prepare("SELECT worker_projection FROM room_deliveries WHERE id=?").get(d.id!)?.worker_projection !== pruned)
           throw new Error("room-worker-projection-prune-conflict");
       }
-      if (this.db.prepare("DELETE FROM room_messages WHERE id=?").run(id).changes !== 1
-        || this.db.prepare("SELECT 1 FROM room_messages WHERE id=?").get(id)) throw new Error("room-message-prune-conflict");
+      if (this.db.prepare("UPDATE room_messages SET text=? WHERE id=? AND text<>?")
+        .run(RETENTION_BODY_REDACTED, id, RETENTION_BODY_REDACTED).changes !== 1
+        || !this.db.prepare("SELECT 1 FROM room_messages WHERE id=? AND text=?").get(id, RETENTION_BODY_REDACTED)) {
+        throw new Error("room-message-prune-conflict");
+      }
     }
   }
 

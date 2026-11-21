@@ -407,9 +407,9 @@
       "reason": "Inherited unlayered source in the approved base tree; layering is not established in M1",
       "exitPhase": "M2/M3",
       "m1Treatment": "READ_ONLY_INVENTORY_ONLY",
-      "gitBlobSha1": "eb8efb4d8d3e6c9c593740464d5eb41c3afa564a",
-      "bytes": 135257,
-      "sha256": "F3A8C8449FDB8A0968FCA172EE1A5E95F3F143914822C119B3D0E655FDDC2816"
+      "gitBlobSha1": "7af01f2b45d1ece0266910703b243023590b2306",
+      "bytes": 138337,
+      "sha256": "29B53AAAB8BD5BCFD41A603DFE7350D9C033CF40266C785133F29DE4F7FF1599"
     },
     {
       "path": "src/voice-room/store.ts",
@@ -418,9 +418,9 @@
       "reason": "Inherited unlayered source in the approved base tree; layering is not established in M1",
       "exitPhase": "M2/M3",
       "m1Treatment": "READ_ONLY_INVENTORY_ONLY",
-      "gitBlobSha1": "9bde497cb9ea865a3e4b97f662782a5e059bff48",
-      "bytes": 207559,
-      "sha256": "40C9500DAA76374DE54F36DF7996D78C3DA42D28E6B1A1983BF7955A74AF2736"
+      "gitBlobSha1": "95c4578b331308bc378c8587c329e34a4a551f21",
+      "bytes": 222862,
+      "sha256": "0AD20062533A55A2D1414630657FC53CCBC2FF9E051B44D577C68D1A91534F4B"
     },
     {
       "path": "src/voice-room/tools.ts",

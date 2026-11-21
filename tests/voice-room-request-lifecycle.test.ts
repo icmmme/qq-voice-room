@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -101,6 +102,12 @@ async function waitFor(predicate: () => boolean, label = "synthetic-condition", 
 }
 
 const flush = () => new Promise<void>(resolve => setImmediate(resolve));
+
+function lifecyclePromptCacheSize(room: VoiceRoom): number {
+  return (room as unknown as {
+    readonly lifecycleTranslationPrompts: ReadonlyMap<string, unknown>;
+  }).lifecycleTranslationPrompts.size;
+}
 
 interface DispatchRecord {
   readonly characterId: string;
@@ -387,6 +394,48 @@ test("real public policy accepts tools-free both delivery and the Rin translatio
   assert.equal(h.room.store.lifecycleRequests()[0]!.status, "completed");
 });
 
+test("cached Rin translation input remains acceptable to public policy on the next segment", async t => {
+  const config = roomConfig({
+    deliveryMode: "both",
+    characters: [
+      { id: "rin", accountKey: "account-a", selfId: "10002", name: "Rin", voiceKey: "voice-rin" },
+      { id: "character-b", accountKey: "account-b", selfId: "10003", name: "Character B", voiceKey: "voice-b" },
+    ],
+  });
+  const policy = lifecyclePolicy(config);
+  const translations: string[] = [];
+  let sent = 0;
+  const h = await lifecycleHarness(t, {
+    config,
+    model: { generate: async () => ({ kind: "reply", segments: ["中文第一句", "中文第二句"] }) },
+    translateVoice: async prompt => {
+      const payload = JSON.parse(prompt.messages[0].content) as {
+        voiceTranslation?: { sourceText?: unknown };
+      };
+      translations.push(String(payload.voiceTranslation?.sourceText));
+      return "にほんごのへんじ";
+    },
+    dispatch: async request => {
+      request.beforeSend();
+      const id = String(750000 + ++sent);
+      await request.observe({ kind: "ack", messageId: id });
+      if (request.medium === "audio") request.physicalSettled();
+      request.released();
+      return id;
+    },
+    deps: { permitsText: policy.permitsText, permitsPrompt: policy.permitsPrompt },
+  });
+  assert.equal(h.receive("151", "翻译两段", ["10002"]), "scheduled");
+  await h.room.whenIdle();
+  assert.deepEqual(translations, ["中文第一句", "中文第二句"]);
+  const request = h.room.store.lifecycleRequests()[0]!;
+  const turn = h.room.store.lifecycleTurns(request.requestId)[0]!;
+  assert.deepEqual(h.dispatches.map(item => item.medium), ["text", "audio", "text", "audio"],
+    JSON.stringify({ request, segments: h.room.store.lifecycleSegments(turn.turnId) }));
+  assert.equal(h.room.store.lifecycleRequests()[0]!.status, "completed");
+  assert.equal(lifecyclePromptCacheSize(h.room), 0);
+});
+
 test("real public policy blocks synthetic secrets, identities and private paths before model or send", async t => {
   const policy = lifecyclePolicy();
   const h = await lifecycleHarness(t, {
@@ -581,6 +630,281 @@ test("cancellation during TTS that ignores Abort never dispatches late audio", a
   assert.deepEqual(h.dispatches.map(item => item.medium), ["text"]);
   assert.equal(h.room.store.lifecycleRequests()[0]!.status, "failed");
   assert.equal(h.room.store.lifecycleRequests()[0]!.outcomeReason, "mode_changed");
+});
+
+test("prompt cache releases text-only requests and never leaks one into a later both request", async t => {
+  let modelCalls = 0;
+  let sent = 0;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      deliveryMode: "text",
+      characters: [
+        { id: "character-a", accountKey: "account-a", selfId: "10002", name: "Character A", voiceKey: "voice-a" },
+        { id: "rin", accountKey: "account-b", selfId: "10003", name: "Rin", voiceKey: "voice-rin" },
+      ],
+    }),
+    model: {
+      generate: async (): Promise<RoomLifecycleAnswer> => {
+        modelCalls++;
+        return modelCalls === 1
+          ? { kind: "reply", segments: ["text one", "text two"] }
+          : { kind: "reply", segments: ["voice one", "voice two"] };
+      },
+    },
+    translateVoice: async () => "にほんごのへんじ",
+    dispatch: async request => {
+      request.beforeSend();
+      const id = String(840000 + ++sent);
+      await request.observe({ kind: "ack", messageId: id });
+      request.released();
+      return id;
+    },
+  });
+
+  assert.equal(h.receive("130", "text only", ["10003"]), "scheduled");
+  await h.room.whenIdle();
+  assert.equal(h.room.store.lifecycleRequests()[0]!.status, "completed");
+  assert.equal(lifecyclePromptCacheSize(h.room), 0);
+
+  h.room.store.setDeliveryMode("both");
+  assert.equal(h.receive("131", "voice now", ["10003"]), "scheduled");
+  await h.room.whenIdle();
+  assert.equal(h.room.store.lifecycleRequests()[1]!.status, "completed");
+  assert.equal(lifecyclePromptCacheSize(h.room), 0);
+});
+
+test("a multi-segment both request keeps its prompt until the final voice segment settles", async t => {
+  let sent = 0;
+  let translations = 0;
+  let modelCalls = 0;
+  const secondTurnStarted = deferred<void>();
+  const releaseSecondTurn = deferred<void>();
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      deliveryMode: "both",
+      limits: { turnsPerMinute: 12 },
+      characters: [
+        { id: "rin-a", accountKey: "account-a", selfId: "10002", name: "Rin", voiceKey: "voice-rin-a" },
+        { id: "rin-b", accountKey: "account-b", selfId: "10003", name: "Rin", voiceKey: "voice-rin-b" },
+      ],
+    }),
+    model: { generate: async () => {
+      modelCalls++;
+      return modelCalls === 1
+        ? { kind: "reply", segments: ["A first", "A second"] }
+        : { kind: "reply", segments: ["B first", "B second"] };
+    } },
+    translateVoice: async () => {
+      translations++;
+      return "にほんごのへんじ";
+    },
+    dispatch: async request => {
+      if (request.item.turn.characterId === "rin-b" && request.item.segment.segmentIndex === 0
+        && request.medium === "text") {
+        secondTurnStarted.resolve();
+        await releaseSecondTurn.promise;
+      }
+      request.beforeSend();
+      const id = String(850000 + ++sent);
+      await request.observe({ kind: "ack", messageId: id });
+      if (request.medium === "audio") request.physicalSettled();
+      request.released();
+      return id;
+    },
+  });
+
+  assert.equal(h.receive("132", "speak twice", ["10002", "10003"]), "scheduled");
+  await secondTurnStarted.promise;
+  assert.equal(translations, 2);
+  assert.equal(lifecyclePromptCacheSize(h.room), 1);
+
+  releaseSecondTurn.resolve();
+  await h.room.whenIdle();
+  assert.equal(h.room.store.lifecycleRequests()[0]!.status, "completed");
+  assert.equal(translations, 4);
+  assert.equal(lifecyclePromptCacheSize(h.room), 0);
+});
+
+test("voice failures keep the translation prompt only for the remaining segment", async t => {
+  for (const failure of ["translation", "synthesis"] as const) {
+    await t.test(failure, async subtest => {
+      let sent = 0;
+      let translations = 0;
+      let synthesisCalls = 0;
+      const secondTextStarted = deferred<void>();
+      const releaseSecondText = deferred<void>();
+      const h = await lifecycleHarness(subtest, {
+        config: roomConfig({
+          deliveryMode: "both",
+          characters: [
+            { id: "rin", accountKey: "account-a", selfId: "10002", name: "Rin", voiceKey: "voice-rin" },
+            { id: "character-b", accountKey: "account-b", selfId: "10003", name: "Character B", voiceKey: "voice-b" },
+          ],
+        }),
+        model: { generate: async () => ({ kind: "reply", segments: ["first failure", "second success"] }) },
+        translateVoice: async () => {
+          translations++;
+          if (failure === "translation" && translations === 1) {
+            throw new Error("voice_translation_unavailable");
+          }
+          return "にほんごのへんじ";
+        },
+        synthesize: async () => {
+          synthesisCalls++;
+          if (failure === "synthesis" && synthesisCalls === 1) throw new Error("fish-tts-network");
+          return new Uint8Array([1, 2, 3]);
+        },
+        dispatch: async request => {
+          if (request.item.segment.segmentIndex === 1 && request.medium === "text") {
+            secondTextStarted.resolve();
+            await releaseSecondText.promise;
+          }
+          request.beforeSend();
+          const id = String(860000 + ++sent);
+          await request.observe({ kind: "ack", messageId: id });
+          request.released();
+          return id;
+        },
+      });
+
+      assert.equal(h.receive("133", "fail once", ["10002"]), "scheduled");
+      await secondTextStarted.promise;
+      assert.equal(lifecyclePromptCacheSize(h.room), 1);
+
+      releaseSecondText.resolve();
+      await h.room.whenIdle();
+      const request = h.room.store.lifecycleRequests()[0]!;
+      assert.equal(request.status, "completed");
+      assert.equal(translations, 2);
+      assert.deepEqual(h.dispatches.map(item => item.medium), ["text", "text", "audio"]);
+      assert.equal(lifecyclePromptCacheSize(h.room), 0);
+    });
+  }
+});
+
+test("a terminal audio transport failure releases the prompt cache", async t => {
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      deliveryMode: "both",
+      characters: [
+        { id: "rin", accountKey: "account-a", selfId: "10002", name: "Rin", voiceKey: "voice-rin" },
+        { id: "character-b", accountKey: "account-b", selfId: "10003", name: "Character B", voiceKey: "voice-b" },
+      ],
+    }),
+    model: { generate: async () => ({ kind: "reply", segments: ["first voice", "second voice"] }) },
+    translateVoice: async () => "にほんごのへんじ",
+    dispatch: async request => {
+      request.beforeSend();
+      if (request.medium === "audio") throw new Error("transport_unknown");
+      await request.observe({ kind: "ack", messageId: "755001" });
+      request.released();
+      return "755001";
+    },
+  });
+  assert.equal(h.receive("138", "unknown audio result", ["10002"]), "scheduled");
+  await h.room.whenIdle();
+  assert.equal(h.room.store.lifecycleRequests()[0]!.status, "failed");
+  assert.equal(lifecyclePromptCacheSize(h.room), 0);
+});
+
+test("a mode revision change releases a cached prompt immediately", async t => {
+  let translationStarted = false;
+  const translation = deferred<string>();
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      deliveryMode: "both",
+      characters: [
+        { id: "rin", accountKey: "account-a", selfId: "10002", name: "Rin", voiceKey: "voice-rin" },
+        { id: "character-b", accountKey: "account-b", selfId: "10003", name: "Character B", voiceKey: "voice-b" },
+      ],
+    }),
+    model: { generate: async () => ({ kind: "reply", segments: ["first voice", "second voice"] }) },
+    translateVoice: async () => {
+      translationStarted = true;
+      return translation.promise;
+    },
+  });
+
+  assert.equal(h.receive("134", "translate before mode change", ["10002"]), "scheduled");
+  await waitFor(() => translationStarted, "translation start");
+  assert.equal(lifecyclePromptCacheSize(h.room), 1);
+
+  assert.equal(h.receive("135", "/room mode ambient"), "control");
+  await waitFor(() => {
+    const status = h.room.store.lifecycleRequests()[0]?.status;
+    return status !== undefined && !["queued", "generating", "delivering"].includes(status);
+  }, "mode cancellation");
+  assert.equal(lifecyclePromptCacheSize(h.room), 0);
+
+  translation.resolve("まちがったおそいほんやく");
+  await h.room.whenIdle();
+  assert.equal(lifecyclePromptCacheSize(h.room), 0);
+});
+
+test("pause releases the cached prompt and resume can still translate the next voice segment", async t => {
+  let translations = 0;
+  let translationStarted = false;
+  const firstTranslation = deferred<string>();
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      deliveryMode: "both",
+      characters: [
+        { id: "rin", accountKey: "account-a", selfId: "10002", name: "Rin", voiceKey: "voice-rin" },
+        { id: "character-b", accountKey: "account-b", selfId: "10003", name: "Character B", voiceKey: "voice-b" },
+      ],
+    }),
+    model: { generate: async () => ({ kind: "reply", segments: ["first voice", "second voice"] }) },
+    translateVoice: async () => {
+      translations++;
+      if (translations === 1) {
+        translationStarted = true;
+        return firstTranslation.promise;
+      }
+      return "にほんごのへんじ";
+    },
+  });
+
+  assert.equal(h.receive("136", "pause then resume", ["10002"]), "scheduled");
+  await waitFor(() => translationStarted, "first translation start");
+  assert.equal(lifecyclePromptCacheSize(h.room), 1);
+
+  h.room.store.setPaused(true);
+  assert.equal(lifecyclePromptCacheSize(h.room), 0);
+  firstTranslation.resolve("とりけされたほんやく");
+  await flush();
+
+  h.room.store.setPaused(false);
+  await waitFor(() => h.room.store.lifecycleRequests()[0]?.status === "completed", "resumed completion");
+  assert.equal(translations, 3);
+  assert.equal(lifecyclePromptCacheSize(h.room), 0);
+});
+
+test("expiry releases a cached prompt even when the request has a failed terminal outcome", async t => {
+  let now = Date.parse("2026-11-13T00:00:00Z");
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      deliveryMode: "both",
+      characters: [
+        { id: "rin", accountKey: "account-a", selfId: "10002", name: "Rin", voiceKey: "voice-rin" },
+        { id: "character-b", accountKey: "account-b", selfId: "10003", name: "Character B", voiceKey: "voice-b" },
+      ],
+    }),
+    model: { generate: async () => ({ kind: "reply", segments: ["first voice", "second voice"] }) },
+    translateVoice: async () => "にほんごのへんじ",
+    deps: { now: () => now },
+    dispatch: async request => {
+      request.beforeSend();
+      await request.observe({ kind: "ack", messageId: "871001" });
+      request.released();
+      return "871001";
+    },
+  });
+
+  assert.equal(h.receive("137", "expire before delivery", ["10002"]), "scheduled");
+  await waitFor(() => h.prompts.length === 1, "generation before expiry");
+  now += QUEUE.ttlMs + 1_000;
+  await h.room.whenIdle();
+  assert.equal(lifecyclePromptCacheSize(h.room), 0);
 });
 
 test("observer release cannot clear an audio fence before physical send completion", async t => {
@@ -3383,4 +3707,364 @@ test("an immutable audio ACK wins when the transport promise later rejects", asy
     .map(row => [row.medium, row.platformId]), [["text", "899701"], ["voice", "899702"]]);
   assert.equal(h.room.store.lifecycleRequests()[0]?.status, "completed");
   assert.equal(h.room.workerStatusForTest().phase, "ready");
+});
+
+test("body retention inventory reports a body-free no-op before the seven-day window", async t => {
+  const base = Date.parse("2026-11-20T00:00:00Z");
+  const h = await lifecycleHarness(t, {
+    deps: { now: () => base },
+    model: { generate: async () => ({ kind: "reply", segments: ["retention generated canary"] }) },
+    synthesize: async () => new Uint8Array([1, 2, 3]),
+    dispatch: async request => {
+      request.beforeSend();
+      const messageId = request.medium === "text" ? "799001" : "799002";
+      await request.observe({ kind: "ack", messageId });
+      request.released();
+      return messageId;
+    },
+  });
+  assert.equal(h.receive("798", "retention request canary", ["10002"]), "scheduled");
+  await h.room.whenIdle();
+
+  const request = h.room.store.lifecycleRequests()[0]!;
+  const turn = h.room.store.lifecycleTurns(request.requestId)[0]!;
+  const segment = h.room.store.lifecycleSegments(turn.turnId)[0]!;
+  const report = h.room.store.cleanupBodyRetention(base);
+  assert.equal(report.changed, false);
+  assert.deepEqual(report.counts, {
+    messageBodiesRedacted: 0,
+    deliveryBodiesNulled: 0,
+    workPayloadsRedacted: 0,
+    lifecycleRequestPayloadsRedacted: 0,
+    lifecycleSegmentBodiesRedacted: 0,
+  });
+  assert.deepEqual(report.reasons, []);
+  assert.deepEqual(report.inventory, [
+    { table: "room_messages", column: "text", meaning: "message_body" },
+    { table: "room_deliveries", column: "semantic_text", meaning: "generated_text" },
+    { table: "room_deliveries", column: "voice_text", meaning: "voice_translation" },
+    { table: "room_work_items", column: "payload_json", meaning: "request_body_json" },
+    { table: "room_lifecycle_requests", column: "payload_json", meaning: "request_body_json" },
+    { table: "room_lifecycle_segments", column: "semantic_text", meaning: "generated_text" },
+    { table: "room_lifecycle_segments", column: "voice_text", meaning: "voice_translation" },
+  ]);
+  assert.doesNotMatch(JSON.stringify(report), /retention request canary|retention generated canary|79900/);
+  assert.equal(h.room.store.historyMessage(request.messageRowId)?.text, "retention request canary");
+  assert.equal(h.room.store.lifecycleRequestById(request.requestId)?.input.text, "retention request canary");
+  assert.equal(h.room.store.lifecycleSegments(turn.turnId)[0]?.text, "retention generated canary");
+  assert.ok(segment.segmentId);
+});
+
+test("body retention is exact at seven days, idempotent, survives reopen and preserves lifecycle facts", async t => {
+  const root = mkdtempSync(join(tmpdir(), "pa-retention-boundary-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const file = join(root, "room.sqlite");
+  const config = checkRoomConfig(roomConfig({ deliveryMode: "both" }));
+  const base = Date.parse("2026-11-20T00:00:00Z");
+  const boundary = base - 7 * 86400000;
+  const outside = boundary - 60_000;
+  const store = new RoomStore(file, config, { lifecycle: "connection" });
+  store.acquireLifecycleOwner("retention-owner", store.state().epoch, base + 60000, base);
+  const admittedWork = store.acceptInput(roomInput("798100", "old-work-canary"), {
+    now: outside,
+    expectedEpoch: store.state().epoch,
+    source: "direct",
+    mode: "enqueue",
+    policy: QUEUE,
+  });
+  assert.equal(admittedWork.kind, "enqueue");
+  const claimedWork = store.claimNext({ expectedEpoch: store.state().epoch, now: outside + 1,
+    burstId: "retention-burst" });
+  assert.equal(claimedWork?.workItemId, admittedWork.item?.workItemId);
+  assert.equal(store.settleWorkItem(admittedWork.item!.workItemId, {
+    expectedEpoch: store.state().epoch,
+    burstId: "retention-burst",
+    now: base + 2,
+    status: "cancelled",
+    reason: "delivery_cancelled",
+  }), true);
+  store.close();
+
+  const db = new DatabaseSync(file);
+  const insertMessage = db.prepare(`INSERT INTO room_messages
+    (speaker_type,speaker_id,account_key,target_id,text,platform_id,created_at,medium) VALUES (?,?,?,?,?,?,?,?)`);
+  const oldUser = Number(insertMessage.run("user", "member-1111111111111111", "account-a", null,
+    "old-user-canary", "798100", outside, "text").lastInsertRowid);
+  const oldBot = Number(insertMessage.run("bot", "character-a", "account-a", oldUser,
+    "old-generated-canary", "798101", outside, "text").lastInsertRowid);
+  const oldVoice = Number(insertMessage.run("bot", "character-a", "account-a", oldUser,
+    "old-voice-canary", "798102", outside, "voice").lastInsertRowid);
+  const edgeUser = Number(insertMessage.run("user", "member-1111111111111111", "account-a", null,
+    "edge-user-canary", "798103", boundary, "text").lastInsertRowid);
+  const activeUser = Number(insertMessage.run("user", "member-1111111111111111", "account-a", null,
+    "active-user-canary", "798104", outside, "text").lastInsertRowid);
+  const unknownUser = Number(insertMessage.run("user", "member-1111111111111111", "account-a", null,
+    "unknown-user-canary", "798105", outside, "text").lastInsertRowid);
+  const expiredUser = Number(insertMessage.run("user", "member-1111111111111111", "account-a", null,
+    "expired-user-canary", "798106", outside, "text").lastInsertRowid);
+
+  const oldRequest = "11111111-1111-4111-8111-111111111111";
+  const oldTurn = "22222222-2222-4222-8222-222222222222";
+  const oldSegment = "33333333-3333-4333-8333-333333333333";
+  const oldTextAttempt = "44444444-4444-4444-8444-444444444444";
+  const activeRequest = "55555555-5555-4555-8555-555555555555";
+  const activeTurn = "66666666-6666-4666-8666-666666666666";
+  const activeSegment = "77777777-7777-4777-8777-777777777777";
+  const unknownRequest = "88888888-8888-4888-8888-888888888888";
+  const unknownTurn = "99999999-9999-4999-8999-999999999999";
+  const unknownSegment = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const unknownAttempt = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const expiredRequest = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const expiredTurn = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const expiredSegment = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  db.prepare(`INSERT INTO room_lifecycle_requests
+    (request_id,event_key,accept_seq,status,outcome_reason,source,execution_epoch,execution_revision,expires_at,
+      message_row_id,delivery_mode,payload_json,created_at,updated_at)
+    VALUES (?,?,1,'failed','delivery_rejected','direct',0,0,?,?,'both',?,?,?)`).run(oldRequest,
+    "a".repeat(64), base, oldUser, JSON.stringify({ input: { text: "old-request-canary" }, characterIds: ["character-a"],
+      messageRowId: oldUser, senderKey: "member-1111111111111111" }), outside, outside);
+  db.prepare(`INSERT INTO room_lifecycle_turns
+    (turn_id,request_id,character_id,mention_index,status,reason,created_at,updated_at)
+    VALUES (?,?, 'character-a',0,'failed','delivery_rejected',?,?)`).run(oldTurn, oldRequest, outside, outside);
+  db.prepare(`INSERT INTO room_lifecycle_segments
+    (segment_id,turn_id,segment_index,semantic_text,voice_text,voice_language,delivery_mode,state,reason,created_at,updated_at)
+    VALUES (?,?,0,'old-segment-canary','old-translation-canary','ja','both','failed','delivery_rejected',?,?)`)
+    .run(oldSegment, oldTurn, outside, outside);
+  db.prepare(`INSERT INTO room_lifecycle_attempts
+    (attempt_id,segment_id,request_id,turn_id,account_key,medium,revision,intent_at,started_at,owner_token,committed_row_id)
+    VALUES (?,?,?,?, 'account-a','text',0,?,?, 'retention-owner',?)`)
+    .run(oldTextAttempt, oldSegment, oldRequest, oldTurn, outside, outside, oldBot);
+  db.prepare(`INSERT INTO room_lifecycle_receipts VALUES (?, 'ack', '798101', ?)`).run(oldTextAttempt, outside);
+
+  db.prepare(`INSERT INTO room_lifecycle_requests
+    (request_id,event_key,accept_seq,status,outcome_reason,source,execution_epoch,execution_revision,expires_at,
+      message_row_id,delivery_mode,payload_json,created_at,updated_at)
+    VALUES (?,?,2,'generating',NULL,'direct',0,0,?,?,'text',?,?,?)`).run(activeRequest,
+    "b".repeat(64), base + 60000, activeUser,
+    JSON.stringify({ input: { text: "active-request-canary" }, characterIds: ["character-a"],
+      messageRowId: activeUser, senderKey: "member-1111111111111111" }), outside, outside);
+  db.prepare(`INSERT INTO room_lifecycle_turns
+    (turn_id,request_id,character_id,mention_index,status,reason,created_at,updated_at)
+    VALUES (?,?, 'character-a',0,'generating',NULL,?,?)`).run(activeTurn, activeRequest, outside, outside);
+  db.prepare(`INSERT INTO room_lifecycle_segments
+    (segment_id,turn_id,segment_index,semantic_text,voice_text,voice_language,delivery_mode,state,reason,created_at,updated_at)
+    VALUES (?,?,0,'active-segment-canary',NULL,NULL,'text','pending',NULL,?,?)`)
+    .run(activeSegment, activeTurn, outside, outside);
+  db.prepare(`INSERT INTO room_lifecycle_requests
+    (request_id,event_key,accept_seq,status,outcome_reason,source,execution_epoch,execution_revision,expires_at,
+      message_row_id,delivery_mode,payload_json,created_at,updated_at)
+    VALUES (?,?,3,'failed','delivery_unknown','direct',0,0,?,?,'both',?,?,?)`).run(unknownRequest,
+    "e".repeat(64), base, unknownUser,
+    JSON.stringify({ input: { text: "unknown-request-canary" }, characterIds: ["character-a"],
+      messageRowId: unknownUser, senderKey: "member-1111111111111111" }), outside, outside);
+  db.prepare(`INSERT INTO room_lifecycle_turns
+    (turn_id,request_id,character_id,mention_index,status,reason,created_at,updated_at)
+    VALUES (?,?, 'character-a',0,'unknown','delivery_unknown',?,?)`).run(unknownTurn, unknownRequest, outside, outside);
+  db.prepare(`INSERT INTO room_lifecycle_segments
+    (segment_id,turn_id,segment_index,semantic_text,voice_text,voice_language,delivery_mode,state,reason,created_at,updated_at)
+    VALUES (?,?,0,'unknown-segment-canary','unknown-translation-canary','ja','both','unknown','delivery_unknown',?,?)`)
+    .run(unknownSegment, unknownTurn, outside, outside);
+  db.prepare(`INSERT INTO room_lifecycle_attempts
+    (attempt_id,segment_id,request_id,turn_id,account_key,medium,revision,intent_at,started_at,owner_token,committed_row_id)
+    VALUES (?,?,?,?, 'account-a','audio',0,?,?, 'retention-owner',NULL)`)
+    .run(unknownAttempt, unknownSegment, unknownRequest, unknownTurn, outside, outside);
+  db.prepare("INSERT INTO room_lifecycle_audio_fence(id,attempt_id,started_at) VALUES (1,?,?)")
+    .run(unknownAttempt, outside);
+  db.prepare(`INSERT INTO room_lifecycle_requests
+    (request_id,event_key,accept_seq,status,outcome_reason,source,execution_epoch,execution_revision,expires_at,
+      message_row_id,delivery_mode,payload_json,created_at,updated_at)
+    VALUES (?,?,4,'generating',NULL,'direct',0,0,?,?,'text',?,?,?)`).run(expiredRequest,
+    "f".repeat(64), outside, expiredUser,
+    JSON.stringify({ input: { text: "expired-request-canary" }, characterIds: ["character-a"],
+      messageRowId: expiredUser, senderKey: "member-1111111111111111" }), outside, outside);
+  db.prepare(`INSERT INTO room_lifecycle_turns
+    (turn_id,request_id,character_id,mention_index,status,reason,created_at,updated_at)
+    VALUES (?,?, 'character-a',0,'generating',NULL,?,?)`).run(expiredTurn, expiredRequest, outside, outside);
+  db.prepare(`INSERT INTO room_lifecycle_segments
+    (segment_id,turn_id,segment_index,semantic_text,voice_text,voice_language,delivery_mode,state,reason,created_at,updated_at)
+    VALUES (?,?,0,'expired-segment-canary',NULL,NULL,'text','pending',NULL,?,?)`)
+    .run(expiredSegment, expiredTurn, outside, outside);
+  db.prepare("UPDATE room_work_items SET created_at=?,received_at=?,updated_at=? WHERE work_item_id=?")
+    .run(outside, outside, outside, admittedWork.item!.workItemId);
+  db.prepare(`INSERT INTO room_deliveries
+    (id,burst_id,character_id,account_key,voice_key,state,created_at,semantic_text,voice_text,voice_language,delivery_mode)
+    VALUES ('legacy-stale-delivery','legacy-burst','character-a','account-a','voice-a','interrupted',
+      ?,'old-delivery-canary','old-delivery-voice-canary','ja','both')`).run(outside);
+  db.prepare(`INSERT INTO room_deliveries
+    (id,burst_id,character_id,account_key,voice_key,state,created_at,semantic_text,voice_text,voice_language,delivery_mode)
+    VALUES ('legacy-terminal-delivery','legacy-terminal-burst','character-a','account-a','voice-a','stopped',
+      ?,'old-terminal-canary','old-terminal-voice-canary','ja','both')`).run(outside);
+  db.prepare(`INSERT INTO room_bursts(id,epoch,trigger,target_id,state,created_at)
+    VALUES ('legacy-burst',0,'direct',?,'interrupted',?)`).run(oldUser, outside);
+  db.prepare("UPDATE room_state SET next_accept_seq=4").run();
+  db.close();
+  const probe = new DatabaseSync(file);
+  assert.deepEqual(probe.prepare("SELECT text FROM room_messages WHERE created_at < ? ORDER BY id")
+    .all(base - 7 * 86400000).map(row => row.text).sort(), [
+      "active-user-canary",
+      "expired-user-canary",
+      "old-generated-canary",
+      "old-user-canary",
+      "old-voice-canary",
+      "old-work-canary",
+      "unknown-user-canary",
+    ]);
+  assert.equal(Number(probe.prepare("SELECT count(*) AS n FROM room_messages WHERE created_at < ?")
+    .get(base - 7 * 86400000)!.n), 7);
+  assert.equal(Number(probe.prepare("SELECT count(*) AS n FROM room_work_items WHERE created_at < ?")
+    .get(base - 7 * 86400000)!.n), 1);
+  const terminalTriggerSql = String(probe.prepare(
+    "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='room_work_terminal'").get()!.sql);
+  probe.close();
+
+  const rollbackDir = join(root, "rollback");
+  mkdirSync(rollbackDir);
+  const rollbackFile = join(rollbackDir, "room.sqlite");
+  copyFileSync(file, rollbackFile);
+  const faultDb = new DatabaseSync(rollbackFile);
+  faultDb.exec(`CREATE TRIGGER retention_fault BEFORE UPDATE OF semantic_text ON room_lifecycle_segments
+    BEGIN SELECT RAISE(ABORT,'forced-retention-fault'); END;`);
+  faultDb.close();
+  const failing = new RoomStore(rollbackFile, config, { lifecycle: "connection" });
+  assert.throws(() => failing.cleanupBodyRetention(base), /forced-retention-fault/);
+  failing.close();
+  const rolledBack = new DatabaseSync(rollbackFile);
+  assert.equal(String(rolledBack.prepare("SELECT text FROM room_messages WHERE id=?").get(oldUser)!.text),
+    "old-user-canary");
+  assert.match(String(rolledBack.prepare("SELECT payload_json FROM room_work_items WHERE work_item_id=?")
+    .get(admittedWork.item!.workItemId)!.payload_json), /old-work-canary/);
+  assert.match(String(rolledBack.prepare("SELECT payload_json FROM room_lifecycle_requests WHERE request_id=?")
+    .get(oldRequest)!.payload_json), /old-request-canary/);
+  assert.match(String(rolledBack.prepare("SELECT payload_json FROM room_lifecycle_requests WHERE request_id=?")
+    .get(unknownRequest)!.payload_json), /unknown-request-canary/);
+  assert.equal(String(rolledBack.prepare("SELECT semantic_text FROM room_lifecycle_segments WHERE segment_id=?")
+    .get(unknownSegment)!.semantic_text), "unknown-segment-canary");
+  assert.equal(String(rolledBack.prepare("SELECT semantic_text FROM room_deliveries WHERE id='legacy-terminal-delivery'")
+    .get()!.semantic_text), "old-terminal-canary");
+  assert.equal(String(rolledBack.prepare("SELECT semantic_text FROM room_deliveries WHERE id='legacy-stale-delivery'")
+    .get()!.semantic_text), "old-delivery-canary");
+  assert.ok(rolledBack.prepare("SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name='room_work_terminal'").get());
+  rolledBack.exec("DROP TRIGGER retention_fault");
+  rolledBack.close();
+
+  const reopened = new RoomStore(file, config, { lifecycle: "connection" });
+  t.after(() => reopened.close());
+  const report = reopened.cleanupBodyRetention(base);
+  assert.deepEqual(report.reasons, ["age"]);
+  assert.equal(report.changed, true);
+  assert.deepEqual(report.counts, {
+    messageBodiesRedacted: 6,
+    deliveryBodiesNulled: 2,
+    workPayloadsRedacted: 1,
+    lifecycleRequestPayloadsRedacted: 3,
+    lifecycleSegmentBodiesRedacted: 3,
+  });
+  assert.deepEqual(report.reasons, ["age"]);
+  assert.doesNotMatch(JSON.stringify(report), /canary|79810[0-6]|member-|account-a|character-a/);
+
+  for (const id of [oldUser, oldBot, oldVoice, admittedWork.item!.payload!.messageRowId, unknownUser, expiredUser]) {
+    const message = reopened.historyMessage(id);
+    assert.ok(message, "retention keeps the message identity");
+    assert.equal(message.text, "[redacted:retention]");
+    assert.equal(message.createdAt, outside);
+  }
+  assert.equal(reopened.historyMessage(edgeUser)?.text, "edge-user-canary");
+  assert.equal(reopened.historyMessage(activeUser)?.text, "active-user-canary");
+  const old = reopened.lifecycleRequestById(oldRequest)!;
+  assert.equal(old.input.text, "[redacted:retention]");
+  assert.equal(old.status, "failed");
+  assert.equal(old.outcomeReason, "delivery_rejected");
+  assert.equal(old.createdAt, outside);
+  assert.equal(old.updatedAt, outside);
+  assert.equal(reopened.lifecycleTurns(oldRequest)[0]?.status, "failed");
+  assert.equal(reopened.lifecycleSegments(oldTurn)[0]?.text, "[redacted:retention]");
+  assert.equal(reopened.lifecycleSegments(oldTurn)[0]?.voiceText, null);
+  assert.deepEqual({ ...reopened.lifecycleAttempt(oldTextAttempt) }, {
+    attemptId: oldTextAttempt,
+    segmentId: oldSegment,
+    requestId: oldRequest,
+    turnId: oldTurn,
+    accountKey: "account-a",
+    medium: "text",
+    revision: 0,
+    intentAt: outside,
+    startedAt: outside,
+    ownerToken: "retention-owner",
+    committedRowId: oldBot,
+  });
+  assert.deepEqual(reopened.lifecycleReceipts(oldTextAttempt).map(receipt => ({ ...receipt })), [
+    { kind: "ack", messageId: "798101", observedAt: outside },
+  ]);
+  const active = reopened.lifecycleRequestById(activeRequest)!;
+  assert.equal(active.input.text, "active-request-canary");
+  assert.equal(active.status, "generating");
+  assert.equal(reopened.lifecycleSegments(activeTurn)[0]?.text, "active-segment-canary");
+  const unknown = reopened.lifecycleRequestById(unknownRequest)!;
+  assert.equal(unknown.input.text, "[redacted:retention]");
+  assert.equal(unknown.status, "failed");
+  assert.equal(reopened.lifecycleSegments(unknownTurn)[0]?.text, "[redacted:retention]");
+  assert.equal(reopened.lifecycleSegments(unknownTurn)[0]?.voiceText, null);
+  assert.equal(reopened.lifecycleAttempt(unknownAttempt)?.startedAt, outside);
+  assert.deepEqual(reopened.lifecycleReceipts(unknownAttempt), []);
+  assert.equal(reopened.historyMessage(unknownUser)?.text, "[redacted:retention]");
+  assert.equal(reopened.lifecycleAudioFence(), unknownAttempt);
+  const expired = reopened.lifecycleRequestById(expiredRequest)!;
+  assert.equal(expired.input.text, "[redacted:retention]");
+  assert.equal(expired.status, "generating");
+  assert.equal(expired.expiresAt, outside);
+  assert.equal(reopened.lifecycleSegments(expiredTurn)[0]?.text, "[redacted:retention]");
+  assert.equal(reopened.lifecycleSegments(expiredTurn)[0]?.state, "pending");
+  const work = reopened.workItem(admittedWork.item!.workItemId)!;
+  assert.equal(work.payload?.input.text, "[redacted:retention]");
+  assert.equal(work.payload?.input.senderKey, admittedWork.item!.payload!.input.senderKey);
+  assert.equal(work.status, "cancelled");
+  assert.equal(work.terminalReason, "delivery_cancelled");
+  assert.equal(work.createdAt, outside);
+  assert.equal(work.receivedAt, outside);
+  assert.equal(reopened.schemaVersion(), 9);
+  reopened.close();
+
+  const resumed = new RoomStore(file, config, { lifecycle: "connection" });
+  t.after(() => resumed.close());
+  const repeated = resumed.cleanupBodyRetention(base);
+  assert.equal(repeated.changed, false);
+  assert.deepEqual(repeated.counts, {
+    messageBodiesRedacted: 0,
+    deliveryBodiesNulled: 0,
+    workPayloadsRedacted: 0,
+    lifecycleRequestPayloadsRedacted: 0,
+    lifecycleSegmentBodiesRedacted: 0,
+  });
+  assert.deepEqual(repeated.reasons, []);
+  assert.equal(resumed.historyMessage(edgeUser)?.text, "edge-user-canary");
+  assert.equal(resumed.lifecycleRequestById(activeRequest)?.input.text, "active-request-canary");
+  assert.equal(resumed.lifecycleRequestById(oldRequest)?.input.text, "[redacted:retention]");
+  assert.equal(resumed.lifecycleRequestById(unknownRequest)?.input.text, "[redacted:retention]");
+  assert.equal(resumed.lifecycleRequestById(expiredRequest)?.input.text, "[redacted:retention]");
+  assert.equal(resumed.lifecycleAudioFence(), unknownAttempt);
+  assert.equal(resumed.workItem(admittedWork.item!.workItemId)?.payload?.input.senderKey,
+    admittedWork.item!.payload!.input.senderKey);
+  assert.equal(resumed.lifecycleAttempt(oldTextAttempt)?.committedRowId, oldBot);
+  assert.deepEqual(resumed.lifecycleReceipts(oldTextAttempt).map(receipt => receipt.kind), ["ack"]);
+  resumed.close();
+  const finalDb = new DatabaseSync(file);
+  assert.equal(finalDb.prepare("SELECT semantic_text FROM room_deliveries WHERE id='legacy-stale-delivery'")
+    .get()!.semantic_text, null);
+  assert.equal(finalDb.prepare("SELECT voice_text FROM room_deliveries WHERE id='legacy-stale-delivery'")
+    .get()!.voice_text, null);
+  assert.equal(finalDb.prepare("SELECT semantic_text FROM room_deliveries WHERE id='legacy-terminal-delivery'")
+    .get()!.semantic_text, null);
+  assert.equal(finalDb.prepare("SELECT voice_text FROM room_deliveries WHERE id='legacy-terminal-delivery'")
+    .get()!.voice_text, null);
+  assert.equal(String(finalDb.prepare("SELECT medium FROM room_lifecycle_attempts WHERE attempt_id=?")
+    .get(unknownAttempt)!.medium), "audio");
+  assert.equal(Number(finalDb.prepare("SELECT count(*) AS n FROM room_lifecycle_receipts WHERE attempt_id=?")
+    .get(unknownAttempt)!.n), 0);
+  assert.equal(String(finalDb.prepare("SELECT attempt_id FROM room_lifecycle_audio_fence WHERE id=1")
+    .get()!.attempt_id), unknownAttempt);
+  assert.equal(finalDb.prepare("PRAGMA user_version").get()!.user_version, 9);
+  assert.deepEqual(finalDb.prepare("PRAGMA foreign_key_check").all(), []);
+  assert.equal(String(finalDb.prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='room_work_terminal'")
+    .get()!.sql), terminalTriggerSql);
+  finalDb.close();
 });

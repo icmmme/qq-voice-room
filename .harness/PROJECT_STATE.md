@@ -4,61 +4,21 @@
 
 <!-- CANONICAL_STATE:BEGIN -->
 
-- Phase: `M3 - Ambient Participation`
-- Task: `VR-PRODUCT-TAKEOVER-01 / M3-AMBIENT-PARTICIPATION`
-- Status: `ACCEPTED` (offline Ambient capability; merged to `main`)
-- M2 predecessor:
-  `C8588590837A03F30EF04AD86E5D78EC87D71D5ABCCCA1BC605FE2E73BDD3F1F`
-  remains accepted only for the recorded offline single-`@` capability.
-- Baseline: Q HEAD `82399bc3327e8e86925b0fc2cd79e249fc7417f5`, tree
-  `6b0b736c34dbc370af89c22332bb0dab2d4ff8d5`.
-- Active contract:
-  `Shared/vr-product-takeover-01-m3-ambient-20261118/M3_AMBIENT_CONTRACT.md`
-  SHA256 `D51EB20316A23565FE9A21C99292E2EC2FF5D08AB257039E2E22D64781D6167A`.
-- Contract Addendum R1:
-  `Shared/vr-product-takeover-01-m3-ambient-20261118/M3_AMBIENT_CONTRACT_ADDENDUM_R1.md`
-  SHA256 `6A8E7E3807AB5CA71436F8613353DDA06F6B438247079439FCA1F55A1537BB93`;
-  it authorizes the qq-server production assembly and corrects the Q worktree
-  baseline statement without changing the original contract.
-- M3 scope: one clean-room Ambient planner seam in the existing lifecycle,
-  strict public/bounded input, exact five-minute initiation threshold,
-  pre-call model budget charge, transactional paused admission, paused claims
-  and schema-9 cursor persistence.
-- Candidate paths (8): `src/voice-room/participation-planner.ts`,
-  `src/voice-room/qq-server.ts`, `src/voice-room/runtime.ts`,
-  `src/voice-room/store.ts`, `tests/voice-room-request-lifecycle.test.ts`,
-  `.harness/CURRENT_TASK.md`, `.harness/PROJECT_STATE.md`,
-  `evidence/architecture-baseline.json` (r6-authorized content; guard exit
-  `0` with `43` entries / `62` files).
-- Read-only: all other `src/**`, `scripts/**`, package and lock files,
-  `tsconfig.json`, `.gitignore`, and existing evidence, including
-  `evidence/architecture-baseline.json`.
-- Review `M3-AMBIENT-CLEANROOM-REVIEW-20261119`: FAIL `0/2/4`; P1-2, P2-3
-  and P2-4 were revised, and P1-1 production wiring is now included under
-  Addendum R1.
-- r4 independent Review: FAIL `0/1/3`. The only code defect,
-  P1-R4-COOLDOWN-BYPASS, is fixed by advancing the single authoritative
-  ambient attempt timestamp before every real planner call. Skip, join,
-  initiate, throw, timeout and invalid output all share that path.
-- Architecture: the r3 exact-candidate authorization refreshed only
-  runtime/store identity for r5; r6 copies the authorized baseline
-  byte-for-byte (`BE6DC870...`, `43` entries). The planner remains
-  `LEGACY_UNLAYERED_DEBT` with an M5 exit; guard exit `0`, `43` entries,
-  `62` files, `violations []`.
-- Final independent results on r6: QA `CONDITIONAL_PASS 0/0/1`, Review
-  `CONDITIONAL PASS 0/0/1`, provenance boundary R3 `CONDITIONAL`. The Owner
-  accepted the reconstructed-read-log residual and approved merge on
-  `2026-11-19 Asia/Shanghai`; M2/earlier results still do not transfer.
-- Merge: PR `#2`, merge commit
-  `0f53999f9c3e8adf90829d31eea5171f750264e8`, `origin/main` tree
-  `9cb4ad45b740ec19a1758eebf1ee1fe81fbc3d83`. Acceptance record:
-  `.harness/M3_AMBIENT_PARTICIPATION.md`.
-- Clean-room access record:
-  `P_SOURCE_ACCESS=NONE; P_METADATA_REFERENCE_DISCLOSED`.
-- Product runtime, live QQ/NapCat, model, TTS, production database, `.env`,
-  `3011`, deployment and cutover remain not executed and not authorized.
-- Handoff path:
-  `Shared/vr-product-takeover-01-m3-ambient-20261118/cleanroom/**`.
+- Phase: `M5 - Product Fix Program`
+- Predecessor: `M5-FIX2-AMBIENT-STATUS`
+- Predecessor status: `ACCEPTED`, merged by PR `#6` at
+  `6b6a4502031b1b1168d7854e96adb00808bc808f`, tree
+  `b0d4c2c8ef9f3dc97b56073bdd072f837eb65d8d`, and deployed.
+- Active task: `VR-PRODUCT-TAKEOVER-01 / M5-FIX3-RETENTION-CACHE`
+- Active status: `REVIEW_PENDING` (frozen offline candidate)
+- Active contract: `.harness/M5_FIX3_RETENTION_CACHE.md`
+- Baseline: `6b6a4502031b1b1168d7854e96adb00808bc808f`, tree
+  `b0d4c2c8ef9f3dc97b56073bdd072f837eb65d8d`.
+- Scope: turn-scoped lifecycle translation prompt lifetime plus a
+  transactional body-retention path for expired persisted request, message,
+  delivery and lifecycle text.
+- Current implementation is offline-only. Production data cleanup, merge,
+  release and cutover require separate Owner authorization.
 
 <!-- CANONICAL_STATE:END -->
 

@@ -101,6 +101,8 @@ class RoomLifecycleStorageError extends Error {
 
 class RoomLifecycleVoiceError extends Error {}
 
+interface LifecycleTranslationPrompt { readonly requestId: string; readonly prompt: RoomPrompt }
+
 /** One Room lifecycle and consumer; adapters supply model, voice and transport operations. */
 export class VoiceRoom {
   readonly config: CheckedRoomConfig;
@@ -145,7 +147,11 @@ export class VoiceRoom {
   private lifecycleDeliveryWakeRequested = false;
   private readonly lifecycleAudioObservations = new Set<string>();
   private lifecycleLeaseTimer?: ReturnType<typeof setInterval>;
-  private readonly lifecyclePrompts = new Map<string, RoomPrompt>();
+  /**
+   * The semantic prompt is only reusable by later Japanese voice segments of
+   * the same turn. Text-only and final-segment work never needs an entry.
+   */
+  private readonly lifecycleTranslationPrompts = new Map<string, LifecycleTranslationPrompt>();
   private readonly lifecycleGenerationTasks = new Set<Promise<void>>();
   private readonly ambientTimers = new Set<ReturnType<typeof setTimeout>>();
   private ambientPlan?: { readonly controller: AbortController; readonly promise: Promise<void> };
@@ -944,6 +950,7 @@ export class VoiceRoom {
     this.wakeLifecycleDelivery();
   }
   private abortLifecycleWork(): void {
+    this.lifecycleTranslationPrompts.clear();
     for (const generation of this.lifecycleGenerations.values()) generation.controller.abort();
     this.lifecycleDelivery?.controller.abort();
     this.clearAmbientTimers();
@@ -1259,7 +1266,7 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
         if (this.store.completeLifecycleTurn(turn.turnId,
           Object.freeze([{ text: WORKER_EXPLICIT_NO_ANSWER_FALLBACK.text }]), request.deliveryMode,
           ownerToken, this.now(), text => this.permits(text), WORKER_EXPLICIT_NO_ANSWER_FALLBACK.reason)) {
-          this.lifecyclePrompts.set(turn.turnId, prompt);
+          this.releaseLifecycleTranslationPrompt(turn.turnId);
         }
         return;
       }
@@ -1267,7 +1274,7 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
       if (!segments) return fail("lifecycle_answer_invalid");
       if (this.store.completeLifecycleTurn(turn.turnId,
         segments.map(text => ({ text })), request.deliveryMode, ownerToken, this.now(), text => this.permits(text))) {
-        this.lifecyclePrompts.set(turn.turnId, prompt);
+        this.retainLifecycleTranslationPrompt(turn.turnId, request, character, segments.length, prompt);
       }
     } catch (error) {
       if (!signal.aborted && this.lifecycleRevisionLive(revision, character.accountKey)) {
@@ -1295,15 +1302,54 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
       }
     });
   }
+  private retainLifecycleTranslationPrompt(turnId: string, request: LifecycleRequest,
+    character: RoomCharacter, segmentCount: number, prompt: RoomPrompt): void {
+    if (request.expiresAt > this.now() && request.deliveryMode === "both" && segmentCount > 1
+      && this.config.characterLanguages[character.id]?.translateForVoice) {
+      this.lifecycleTranslationPrompts.set(turnId, { requestId: request.requestId, prompt });
+      return;
+    }
+    this.releaseLifecycleTranslationPrompt(turnId);
+  }
+  private releaseLifecycleTranslationPrompt(turnId: string): void {
+    this.lifecycleTranslationPrompts.delete(turnId);
+  }
+  private releaseInactiveLifecycleTranslationPrompts(): void {
+    for (const [turnId, entry] of this.lifecycleTranslationPrompts) {
+      const request = this.lifecycleStore("lifecycle_prompt_cache_read_failed", () =>
+        this.store.lifecycleRequestById(entry.requestId));
+      const turn = request && this.lifecycleStore("lifecycle_prompt_cache_read_failed", () =>
+        this.store.lifecycleTurns(entry.requestId).find(item => item.turnId === turnId));
+      if (!request || ["completed", "failed", "cancelled", "restart_not_resumed"].includes(request.status)
+        || !turn || !["ready", "delivering"].includes(turn.status)) {
+        this.lifecycleTranslationPrompts.delete(turnId);
+      }
+    }
+  }
+  private settleExpiredLifecycle(now: number, code: string): number {
+    const settled = this.lifecycleStore(code, () => this.store.settleExpiredLifecycle(now));
+    this.releaseInactiveLifecycleTranslationPrompts();
+    return settled;
+  }
+  private settleLifecycleTextOnly(item: Readonly<LifecycleDeliveryItem>, reason: string,
+    ownerToken: string, now: number): void {
+    this.settleLifecycleDelivery(item, "lifecycle_audio_degrade_failed", () => {
+      if (!this.store.settleLifecycleTextOnly(item.segment.segmentId, reason, ownerToken, now)) {
+        this.store.finishLifecycleSegment(item.segment.segmentId, "failed", reason, ownerToken, now);
+      }
+    });
+    this.releaseInactiveLifecycleTranslationPrompts();
+  }
   private async pumpLifecycleDelivery(): Promise<void> {
     while (this.workerPhase === "ready" && !this.closed && !this.lifecycleDelivery) {
       this.lifecycleDeliveryWakeRequested = false;
       if (this.lifecycleControl().paused) return;
+      this.releaseInactiveLifecycleTranslationPrompts();
       // Only this process's own in-flight audio serializes the loop. A fence
       // that survived a restart means one old audio result is unknown; it keeps
       // blocking new audio, but it must not stall unrelated text delivery.
       if (this.lifecycleAudioInFlight()) return;
-      this.store.settleExpiredLifecycle(this.now());
+      this.settleExpiredLifecycle(this.now(), "lifecycle_expiry_failed");
       const token = this.lifecycleOwnerToken;
       if (!token) throw new Error("room-lifecycle-owner-lost");
       const head = this.store.lifecycleHeadRequest();
@@ -1364,17 +1410,24 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
   }
   private async runLifecycleDelivery(requestId: string, ownerToken: string, signal: AbortSignal): Promise<void> {
     while (this.workerPhase === "ready" && !this.closed && !signal.aborted) {
-      if (!this.lifecycleOwnerLiveStrict()) return;
+      if (!this.lifecycleOwnerLiveStrict()) {
+        this.lifecycleTranslationPrompts.clear();
+        return;
+      }
+      this.releaseInactiveLifecycleTranslationPrompts();
       const request = this.store.lifecycleRequestById(requestId);
       if (!request || !["queued", "generating", "delivering"].includes(request.status)) return;
       // An expired request must leave the head. Settling it here uses the same
       // cancellation path as recovery, so a confirmed receipt is preserved and
       // only the unstarted remainder is terminated.
       if (request.expiresAt <= this.now()) {
-        this.store.settleExpiredLifecycle(this.now());
+        this.settleExpiredLifecycle(this.now(), "lifecycle_expiry_failed");
         return;
       }
-      if (request.source === "ambient" && this.store.stopInvalidAmbientLifecycle(requestId, ownerToken, this.now())) return;
+      if (request.source === "ambient" && this.store.stopInvalidAmbientLifecycle(requestId, ownerToken, this.now())) {
+        this.releaseInactiveLifecycleTranslationPrompts();
+        return;
+      }
       if (this.lifecycleAudioInFlight()) return;
       const item = this.store.lifecycleDeliveryItems(requestId)[0];
       if (!item) return;
@@ -1416,7 +1469,7 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
     try {
       if (language.translateForVoice) {
         if (!this.deps.translateVoice) throw new RoomLifecycleVoiceError("voice_translation_unavailable");
-        const prompt = this.lifecyclePrompts.get(item.turn.turnId) ?? this.lifecycleStore(
+        const prompt = this.lifecycleTranslationPrompts.get(item.turn.turnId)?.prompt ?? this.lifecycleStore(
           "lifecycle_audio_prompt_failed", () => this.lifecyclePrompt(character, item.request));
         const translation = buildVoiceTranslationPrompt(prompt, item.segment.text, { ...this.config.limits,
           maxTextChars: this.config.limits.maxTextChars, outputTokens: 2048 });
@@ -1446,22 +1499,24 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
       }
     } catch (error) {
       if (!(error instanceof RoomLifecycleVoiceError)) throw error;
-      if (signal.aborted || !this.lifecycleRevisionLiveStrict(item.request.executionRevision, character.accountKey)) return;
+      if (signal.aborted || !this.lifecycleRevisionLiveStrict(item.request.executionRevision, character.accountKey)) {
+        this.releaseInactiveLifecycleTranslationPrompts();
+        return;
+      }
       const now = this.now();
       if (item.request.expiresAt <= now) {
-        this.lifecycleStore("lifecycle_audio_expiry_failed", () => this.store.settleExpiredLifecycle(now));
+        this.settleExpiredLifecycle(now, "lifecycle_audio_expiry_failed");
+        this.releaseInactiveLifecycleTranslationPrompts();
         return;
       }
       if (item.request.source === "ambient" && this.lifecycleStore("lifecycle_audio_anchor_check_failed", () =>
-        this.store.stopInvalidAmbientLifecycle(item.request.requestId, ownerToken, now))) return;
+        this.store.stopInvalidAmbientLifecycle(item.request.requestId, ownerToken, now))) {
+        this.releaseInactiveLifecycleTranslationPrompts();
+        return;
+      }
       const reason = error.message;
       const failureCode = reason === "tts_budget" ? "tts_budget_exhausted" : reason;
-      this.settleLifecycleDelivery(item, "lifecycle_audio_degrade_failed", () => {
-        if (!this.store.settleLifecycleTextOnly(item.segment.segmentId, failureCode, ownerToken, now)) {
-          this.store.finishLifecycleSegment(item.segment.segmentId, "failed", failureCode, ownerToken, now);
-        }
-      });
-      this.lifecyclePrompts.delete(item.turn.turnId);
+      this.settleLifecycleTextOnly(item, failureCode, ownerToken, now);
       return;
     }
     const refreshed = this.lifecycleStore("lifecycle_audio_items_read_failed", () =>
@@ -1470,7 +1525,8 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
     if (!refreshed) return;
     const now = this.now();
     if (item.request.expiresAt <= now) {
-      this.lifecycleStore("lifecycle_audio_expiry_failed", () => this.store.settleExpiredLifecycle(now));
+      this.settleExpiredLifecycle(now, "lifecycle_audio_expiry_failed");
+      this.releaseInactiveLifecycleTranslationPrompts();
       return;
     }
     if (this.settleLifecycleLegacyAudioFence(refreshed, ownerToken)) return;
@@ -1505,7 +1561,7 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
         this.store.finishLifecycleSegment(item.segment.segmentId, "blocked", reason, ownerToken, now);
       }
     });
-    this.lifecyclePrompts.delete(item.turn.turnId);
+    this.releaseInactiveLifecycleTranslationPrompts();
     return true;
   }
   private async sendLifecycleDelivery(item: Readonly<LifecycleDeliveryItem>, attempt: LifecycleAttempt,
@@ -1589,6 +1645,7 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
           this.lifecycleAudioObservations.delete(attempt.attemptId);
           try {
             this.store.finishLifecycleAttemptNotSent(attempt.attemptId, ownerToken, this.now());
+            this.releaseInactiveLifecycleTranslationPrompts();
           } catch {
             this.faultWorker("room-lifecycle-audio-not-sent-failed");
           }
@@ -1618,7 +1675,7 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
       try {
         if (attempt.medium === "text") this.store.commitLifecycleText(attempt.attemptId, receipt, ownerToken, this.now());
         else this.store.commitLifecycleVoice(attempt.attemptId, receipt, ownerToken, this.now());
-        if (attempt.medium === "audio") this.lifecyclePrompts.delete(attempt.turnId);
+        if (attempt.medium === "audio") this.releaseInactiveLifecycleTranslationPrompts();
         this.wakeLifecycleDelivery();
         return;
       } catch (error) {
@@ -1630,11 +1687,15 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
     }
     this.lifecycleStore("lifecycle_delivery_ack_abandon_failed", () =>
       this.store.abandonLifecycleAttempt(attempt.attemptId, "delivery_cancelled", this.now()));
+    this.releaseInactiveLifecycleTranslationPrompts();
   }
   private settleLifecycleAttemptFailure(attempt: LifecycleAttempt, signal: AbortSignal, ownerToken: string): void {
     const current = this.lifecycleStore("lifecycle_delivery_attempt_read_failed", () =>
       this.store.lifecycleAttempt(attempt.attemptId));
-    if (!current) return;
+    if (!current) {
+      this.releaseInactiveLifecycleTranslationPrompts();
+      return;
+    }
     const receipts = this.lifecycleStore("lifecycle_delivery_receipt_read_failed", () =>
       this.store.lifecycleReceipts(attempt.attemptId));
     const ack = receipts.find(receipt => receipt.kind === "ack");
@@ -1646,12 +1707,14 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
       this.lifecycleStore("lifecycle_delivery_attempt_settle_failed", () =>
         this.store.finishLifecycleAttempt(attempt.attemptId, signal.aborted ? "cancelled" : "failed",
           signal.aborted ? "delivery_cancelled" : "delivery_failed", ownerToken, this.now()));
+      this.releaseInactiveLifecycleTranslationPrompts();
       return;
     }
     const rejected = receipts.some(receipt => receipt.kind === "rejected");
     this.lifecycleStore("lifecycle_delivery_attempt_settle_failed", () =>
       this.store.finishLifecycleAttempt(attempt.attemptId, rejected ? "failed" : "unknown",
         rejected ? "delivery_rejected" : "delivery_unknown", ownerToken, this.now()));
+    this.releaseInactiveLifecycleTranslationPrompts();
   }
   private isLifecycleSendBudgetStop(failure: unknown): boolean {
     return failure instanceof Error && failure.message === "room-delivery-send-budget";
@@ -1690,8 +1753,9 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
     if (!current) return;
     if (current.expiresAt <= this.now()) {
       try {
-        this.store.settleExpiredLifecycle(this.now());
+        this.settleExpiredLifecycle(this.now(), "lifecycle_intent_rejection_settle_failed");
       } catch (error) {
+        if (error instanceof RoomLifecycleStorageError) throw error;
         throw new RoomLifecycleStorageError("lifecycle_intent_rejection_settle_failed", error);
       }
       return;
@@ -1725,16 +1789,16 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
     }
   }
   private settleLifecycleSendBudget(item: Readonly<LifecycleDeliveryItem>, ownerToken: string): void {
+    if (item.segment.state === "text_sent") {
+      this.settleLifecycleTextOnly(item, "send_budget", ownerToken, this.now());
+      return;
+    }
     this.settleLifecycleDelivery(item, "lifecycle_send_budget_settle_failed", () => {
       const now = this.now();
-      if (item.segment.state === "text_sent"
-        && this.store.settleLifecycleTextOnly(item.segment.segmentId, "send_budget", ownerToken, now)) {
-        this.lifecyclePrompts.delete(item.turn.turnId);
-        return;
-      }
       this.store.finishLifecycleSegment(item.segment.segmentId, "blocked", "send_budget_exhausted",
         ownerToken, now);
     });
+    this.releaseInactiveLifecycleTranslationPrompts();
   }
   private async callLifecycle<T>(signal: AbortSignal, timeoutMs: number,
     operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
