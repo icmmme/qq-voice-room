@@ -1716,17 +1716,20 @@ export class RoomStore {
     if (segments.some(segment => !this.lifecycleSegmentTerminal(segment.state))) return;
     const failed = settledTurns.some(t => ["failed","unknown","cancelled","blocked"].includes(t.status))
       || segments.some(s => ["failed","unknown","cancelled","blocked"].includes(s.state));
-    const status: LifecycleRequestStatus = failed ? "failed" : "completed";
+    const stale = request.source === "ambient" && settledTurns.some(turn => turn.reason === "stale_anchor")
+      && settledTurns.every(turn => turn.status === "cancelled" || turn.status === "skipped");
+    const status: LifecycleRequestStatus = stale ? "cancelled" : failed ? "failed" : "completed";
     // Surface the first degraded cause at request level: a TTS fallback or a
     // legacy unknown-audio block. The two stay distinguishable by their reason
     // string, so neither is silently merged into the other's metric.
     const degraded = segments.find(s => typeof s.reason === "string"
       && (s.reason.startsWith("tts_text_only") || s.reason === "audio_blocked_legacy_unknown"));
-    const reason = failed
+    const reason = stale ? "stale_anchor" : failed
       ? settledTurns.find(t => ["failed","unknown","cancelled","blocked"].includes(t.status))?.reason
         ?? segments.find(s => ["failed","unknown","cancelled","blocked"].includes(s.state))?.reason
         ?? "lifecycle_failed"
-      : degraded?.reason ?? "all_obligations_terminal";
+      : degraded?.reason ?? (request.source === "ambient" && settledTurns.every(turn => turn.status === "skipped")
+        ? "ambient_model_skip" : "all_obligations_terminal");
     this.db.prepare("UPDATE room_lifecycle_requests SET status=?,outcome_reason=?,updated_at=? WHERE request_id=? AND status IN ('generating','delivering')")
       .run(status, reason, now, requestId);
   }
@@ -1753,6 +1756,30 @@ export class RoomStore {
       this.expireLifecycleRequests(now);
       // Report what this call actually settled, not how many were outstanding.
       return before - outstanding();
+    });
+  }
+  ambientAnchorCurrent(anchorRowId: number): boolean {
+    const latest = this.db.prepare(`SELECT id FROM room_messages
+      WHERE speaker_type='user' ORDER BY id DESC LIMIT 1`).get();
+    return Number(latest?.id) === anchorRowId;
+  }
+  private ambientLifecycleStopReason(request: LifecycleRequest, now: number, skipping = false):
+    "ttl_expired" | "stale_anchor" | null {
+    if (request.source !== "ambient" || !LIFECYCLE_REQUEST_ACTIVE.has(request.status)) return null;
+    if (request.expiresAt <= now) return "ttl_expired";
+    return !skipping && !this.ambientAnchorCurrent(request.messageRowId) ? "stale_anchor" : null;
+  }
+  private stopAmbientLifecycleRequest(request: LifecycleRequest, now: number): boolean {
+    const reason = this.ambientLifecycleStopReason(request, now);
+    if (!reason) return false;
+    this.cancelLifecycleRequests("all-for-request", reason, now, request.requestId);
+    return true;
+  }
+  stopInvalidAmbientLifecycle(requestId: string, ownerToken: string, now: number): boolean {
+    return this.transaction(() => {
+      this.assertLifecycleOwner(ownerToken, now);
+      const request = this.lifecycleRequestById(requestId);
+      return request !== null && this.stopAmbientLifecycleRequest(request, now);
     });
   }
   private blockDependentLifecycleSegments(turnId: string, afterSegmentId: string, reason: string, now: number): void {
@@ -1984,9 +2011,7 @@ export class RoomStore {
         || !/^member-[0-9a-f]{16}$/.test(anchor.speakerId)) {
         return { kind: "reject", request: null, reason: "anchor", messageRowId: anchorRowId } as const;
       }
-      const latestHuman = this.db.prepare(`SELECT id FROM room_messages
-        WHERE speaker_type='user' ORDER BY id DESC LIMIT 1`).get() as { id: number } | undefined;
-      if (!latestHuman || Number(latestHuman.id) !== anchorRowId) {
+      if (!this.ambientAnchorCurrent(anchorRowId)) {
         return { kind: "reject", request: null, reason: "stale_anchor", messageRowId: anchorRowId } as const;
       }
       const requested = new Set(rawCharacterIds);
@@ -2092,14 +2117,17 @@ export class RoomStore {
   completeLifecycleTurn(turnId: string, segments: readonly { text: string; voiceText?: string; voiceLanguage?: "zh" | "ja" }[],
     mode: LifecycleDeliveryMode, ownerToken: string, now: number,
     permittedOutput: ((text: string) => boolean) | undefined = undefined,
-    turnReason: string | null = null): void {
+    turnReason: string | null = null): boolean {
     if (!Array.isArray(segments) || segments.length < 1 || segments.length > 2
       || !["text","both"].includes(mode) || (turnReason !== null && !code(turnReason)))
       throw new Error("room-lifecycle-turn-invalid");
-    this.transaction(() => {
+    return this.transaction(() => {
       this.assertLifecycleOwner(ownerToken, now);
       const turn = this.db.prepare("SELECT request_id,status,character_id FROM room_lifecycle_turns WHERE turn_id=?").get(turnId);
       if (!turn || turn.status !== "generating") throw new Error("room-lifecycle-turn-invalid");
+      const request = this.lifecycleRequestById(String(turn.request_id));
+      if (!request) throw new Error("room-lifecycle-request-invalid");
+      if (this.stopAmbientLifecycleGeneration(turnId, request, now)) return false;
       for (let index = 0; index < segments.length; index++) {
         const segment = segments[index]!;
         if (!segment || typeof segment.text !== "string" || !segment.text.trim() || segment.text.includes("\0")
@@ -2121,6 +2149,7 @@ export class RoomStore {
       this.db.prepare("UPDATE room_lifecycle_turns SET status='ready',reason=?,updated_at=? WHERE turn_id=? AND status='generating'")
         .run(turnReason, now, turnId);
       this.lifecycleSettleRequest(String(turn.request_id), now);
+      return true;
     });
   }
   private permitsLifecycleOutput(text: string, permittedOutput?: (text: string) => boolean): boolean {
@@ -2152,19 +2181,35 @@ export class RoomStore {
       }
     });
   }
-  failLifecycleTurn(turnId: string, status: "failed" | "unknown" | "cancelled" | "blocked", reason: string,
+  settleLifecycleGeneration(turnId: string, status: "failed" | "skipped", reason: string,
     ownerToken: string, now: number): void {
-    if (!code(reason) || !["failed","unknown","cancelled","blocked"].includes(status)) throw new Error("room-lifecycle-turn-invalid");
+    if (!code(reason) || !["failed", "skipped"].includes(status)) throw new Error("room-lifecycle-turn-invalid");
     this.transaction(() => {
       this.assertLifecycleOwner(ownerToken, now);
       const turn = this.db.prepare("SELECT request_id,status FROM room_lifecycle_turns WHERE turn_id=?").get(turnId);
       if (!turn || !["pending","generating"].includes(String(turn.status))) return;
-      this.db.prepare("UPDATE room_lifecycle_turns SET status=?,reason=?,updated_at=? WHERE turn_id=?").run(status, reason, now, turnId);
-      this.db.prepare(`UPDATE room_lifecycle_segments SET state=?,reason=?,updated_at=?
-        WHERE turn_id=? AND state NOT IN ('completed','failed','unknown','cancelled','blocked','skipped')`)
-        .run(status, reason, now, turnId);
-      this.lifecycleSettleRequest(String(turn.request_id), now);
+      const request = this.lifecycleRequestById(String(turn.request_id));
+      if (!request || (status === "skipped" && request.source !== "ambient")) throw new Error("room-lifecycle-turn-invalid");
+      if (this.stopAmbientLifecycleGeneration(turnId, request, now, status === "skipped")) return;
+      this.finishLifecycleGeneration(turnId, request.requestId, status, reason, now);
     });
+  }
+  private stopAmbientLifecycleGeneration(turnId: string, request: LifecycleRequest, now: number,
+    skipping = false): boolean {
+    const reason = this.ambientLifecycleStopReason(request, now, skipping);
+    if (reason === "ttl_expired") this.cancelLifecycleRequests("all-for-request", reason, now, request.requestId);
+    // An in-flight sibling can still settle a valid model skip. Expiry stops all siblings.
+    if (reason === "stale_anchor") this.finishLifecycleGeneration(turnId, request.requestId, "cancelled", reason, now);
+    return reason !== null;
+  }
+  private finishLifecycleGeneration(turnId: string, requestId: string, status: "failed" | "skipped" | "cancelled",
+    reason: string, now: number): void {
+    this.db.prepare("UPDATE room_lifecycle_turns SET status=?,reason=?,updated_at=? WHERE turn_id=?")
+      .run(status, reason, now, turnId);
+    this.db.prepare(`UPDATE room_lifecycle_segments SET state=?,reason=?,updated_at=?
+      WHERE turn_id=? AND state NOT IN ('completed','failed','unknown','cancelled','blocked','skipped')`)
+      .run(status, reason, now, turnId);
+    this.lifecycleSettleRequest(requestId, now);
   }
   claimLifecycleDelivery(requestId: string, ownerToken: string, now: number): boolean {
     return this.transaction(() => {
@@ -2507,19 +2552,21 @@ export class RoomStore {
       return this.lifecycleAttempt(attemptId)!;
     });
   }
-  recordLifecycleStarted(id: string, ownerToken: string, now: number): void {
-    this.transaction(() => {
+  recordLifecycleStarted(id: string, ownerToken: string, now: number): boolean {
+    return this.transaction(() => {
       this.assertLifecycleOwner(ownerToken, now);
       const attempt = this.lifecycleAttempt(id);
       if (!attempt || attempt.startedAt !== null || attempt.ownerToken !== ownerToken
         || attempt.revision !== this.state().execution_revision || now < attempt.intentAt)
         throw new Error("room-lifecycle-attempt-invalid");
       const request = this.lifecycleRequestById(attempt.requestId);
-      if (!request || request.expiresAt <= now || request.executionEpoch !== this.state().epoch
+      if (!request || request.executionEpoch !== this.state().epoch
         || request.executionRevision !== this.state().execution_revision
         || !["generating","delivering"].includes(request.status)) {
         throw new Error("room-lifecycle-attempt-invalid");
       }
+      if (this.stopAmbientLifecycleRequest(request, now)) return false;
+      if (request.expiresAt <= now) throw new Error("room-lifecycle-attempt-invalid");
       if (!this.canSpend("send", now)) throw new Error("room-delivery-send-budget");
       if (attempt.medium === "audio") {
         if (this.db.prepare("SELECT 1 FROM room_lifecycle_audio_fence WHERE id=1").get())
@@ -2536,6 +2583,7 @@ export class RoomStore {
       this.db.prepare("INSERT INTO room_budget(kind,created_at) VALUES ('send',?)").run(now);
       this.db.prepare("UPDATE room_lifecycle_turns SET status='delivering',updated_at=? WHERE turn_id=? AND status='ready'")
         .run(now, attempt.turnId);
+      return true;
     });
   }
   recordLifecycleObservation(id: string, observation: RoomDeliveryObservation, ownerToken: string | null, now: number): void {
@@ -2577,6 +2625,7 @@ export class RoomStore {
         || attempt.revision !== this.state().execution_revision
         || !this.lifecycleReceipts(attemptId).some(receipt => receipt.kind === "ack" && receipt.messageId === receiptId))
         throw new Error("room-lifecycle-attempt-invalid");
+      if (attempt.committedRowId !== null) return attempt.committedRowId;
       const row = this.db.prepare(`SELECT s.segment_id,s.semantic_text,s.state,s.delivery_mode,t.turn_id,t.character_id,r.message_row_id
         FROM room_lifecycle_segments s JOIN room_lifecycle_turns t ON t.turn_id=s.turn_id
         JOIN room_lifecycle_requests r ON r.request_id=t.request_id WHERE s.segment_id=?`).get(attempt.segmentId);
@@ -2603,6 +2652,7 @@ export class RoomStore {
         || attempt.revision !== this.state().execution_revision
         || !this.lifecycleReceipts(attemptId).some(receipt => receipt.kind === "ack" && receipt.messageId === receiptId))
         throw new Error("room-lifecycle-attempt-invalid");
+      if (attempt.committedRowId !== null) return attempt.committedRowId;
       const row = this.db.prepare(`SELECT s.segment_id,s.voice_text,s.state,s.delivery_mode,t.turn_id,t.character_id,r.message_row_id
         FROM room_lifecycle_segments s JOIN room_lifecycle_turns t ON t.turn_id=s.turn_id
         JOIN room_lifecycle_requests r ON r.request_id=t.request_id WHERE s.segment_id=?`).get(attempt.segmentId);

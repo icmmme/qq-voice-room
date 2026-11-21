@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { checkRoomConfig } from "../src/voice-room/config.js";
-import { checkPublicPersonas, readRoomModelConfig, readRoomQqSettings } from "../src/voice-room/qq-config.js";
+import { checkPublicPersonas, readRoomModelConfig, readRoomQqSettings, RoomWorkerDeliveryError,
+  workerDeliveryModes } from "../src/voice-room/qq-config.js";
 import { roomLifecycleGenerator, roomWorkerVoiceTranslator, ROOM_MODEL_ROUND_TIMEOUT_MS } from "../src/voice-room/model.js";
 import { startRoomQq } from "../src/voice-room/qq-server.js";
 import { roomPublicPolicy } from "../src/voice-room/public-policy.js";
@@ -19,6 +20,7 @@ async function main() {
   checkPublicPersonas(settings);
   const model = readRoomModelConfig();
   const fish = readFishConfig(process.env, settings.room);
+  const deliveryModes = workerDeliveryModes(settings.room.deliveryMode, fish !== null);
   const policy = roomPublicPolicy(settings, model, resolve(file), fish
     ? [fish.apiKey, fish.baseUrl, ...fish.voices.map(v => v.referenceId)] : []);
   for (const c of settings.room.characters) policy.persona(c);
@@ -37,6 +39,8 @@ async function main() {
   const budget = calculateContextBudget(room.limits.contextTokens, room.limits.outputTokens);
   const contextDiagnostic = {
     type: "room-context-budget",
+    ...deliveryModes,
+    ...(deliveryModes.effectiveDeliveryMode === null ? { effectiveDeliveryModeSource: "stored" } : {}),
     contextWindowSource: room.contextWindowSource,
     modelWindowSource: contextWindow.modelWindowSource,
     modelWindowVerified: contextWindow.modelWindowVerified,
@@ -59,6 +63,7 @@ async function main() {
     ? " 未支持的绕过规则未生效，请核对内网域名/IP。" : "";
   if (action === "check") {
     console.log(`房间配置有效：两账号、两份公开人设、模型格式有效；${fish ? "Fish 配置格式有效（未验证连通性/音色）" : "仅文字"}；lifecycle Worker 两账号就绪后进入 mention_only。`);
+    if (deliveryModes.effectiveDeliveryMode === null) console.log("未配置 deliveryMode，启动时沿用存储的投递模式。");
     console.log(JSON.stringify(contextDiagnostic));
     console.log(`代理诊断：来源=${proxy.summary.source}，启用=${proxy.summary.enabled ? "是" : "否"}，绕过规则=${proxy.summary.bypassRuleCount} 条，忽略=${proxy.summary.ignoredBypassRuleCount} 条。${bypassWarning}`);
     console.log("本检查未创建数据库、未连接 QQ、未调用模型或 TTS，也未启用代理。不要与旧 bridge 同时消费测试群。");
@@ -84,7 +89,9 @@ async function main() {
     restoreProxy();
     throw error;
   }
-  console.log(`房间${fish ? "语音" : "文字"}入口已启动，端口 ${settings.port}；等待两个 NapCat Universal 反向连接。`);
+  const entryMode = deliveryModes.effectiveDeliveryMode === "both" ? "文字＋语音"
+    : deliveryModes.effectiveDeliveryMode === "text" ? "文字" : "";
+  console.log(`房间${entryMode}入口已启动，端口 ${settings.port}；等待两个 NapCat Universal 反向连接。`);
   console.log("lifecycle Worker 两账号就绪后进入 mention_only；仅支持 text/both，仅配置 ownerId 可切换模式；工具调用关闭。Ctrl+C 关闭并归账。");
   let stopping = false;
   const stop = () => {
@@ -95,7 +102,8 @@ async function main() {
   process.once("SIGINT", stop); process.once("SIGTERM", stop);
 }
 main().catch(error => {
-  console.error(error instanceof FishTtsError ? "Fish 配置无效：检查密钥、两音色 ID、官方基址、受支持模型和 MP3 设置；原始值已隐藏。"
+  console.error(error instanceof RoomWorkerDeliveryError ? error.message
+    : error instanceof FishTtsError ? "Fish 配置无效：检查密钥、两音色 ID、官方基址、受支持模型和 MP3 设置；原始值已隐藏。"
     : error instanceof RoomProxyError ? `代理配置无效（${error.code}）：未自动回退直连。检查进程代理变量或 Windows 系统代理；PAC、SOCKS 和不支持配置需先显式处理。`
     : "房间启动/检查失败：检查 ROOM_CONFIG、公开人设、模型配置及 ROOM_QQ_*_TOKEN；原始错误已隐藏。");
   process.exitCode = 1;
