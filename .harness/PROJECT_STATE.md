@@ -10,17 +10,45 @@
   `6b6a4502031b1b1168d7854e96adb00808bc808f`, tree
   `b0d4c2c8ef9f3dc97b56073bdd072f837eb65d8d`, and deployed.
 - Active task: `VR-PRODUCT-TAKEOVER-01 / M5-FIX3-RETENTION-CACHE`
-- Active status: `REVIEW_PENDING` (frozen offline candidate)
+- Active status: `ACCEPTED` (offline contract closed; no follow-on task activated)
 - Active contract: `.harness/M5_FIX3_RETENTION_CACHE.md`
 - Baseline: `6b6a4502031b1b1168d7854e96adb00808bc808f`, tree
   `b0d4c2c8ef9f3dc97b56073bdd072f837eb65d8d`.
 - Scope: turn-scoped lifecycle translation prompt lifetime plus a
   transactional body-retention path for expired persisted request, message,
   delivery and lifecycle text.
-- Current implementation is offline-only. Production data cleanup, merge,
-  release and cutover require separate Owner authorization.
+- Owner decision: [M5 Fix-3 offline closeout](#m5-fix-3-offline-closeout).
+  Production data cleanup, merge, release and cutover require separate Owner
+  authorization.
 
 <!-- CANONICAL_STATE:END -->
+
+## M5 Fix-3 offline closeout
+
+- Decision: on `2026-11-24 Asia/Shanghai`, the Owner replied `确认离线结案`
+  in the task conversation to confirm acceptance of the offline contract only.
+- Accepted implementation: `e97a3ef1dd4c459c34b53c59bff8340cb6534779`.
+  The existing merge commit `aa4c5d2dce803ee7f398940809d19ef0861b24a4`
+  has the same tree `e78df6eecf5dc77c14f3d1f7f36a5a09cb4b584b`.
+- Frozen patch: `candidate-fix3.diff`, `108093` bytes, SHA256
+  `2960F0E97CB44131FFEBE8347DA4B865E99ACD09AEA0389EE35EFD6091294886`.
+  Replay from the baseline reproduced the accepted tree and matched all seven
+  declared postimages by Git blob, byte count and SHA256.
+- Evidence package: `Shared/vr-product-takeover-01-m5-fix3-20261121`.
+  The root, QA and Review manifests matched all listed files (`45/45`,
+  `18/18` and `19/19`, respectively).
+
+| Evidence in package | SHA256 | Result |
+| --- | --- | --- |
+| `qa/QA_REPORT.md` | `F33235115C338569463D1736FCC84B5CF055026A3258169EBD02F4C951F8FB00` | Independent QA `PASS`; B3-01 through B3-08; focused `12/12`, full `114/114`; no P0/P1/P2 findings |
+| `review/REVIEW_REPORT.md` | `C1D48188AE050507D59B5A1DAD15DA5D2E3A184E59082CB28827C6F5941FB40F` | Independent Review `PASS` for the same patch and tree; no P0/P1/P2 findings |
+| `qa/16-r2-independent-database-probe.log` | `C111AC5408E29E5ED30FF87653D5E2DEDD04E7961AC69530E3BD234CCB216895` | Exit `0`; synthetic backup and restore reopened schema 9 with seven readable body fields and no foreign-key violations |
+
+This section records a post-acceptance decision. It is not part of the frozen
+candidate and does not transfer the PASS to the current working tree. The
+cutover report's historical `READY` result is separate. This decision does not
+verify live client delivery or authorize production cleanup, scheduling, release,
+cutover or task activation.
 
 ## Accepted M2 Canonical State
 
