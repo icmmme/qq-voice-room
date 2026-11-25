@@ -188,6 +188,8 @@ export interface RoomInput {
   text: string;
   mentions?: readonly string[];
   replyToMessageId?: string;
+  /** Validated public HTTP(S) image URLs from ingress; memory-only and never persisted to SQLite. */
+  images?: readonly string[];
   unsupported?: boolean;
 }
 

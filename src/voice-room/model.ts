@@ -1,5 +1,5 @@
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessage, Message, Tool, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ImageContent, Message, Tool, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 import { join } from "node:path";
 import type { ModelConfig } from "../config.js";
 import { estimateTokens } from "../prompting/token-estimate.js";
@@ -37,6 +37,11 @@ export interface RoomLifecycleGenerateOptions {
   readonly maxSegments?: number;
   readonly deep?: boolean;
   readonly web?: RoomWebToolkit;
+  readonly images?: readonly ImageContent[];
+}
+
+export function hasVisionModel(config: ModelConfig): boolean {
+  return Boolean(config.visionModelId || config.modelSupportsVision);
 }
 
 function stripJsonFence(raw: string): string {
@@ -206,11 +211,11 @@ function diagnosticStage(prompt: RoomPrompt): RoomModelDiagnostic["stage"] {
   } catch { return "reply"; }
 }
 
-function resolveThinkingPayload(config: ModelConfig, deep: boolean): {
+function resolveThinkingPayload(config: ModelConfig, deep: boolean, modelId = config.modelId): {
   payload: Record<string, unknown>;
   disableRequested: boolean;
 } {
-  const isDeepSeekToggle = config.modelId === "deepseek-flash" || config.modelId === "deepseek-v4-pro";
+  const isDeepSeekToggle = modelId === "deepseek-flash" || modelId === "deepseek-v4-pro";
   const mode = config.thinkingMode ?? "auto";
   if (mode === "disabled") {
     return {
@@ -242,13 +247,25 @@ function createRuntimeAccessor(config: ModelConfig, roomDataDir: string, registe
         });
         runtime.registerProvider("room-provider", {
           baseUrl: config.baseUrl, api: "openai-completions", models: [{
-            id: config.modelId, name: config.modelId, reasoning: false, input: ["text"],
+            id: config.modelId, name: config.modelId, reasoning: false,
+            input: config.modelSupportsVision ? ["text", "image"] : ["text"],
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
             contextWindow: config.contextWindow, maxTokens: registeredMaxTokens,
             compat: { supportsDeveloperRole: false, supportsStore: false, maxTokensField: "max_tokens" },
           }],
         });
         await runtime.setRuntimeApiKey("room-provider", config.apiKey);
+        if (config.visionModelId) {
+          runtime.registerProvider("room-vision-provider", {
+            baseUrl: config.visionBaseUrl ?? config.baseUrl, api: "openai-completions", models: [{
+              id: config.visionModelId, name: config.visionModelId, reasoning: false, input: ["text", "image"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: config.contextWindow, maxTokens: registeredMaxTokens,
+              compat: { supportsDeveloperRole: false, supportsStore: false, maxTokensField: "max_tokens" },
+            }],
+          });
+          await runtime.setRuntimeApiKey("room-vision-provider", config.visionApiKey ?? config.apiKey);
+        }
         return runtime;
       })().catch(error => {
         runtimePromise = undefined;
@@ -296,6 +313,7 @@ function estimateMessageTokens(message: Message): number {
   } else if (Array.isArray(message.content)) {
     for (const block of message.content) {
       if (block.type === "text") total += estimateTokens(block.text);
+      else if (block.type === "image") total += 1024;
       else if (block.type === "toolCall") total += estimateTokens(block.name + JSON.stringify(block.arguments));
     }
   }
@@ -546,13 +564,20 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
   return async (prompt, signal, maxChars, options = {}) => {
     if (!Number.isSafeInteger(maxChars) || maxChars < 1) throw new Error("room-lifecycle-model-request-invalid");
     const deep = Boolean(options.deep);
+    const images = options.images ?? [];
+    const hasImages = images.length > 0;
+    const visionEnabled = hasImages && hasVisionModel(config);
+    const useDedicatedVision = visionEnabled && Boolean(config.visionModelId);
+    const activeProvider = useDedicatedVision ? "room-vision-provider" : "room-provider";
+    const activeModelId = useDedicatedVision ? config.visionModelId! : config.modelId;
     const maxSegments = options.maxSegments ?? (deep ? ROOM_LIFECYCLE_DEEP_MAX_SEGMENTS : 2);
     const targetMaxTokens = deep
       ? Math.max(1, Math.min(Math.max(config.maxTokens, 4096), ROOM_LIFECYCLE_DEEP_MAX_TOKENS))
       : Math.max(1, Math.min(config.maxTokens, ROOM_LIFECYCLE_MAX_TOKENS));
     const maxTokens = Math.max(256, Math.min(targetMaxTokens, Math.max(256, config.contextWindow - 2048)));
-    const thinking = resolveThinkingPayload(config, deep);
-    let diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, thinking.disableRequested);
+    const primaryThinking = resolveThinkingPayload(config, deep, config.modelId);
+    let currentThinking = resolveThinkingPayload(config, deep, activeModelId);
+    let diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, currentThinking.disableRequested);
     const web = deep ? options.web : undefined;
     const tools: Tool[] = web ? buildWebTools(web) : [];
 
@@ -578,19 +603,37 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
 - Do not return more than two segments and never pad a one-segment reply.`;
 
     const systemPrompt = `${prompt.systemPrompt}${protocolSuffix}`;
+    const visionUnconfiguredNote = "\n\nNote: the user attached image(s), but vision is not enabled on this model; state honestly that you cannot view images right now and do not guess their content.";
+    const visionRuntimeFallbackNote = "\n\nNote: the user attached image(s), and viewing the image failed right now; state honestly that you cannot view the image right now, do not guess its content, and still answer any text question if present.";
+    let currentSystemPrompt = hasImages && !hasVisionModel(config)
+      ? `${systemPrompt}${visionUnconfiguredNote}`
+      : systemPrompt;
+    const buildMessages = (withImages: boolean): Message[] => prompt.messages.map((message, index) => ({
+      role: "user" as const,
+      content: withImages && index === prompt.messages.length - 1
+        ? [{ type: "text" as const, text: message.content }, ...images]
+        : message.content,
+      timestamp: Date.now(),
+    }));
 
     try {
       signal.throwIfAborted();
       const inputBudget = config.contextWindow - maxTokens - 1024;
-      const messages: Message[] = prompt.messages.map(message => ({
-        role: "user" as const, content: message.content, timestamp: Date.now(),
-      }));
-      if (inputBudget < 1 || estimateTranscriptTokens(systemPrompt, messages) > inputBudget) {
+      let currentMessages = buildMessages(visionEnabled);
+      if (inputBudget < 1 || estimateTranscriptTokens(currentSystemPrompt, currentMessages) > inputBudget) {
         throw new RoomModelError("context-budget");
       }
       const runtime = await getRuntime();
       signal.throwIfAborted();
-      const model = runtime.getModel("room-provider", config.modelId)!;
+      let currentModel = runtime.getModel(activeProvider, activeModelId)!;
+      let visionFallbackAttempted = false;
+      const switchToTextFallback = () => {
+        visionFallbackAttempted = true;
+        currentModel = runtime.getModel("room-provider", config.modelId)!;
+        currentThinking = primaryThinking;
+        currentSystemPrompt = `${systemPrompt}${visionRuntimeFallbackNote}`;
+        currentMessages = buildMessages(false);
+      };
 
       const seenCalls = new Set<string>();
       const totalRounds = tools.length > 0 ? ROOM_MAX_TOOL_ROUNDS + 1 : 1;
@@ -598,19 +641,22 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
       for (let round = 0; round < totalRounds; round++) {
         signal.throwIfAborted();
         if (round > 0) {
-          compactToolResultsToBudget(systemPrompt, messages, inputBudget);
+          compactToolResultsToBudget(currentSystemPrompt, currentMessages, inputBudget);
         }
-        const usedTokens = estimateTranscriptTokens(systemPrompt, messages);
-        if (usedTokens > inputBudget) throw new RoomModelError("context-budget");
 
         let allowToolsThisRound = !disableToolsFallback && tools.length > 0 && round < ROOM_MAX_TOOL_ROUNDS;
         let result: AssistantMessage;
         for (;;) {
+          signal.throwIfAborted();
+          const usedTokens = estimateTranscriptTokens(currentSystemPrompt, currentMessages);
+          if (usedTokens > inputBudget) throw new RoomModelError("context-budget");
+          const canVisionFallback = round === 0 && visionEnabled && !visionFallbackAttempted;
+          const canToolsFallback = round === 0 && allowToolsThisRound && !disableToolsFallback;
           try {
-            result = await runtime.complete(model, {
-              systemPrompt,
+            result = await runtime.complete(currentModel, {
+              systemPrompt: currentSystemPrompt,
               tools: allowToolsThisRound ? tools : [],
-              messages,
+              messages: currentMessages,
             }, {
               signal,
               timeoutMs: ROOM_MODEL_ROUND_TIMEOUT_MS,
@@ -621,16 +667,21 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
               onPayload: payload => {
                 if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("room-model-payload");
                 return allowToolsThisRound
-                  ? { ...payload, ...thinking.payload }
-                  : { ...payload, ...thinking.payload, response_format: { type: "json_object" } };
+                  ? { ...payload, ...currentThinking.payload }
+                  : { ...payload, ...currentThinking.payload, response_format: { type: "json_object" } };
               },
             });
           } catch (error) {
             if (signal.aborted) throw new RoomModelError("cancelled");
-            if (round === 0 && allowToolsThisRound && !disableToolsFallback) {
+            if (canVisionFallback) {
+              switchToTextFallback();
+              diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, currentThinking.disableRequested);
+              continue;
+            }
+            if (canToolsFallback) {
               disableToolsFallback = true;
               allowToolsThisRound = false;
-              diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, thinking.disableRequested);
+              diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, currentThinking.disableRequested);
               continue;
             }
             throw error;
@@ -640,10 +691,15 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
           if (result.stopReason === "aborted") throw new RoomModelError("cancelled");
           if (diagnostic.snapshot().provider.finishReason === "content_filter") throw new RoomModelError("incomplete");
           if (result.stopReason === "error") {
-            if (round === 0 && allowToolsThisRound && !disableToolsFallback) {
+            if (canVisionFallback) {
+              switchToTextFallback();
+              diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, currentThinking.disableRequested);
+              continue;
+            }
+            if (canToolsFallback) {
               disableToolsFallback = true;
               allowToolsThisRound = false;
-              diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, thinking.disableRequested);
+              diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, currentThinking.disableRequested);
               continue;
             }
             throw new RoomModelError("request");
@@ -656,18 +712,18 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
           : [];
 
         if (toolCalls.length > 0 && web) {
-          messages.push(result);
-          const remainingAfterAssistant = Math.max(0, inputBudget - estimateTranscriptTokens(systemPrompt, messages));
+          currentMessages.push(result);
+          const remainingAfterAssistant = Math.max(0, inputBudget - estimateTranscriptTokens(currentSystemPrompt, currentMessages));
           const usableTokens = Math.max(0, remainingAfterAssistant - TOOL_ROUND_SAFETY_RESERVE);
           const perCallTokens = Math.floor(usableTokens / Math.max(1, toolCalls.length));
           const toolResults = await Promise.all(
             toolCalls.map(call => executeWebToolCall(call, web, remainingAfterAssistant, perCallTokens, seenCalls, signal)),
           );
-          messages.push(...toolResults);
+          currentMessages.push(...toolResults);
           continue;
         }
 
-        if (deep) {
+        if (deep || hasImages) {
           return parseDeepLifecycleAnswer(result.stopReason, result.content, maxSegments, maxChars);
         }
         return parseRoomLifecycleAnswer(result.stopReason, result.content, maxSegments);

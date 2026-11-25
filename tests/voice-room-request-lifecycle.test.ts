@@ -5973,3 +5973,498 @@ test("room skills provide idiomatic Chinese QQ group-chat guidance with Analytic
   assert.ok(loadRoomSkill("deep-link-analysis", missingDir).includes("Analytical Lens"));
   assert.ok(loadRoomSkill("deep-tech-qa", missingDir).includes("web_search"));
 });
+
+test("parseRoomQqMessage supports mixed text+image, pure image+@bot, dedup/cap=4, SSRF strip, and rejects unmentioned pure image or forward/record", async () => {
+  const { ROOM_MAX_IMAGES_PER_MESSAGE } = await import("../src/voice-room/qq-message.js");
+  assert.equal(ROOM_MAX_IMAGES_PER_MESSAGE, 4);
+  const checked = checkRoomConfig(roomConfig());
+  const baseEvent = {
+    post_type: "message",
+    message_type: "group",
+    sub_type: "normal",
+    group_id: 10000,
+    user_id: 10001,
+    self_id: 10002,
+    message_id: 99100,
+  };
+
+  // 1. 图文混发 (@ + text + image)
+  const mixedAt = parseRoomQqMessage({
+    ...baseEvent,
+    message: [
+      { type: "at", data: { qq: "10002" } },
+      { type: "text", data: { text: " 看一下这张图" } },
+      { type: "image", data: { url: "https://cdn.example.com/a.png" } },
+    ],
+  }, "account-a", checked);
+  assert.ok(mixedAt);
+  assert.equal(mixedAt.text, "看一下这张图");
+  assert.deepEqual(mixedAt.mentions, ["10002"]);
+  assert.deepEqual(mixedAt.images, ["https://cdn.example.com/a.png"]);
+
+  // 2. 纯图 + @bot (no text)
+  const pureImageAt = parseRoomQqMessage({
+    ...baseEvent,
+    message: [
+      { type: "at", data: { qq: "10002" } },
+      { type: "image", data: { file: "https://cdn.example.com/only.jpg" } },
+    ],
+  }, "account-a", checked);
+  assert.ok(pureImageAt);
+  assert.equal(pureImageAt.text, "");
+  assert.deepEqual(pureImageAt.mentions, ["10002"]);
+  assert.deepEqual(pureImageAt.images, ["https://cdn.example.com/only.jpg"]);
+
+  // 3. Unmentioned 图文混发
+  const unmentionedMixed = parseRoomQqMessage({
+    ...baseEvent,
+    message: [
+      { type: "text", data: { text: "大家看这个" } },
+      { type: "image", data: { url: "https://cdn.example.com/shared.webp" } },
+    ],
+  }, "account-a", checked);
+  assert.ok(unmentionedMixed);
+  assert.equal(unmentionedMixed.text, "大家看这个");
+  assert.deepEqual(unmentionedMixed.images, ["https://cdn.example.com/shared.webp"]);
+
+  // 4. Unmentioned pure image without text is rejected
+  const unmentionedPureImage = parseRoomQqMessage({
+    ...baseEvent,
+    message: [{ type: "image", data: { url: "https://cdn.example.com/silent.png" } }],
+  }, "account-a", checked);
+  assert.equal(unmentionedPureImage, null);
+
+  // 5. Multiple images capped at 4, deduplicated, SSRF/local/private stripped
+  const capped = parseRoomQqMessage({
+    ...baseEvent,
+    message: [
+      { type: "at", data: { qq: "10002" } },
+      { type: "image", data: { url: "http://127.0.0.1/ssrf.png" } },
+      { type: "image", data: { url: "http://192.168.1.5/lan.png" } },
+      { type: "image", data: { url: "http://user:pass@cdn.example.com/creds.png" } },
+      { type: "image", data: { file: "local-cache.png" } },
+      { type: "image", data: { url: "https://cdn.example.com/1.png" } },
+      { type: "image", data: { url: "https://cdn.example.com/1.png" } },
+      { type: "image", data: { url: "https://cdn.example.com/2.png" } },
+      { type: "image", data: { url: "https://cdn.example.com/3.png" } },
+      { type: "image", data: { url: "https://cdn.example.com/4.png" } },
+      { type: "image", data: { url: "https://cdn.example.com/5.png" } },
+    ],
+  }, "account-a", checked);
+  assert.ok(capped);
+  assert.deepEqual(capped.images, [
+    "https://cdn.example.com/1.png",
+    "https://cdn.example.com/2.png",
+    "https://cdn.example.com/3.png",
+    "https://cdn.example.com/4.png",
+  ]);
+
+  // 6. forward and record still rejected even when paired with image/text
+  assert.equal(parseRoomQqMessage({
+    ...baseEvent,
+    message: [
+      { type: "at", data: { qq: "10002" } },
+      { type: "image", data: { url: "https://cdn.example.com/1.png" } },
+      { type: "forward", data: { id: "fwd-1" } },
+    ],
+  }, "account-a", checked), null);
+  assert.equal(parseRoomQqMessage({
+    ...baseEvent,
+    message: [
+      { type: "at", data: { qq: "10002" } },
+      { type: "record", data: { file: "voice.amr" } },
+    ],
+  }, "account-a", checked), null);
+});
+
+test("fetchPublicImage and fetchRoomImages enforce magic bytes, SSRF redirects, size limits, MIME checks, and timeouts", async () => {
+  const { detectImageMime, fetchPublicImage, fetchRoomImages } = await import("../src/voice-room/image.js");
+  const pngBytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+  const jpegBytes = Uint8Array.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+  const gifBytes = Uint8Array.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00]);
+  const webpBytes = Uint8Array.from([0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x20]);
+
+  assert.equal(detectImageMime(pngBytes), "image/png");
+  assert.equal(detectImageMime(jpegBytes), "image/jpeg");
+  assert.equal(detectImageMime(gifBytes), "image/gif");
+  assert.equal(detectImageMime(webpBytes), "image/webp");
+  assert.equal(detectImageMime(new TextEncoder().encode("<svg></svg>")), null);
+
+  // Magic-byte sniffing with application/octet-stream (typical QQ CDN header)
+  const sampleCases: Array<[string, Uint8Array, string, string]> = [
+    ["https://cdn.example.com/a.bin", pngBytes, "application/octet-stream", "image/png"],
+    ["https://cdn.example.com/b.jpg", jpegBytes, "", "image/jpeg"],
+    ["https://cdn.example.com/c.gif", gifBytes, "image/gif", "image/gif"],
+    ["https://cdn.example.com/d.webp", webpBytes, "image/webp", "image/webp"],
+  ];
+  for (const [url, bytes, contentType, expectedMime] of sampleCases) {
+    const res = await fetchPublicImage(url, {
+      fetchImpl: (async () => new Response(bytes, {
+        status: 200,
+        headers: contentType ? { "content-type": contentType } : {},
+      })) as typeof fetch,
+    });
+    assert.equal(res.ok, true);
+    if (res.ok) {
+      assert.equal(res.image.mimeType, expectedMime);
+      assert.equal(res.image.data, Buffer.from(bytes).toString("base64"));
+      assert.equal(res.bytes, bytes.byteLength);
+    }
+  }
+
+  // SSRF initial URL blocked before fetch
+  let fetchCalled = false;
+  const blockedInitial = await fetchPublicImage("http://127.0.0.1/secret.png", {
+    fetchImpl: (async () => { fetchCalled = true; return new Response(pngBytes); }) as typeof fetch,
+  });
+  assert.deepEqual(blockedInitial, { ok: false, reason: "blocked_url" });
+  assert.equal(fetchCalled, false);
+
+  // SSRF 302 redirect to 127.0.0.1 / 192.168.x.x blocked before following
+  for (const redirectTarget of ["http://127.0.0.1/internal.png", "http://192.168.1.10/router.png"]) {
+    const visited: string[] = [];
+    const redirectBlocked = await fetchPublicImage("https://cdn.example.com/redir.png", {
+      fetchImpl: (async input => {
+        visited.push(String(input));
+        return new Response(null, { status: 302, headers: { location: redirectTarget } });
+      }) as typeof fetch,
+    });
+    assert.deepEqual(redirectBlocked, { ok: false, reason: "blocked_url" });
+    assert.deepEqual(visited, ["https://cdn.example.com/redir.png"]);
+  }
+
+  // Content-Length > maxBytes rejected early
+  const tooLargeHeader = await fetchPublicImage("https://cdn.example.com/big.png", {
+    maxBytes: 100,
+    fetchImpl: (async () => new Response(pngBytes, {
+      status: 200,
+      headers: { "content-type": "image/png", "content-length": "101" },
+    })) as typeof fetch,
+  });
+  assert.deepEqual(tooLargeHeader, { ok: false, reason: "too_large" });
+
+  // Streamed body > maxBytes cancels reader immediately and rejects
+  let streamCancelled = false;
+  const oversizedStream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.enqueue(new Uint8Array(64));
+    },
+    cancel() {
+      streamCancelled = true;
+    },
+  });
+  const tooLargeStream = await fetchPublicImage("https://cdn.example.com/stream.png", {
+    maxBytes: 100,
+    fetchImpl: (async () => new Response(oversizedStream, {
+      status: 200,
+      headers: { "content-type": "image/png" },
+    })) as typeof fetch,
+  });
+  assert.deepEqual(tooLargeStream, { ok: false, reason: "too_large" });
+  assert.equal(streamCancelled, true);
+
+  // Reject SVG and HTML
+  const svgRejected = await fetchPublicImage("https://cdn.example.com/icon.svg", {
+    fetchImpl: (async () => new Response("<svg/>", {
+      status: 200,
+      headers: { "content-type": "image/svg+xml" },
+    })) as typeof fetch,
+  });
+  assert.deepEqual(svgRejected, { ok: false, reason: "unsupported_format" });
+
+  const htmlRejected = await fetchPublicImage("https://cdn.example.com/page.png", {
+    fetchImpl: (async () => new Response("<html>not an image</html>", {
+      status: 200,
+      headers: { "content-type": "text/html; charset=utf-8" },
+    })) as typeof fetch,
+  });
+  assert.deepEqual(htmlRejected, { ok: false, reason: "unsupported_format" });
+
+  // Timeout handling
+  const timedOut = await fetchPublicImage("https://cdn.example.com/slow.png", {
+    timeoutMs: 25,
+    fetchImpl: ((_input: string | URL | Request, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal?.reason ?? new Error("aborted")), { once: true });
+    })) as typeof fetch,
+  });
+  assert.deepEqual(timedOut, { ok: false, reason: "timeout" });
+
+  // Batch fetch caps at 4 and summarizes results
+  const batch = await fetchRoomImages([
+    "https://cdn.example.com/1.png",
+    "http://127.0.0.1/blocked.png",
+    "https://cdn.example.com/2.jpg",
+    "https://cdn.example.com/3.webp",
+    "https://cdn.example.com/4.gif",
+  ], {
+    fetchImpl: (async input => {
+      const url = String(input);
+      if (url.endsWith(".jpg")) return new Response(jpegBytes, { status: 200 });
+      if (url.endsWith(".webp")) return new Response(webpBytes, { status: 200 });
+      return new Response(pngBytes, { status: 200 });
+    }) as typeof fetch,
+  });
+  assert.equal(batch.attempted, 4);
+  assert.equal(batch.images.length, 3);
+  assert.equal(batch.failed, 1);
+  assert.deepEqual(batch.reasons, ["blocked_url"]);
+});
+
+test("readModelConfig, readRoomModelConfig, and roomPublicPolicy support and protect vision settings", async () => {
+  const { readModelConfig } = await import("../src/config.js");
+  const { readRoomModelConfig } = await import("../src/voice-room/qq-config.js");
+  const env = {
+    PA_BASE_URL: "https://api.model.invalid/v1",
+    PA_MODEL: "deepseek-flash",
+    PA_API_KEY: "sk-primary-secret-123456",
+    PA_VISION_MODEL: "qwen-vl-max",
+    PA_VISION_BASE_URL: "https://vision.model.invalid/v1/",
+    PA_VISION_API_KEY: "sk-vision-secret-654321",
+    PA_MODEL_SUPPORTS_VISION: "true",
+  };
+  const cfg = readModelConfig(env);
+  assert.equal(cfg.visionModelId, "qwen-vl-max");
+  assert.equal(cfg.visionBaseUrl, "https://vision.model.invalid/v1");
+  assert.equal(cfg.visionApiKey, "sk-vision-secret-654321");
+  assert.equal(cfg.modelSupportsVision, true);
+
+  const roomCfg = readRoomModelConfig(env);
+  assert.equal(roomCfg.visionModelId, "qwen-vl-max");
+  assert.equal(roomCfg.visionBaseUrl, "https://vision.model.invalid/v1");
+  assert.equal(roomCfg.visionApiKey, "sk-vision-secret-654321");
+  assert.equal(roomCfg.modelSupportsVision, true);
+
+  assert.throws(() => readModelConfig({
+    ...env,
+    PA_VISION_BASE_URL: "http://remote.model.invalid/v1",
+  }));
+
+  const room = checkRoomConfig(roomConfig());
+  const settings: RoomQqSettings = {
+    room,
+    dataDir: POLICY_DATA_DIR,
+    port: 0,
+    apiTimeoutMs: 100,
+    accounts: room.characters.map((character, index) => ({
+      accountKey: character.accountKey,
+      token: `synthetic-token-${index}-12345`,
+      personaFile: `C:\\synthetic-private-persona-${index}.md`,
+    })),
+  };
+  const policy = roomPublicPolicy(settings, roomCfg, POLICY_CONFIG_FILE);
+  assert.equal(policy.permitsText("leaked sk-vision-secret-654321 here"), false);
+  assert.equal(policy.permitsText("endpoint https://vision.model.invalid/v1 leaked"), false);
+});
+
+test("roomLifecycleGenerator sends image_url to dedicated vision model and falls back cleanly on round-0 vision error", async () => {
+  const { createServer } = await import("node:http");
+  const { roomLifecycleGenerator } = await import("../src/voice-room/model.js");
+  const pngBytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+  const pngBase64 = Buffer.from(pngBytes).toString("base64");
+
+  const capturedRequests: Array<{ model: string; thinking?: unknown; messages: Array<{ role: string; content: unknown }> }> = [];
+  let failVisionOnRound0 = false;
+
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+      model: string;
+      thinking?: unknown;
+      messages: Array<{ role: string; content: unknown }>;
+    };
+    capturedRequests.push(body);
+
+    if (failVisionOnRound0 && body.model === "qwen-vl-max") {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "multimodal rejected", type: "invalid_request_error" } }));
+      return;
+    }
+
+    const replyText = body.model === "qwen-vl-max"
+      ? "```json\n{\"kind\":\"reply\",\"segments\":[\"看到了一张 PNG 图片\"]}\n```"
+      : JSON.stringify({ kind: "reply", segments: ["暂时看不到图片，但文字问题我收到了"] });
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(`data: ${JSON.stringify({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      choices: [{ index: 0, delta: { content: replyText }, finish_reason: null }],
+    })}\n\n`);
+    res.write(`data: ${JSON.stringify({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    })}\n\n`);
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address() as AddressInfo;
+  const dir = mkdtempSync(join(tmpdir(), "pa-vision-model-test-"));
+  try {
+    const baseUrl = `http://127.0.0.1:${addr.port}/v1`;
+    const generate = roomLifecycleGenerator({
+      baseUrl,
+      modelId: "deepseek-flash",
+      apiKey: "primary-key",
+      visionModelId: "qwen-vl-max",
+      visionBaseUrl: baseUrl,
+      visionApiKey: "vision-key",
+      contextWindow: 8192,
+      maxTokens: 512,
+      requestTimeoutMs: 5000,
+      thinkingMode: "auto",
+    }, dir);
+
+    const prompt = {
+      systemPrompt: "你是测试角色。",
+      messages: [{ role: "user" as const, content: JSON.stringify({ message: "看图" }) }] as const,
+      tools: Object.freeze([]) as readonly [],
+      personaHash: "hash",
+      characterId: "character-a",
+      accountKey: "account-a",
+      voiceKey: "voice-a",
+      targetId: 1,
+    };
+
+    const imageBlock = { type: "image" as const, mimeType: "image/png", data: pngBase64 };
+    const visionAnswer = await generate(prompt, new AbortController().signal, 200, { images: [imageBlock] });
+    assert.deepEqual(visionAnswer, { kind: "reply", segments: ["看到了一张 PNG 图片"] });
+    assert.equal(capturedRequests.length, 1);
+    assert.equal(capturedRequests[0]!.model, "qwen-vl-max");
+    assert.equal(capturedRequests[0]!.thinking, undefined, "non-DeepSeek vision model must not receive DeepSeek thinking toggle");
+    const userMsg = capturedRequests[0]!.messages.find(m => m.role === "user");
+    assert.ok(Array.isArray(userMsg?.content));
+    const imagePart = (userMsg!.content as Array<{ type: string; image_url?: { url: string } }>)
+      .find(part => part.type === "image_url");
+    assert.equal(imagePart?.image_url?.url, `data:image/png;base64,${pngBase64}`);
+
+    // Now simulate round-0 vision failure -> graceful fallback to primary text model
+    capturedRequests.length = 0;
+    failVisionOnRound0 = true;
+    const fallbackAnswer = await generate(prompt, new AbortController().signal, 200, { images: [imageBlock] });
+    assert.deepEqual(fallbackAnswer, { kind: "reply", segments: ["暂时看不到图片，但文字问题我收到了"] });
+    assert.equal(capturedRequests.length, 2);
+    assert.equal(capturedRequests[0]!.model, "qwen-vl-max");
+    assert.equal(capturedRequests[1]!.model, "deepseek-flash");
+    const fallbackUser = capturedRequests[1]!.messages.find(m => m.role === "user");
+    assert.equal(typeof fallbackUser?.content, "string", "fallback request must strip ImageContent");
+    const fallbackSystem = capturedRequests[1]!.messages.find(m => m.role === "system");
+    assert.ok(typeof fallbackSystem?.content === "string" && fallbackSystem.content.includes("viewing the image failed"));
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("VoiceRoom lifecycle handles pure image+@bot with vision off and vision on without persisting image URLs or bytes to SQLite", async () => {
+  const pngBytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+  const imageUrl = "https://cdn.example.com/secret-photo.png";
+  const checked = checkRoomConfig(roomConfig());
+
+  const runScenario = async (options: {
+    visionCapable: boolean;
+    messageId: string;
+    replyText: string;
+  }) => {
+    const root = mkdtempSync(join(tmpdir(), "pa-lifecycle-vision-"));
+    const dispatches: string[] = [];
+    let fetchCount = 0;
+    let seenPromptSystem = "";
+    let seenPayloadCount: unknown;
+    let passedImages: readonly { type: string; mimeType: string; data: string }[] | undefined;
+    const room = new VoiceRoom(join(root, "room.sqlite"), checked, {
+      now: () => Date.parse("2026-11-13T00:00:00Z"),
+      persona: character => `# ${character.name}\nSynthetic public persona.`,
+      synthesize: async () => { throw new Error("unused"); },
+      permitsText: () => true,
+      permitsPrompt: lifecyclePolicy().permitsPrompt,
+    }, { execution: "lifecycle" });
+    try {
+      for (const character of checked.characters) room.setOnline(character.accountKey, true);
+      await room.startLifecycleProductionWorker({
+        model: {
+          visionCapable: options.visionCapable,
+          generate: async (prompt, _signal, _maxChars, genOptions) => {
+            seenPromptSystem = prompt.systemPrompt;
+            seenPayloadCount = (JSON.parse(prompt.messages[0].content) as { attachedImageCount?: unknown }).attachedImageCount;
+            passedImages = genOptions?.images;
+            return { kind: "reply", segments: [options.replyText] };
+          },
+        },
+        imageFetcher: async urls => {
+          fetchCount += 1;
+          return {
+            images: Object.freeze(urls.map(() => Object.freeze({
+              type: "image" as const,
+              mimeType: "image/png",
+              data: Buffer.from(pngBytes).toString("base64"),
+            }))),
+            attempted: urls.length,
+            failed: 0,
+            reasons: Object.freeze([]),
+          };
+        },
+        apiTimeoutMs: 100,
+        closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 100, releaseMs: 100, writeWaitMs: 50 },
+        dispatch: async req => {
+          dispatches.push(req.item.segment.text);
+          req.beforeSend();
+          await req.observe({ kind: "ack", messageId: "700001" });
+          req.released();
+          return "700001";
+        },
+        beginClose: () => {},
+        sealObservations: async () => {},
+      });
+
+      assert.equal(room.receiveLifecycle(roomInput(options.messageId, "", ["10002"], { images: [imageUrl] }), QUEUE), "scheduled");
+      await waitFor(() => dispatches.length === 1, "vision-lifecycle-dispatched");
+      await waitFor(() => room.store.lifecycleRequests()[0]?.status === "completed", "vision-lifecycle-completed");
+      await waitFor(() => (room as unknown as { lifecycleInputImages: Map<string, unknown> }).lifecycleInputImages.size === 0, "lifecycleInputImages-cleaned");
+
+      const db = new DatabaseSync(join(root, "room.sqlite"), { readOnly: true });
+      const reqJson = JSON.stringify(db.prepare("SELECT payload_json FROM room_lifecycle_requests").all());
+      const msgJson = JSON.stringify(db.prepare("SELECT text FROM room_messages").all());
+      const segJson = JSON.stringify(db.prepare("SELECT semantic_text FROM room_lifecycle_segments").all());
+      db.close();
+      return { dispatches, fetchCount, seenPromptSystem, seenPayloadCount, passedImages, reqJson, msgJson, segJson };
+    } finally {
+      await room.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  // 1. Vision unconfigured: pure image + @bot does not crash, does not fetch image bytes, keeps SQLite clean
+  const off = await runScenario({
+    visionCapable: false,
+    messageId: "99201",
+    replyText: "当前没开看图能力，我看不到图片内容。",
+  });
+  assert.equal(off.fetchCount, 0, "must not fetch image bytes when visionCapable is false");
+  assert.equal(off.seenPayloadCount, 1);
+  assert.ok(off.seenPromptSystem.includes("未启用看图"));
+  assert.equal(off.passedImages, undefined);
+  assert.equal(off.dispatches[0], "当前没开看图能力，我看不到图片内容。");
+  assert.equal(off.reqJson.includes(imageUrl), false);
+  assert.equal(off.msgJson.includes(imageUrl), false);
+
+  // 2. Vision configured: fetches image into memory, passes ImageContent to model, completes reply, cleans up memory & SQLite
+  const on = await runScenario({
+    visionCapable: true,
+    messageId: "99202",
+    replyText: "图里是一张 PNG 示例图。",
+  });
+  assert.equal(on.fetchCount, 1);
+  assert.equal(on.seenPayloadCount, 1);
+  assert.ok(on.seenPromptSystem.includes("已成功加载"));
+  assert.equal(on.passedImages?.length, 1);
+  assert.equal(on.passedImages?.[0]?.mimeType, "image/png");
+  assert.equal(on.passedImages?.[0]?.data, Buffer.from(pngBytes).toString("base64"));
+  assert.equal(on.dispatches[0], "图里是一张 PNG 示例图。");
+  assert.equal(on.reqJson.includes(imageUrl), false);
+  assert.equal(on.msgJson.includes(imageUrl), false);
+  assert.equal(on.reqJson.includes(Buffer.from(pngBytes).toString("base64")), false);
+  assert.equal(on.segJson.includes(Buffer.from(pngBytes).toString("base64")), false);
+});

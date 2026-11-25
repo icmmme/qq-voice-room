@@ -2,9 +2,10 @@ import { resolve } from "node:path";
 import { checkRoomConfig } from "../src/voice-room/config.js";
 import { checkPublicPersonas, readRoomModelConfig, readRoomQqSettings, RoomWorkerDeliveryError,
   workerDeliveryModes } from "../src/voice-room/qq-config.js";
-import { roomLifecycleGenerator, roomWorkerVoiceTranslator, ROOM_LIFECYCLE_DEEP_MAX_TOKENS,
-  ROOM_MODEL_ROUND_TIMEOUT_MS } from "../src/voice-room/model.js";
+import { hasVisionModel, roomLifecycleGenerator, roomWorkerVoiceTranslator,
+  ROOM_LIFECYCLE_DEEP_MAX_TOKENS, ROOM_MODEL_ROUND_TIMEOUT_MS } from "../src/voice-room/model.js";
 import { createRoomWebToolkit } from "../src/voice-room/web.js";
+import { createRoomImageFetcher } from "../src/voice-room/image.js";
 import { startRoomQq } from "../src/voice-room/qq-server.js";
 import { roomPublicPolicy } from "../src/voice-room/public-policy.js";
 import { readFishConfig, fishSynthesizer, FishTtsError } from "../src/voice-room/fish.js";
@@ -68,6 +69,7 @@ async function main() {
     modelRoundTimeoutMs: ROOM_MODEL_ROUND_TIMEOUT_MS,
     modelRoundTimeoutSource: "default",
     tools: web.hasSearch ? "web_search,web_fetch" : "web_fetch",
+    visionMode: model.visionModelId ? "dedicated" : model.modelSupportsVision ? "primary" : "disabled",
     providerRetry: "none",
   };
   const proxy = discoverRoomProxy();
@@ -91,8 +93,12 @@ async function main() {
     bridge = await startRoomQq({ ...settings, room }, {
       ...policy,
       web,
-      lifecycleModel: { generate: roomLifecycleGenerator({ ...model, contextWindow: room.limits.contextTokens },
-        settings.dataDir, (code, diagnostic) => console.log(JSON.stringify({ type: "model-error", code, diagnostic }))) },
+      imageFetcher: createRoomImageFetcher({ timeoutMs: model.webTimeoutMs }),
+      lifecycleModel: {
+        visionCapable: hasVisionModel(model),
+        generate: roomLifecycleGenerator({ ...model, contextWindow: room.limits.contextTokens },
+          settings.dataDir, (code, diagnostic) => console.log(JSON.stringify({ type: "model-error", code, diagnostic }))),
+      },
       translateVoice: roomWorkerVoiceTranslator(model, settings.dataDir),
       onContextCompacted: notice => console.log(JSON.stringify({ type: "room-context-compacted", ...notice })),
     }, notice => console.log(JSON.stringify(notice)), fish ? {
