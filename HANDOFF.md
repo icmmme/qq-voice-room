@@ -41,11 +41,16 @@
 - Tests: `tests/voice-room-request-lifecycle.test.ts`
 
 ## 4. Recommended Phase 2 Orchestration & Next Tracks
-- **Dev Orchestration**: Single strong model (`med`–`xhigh` thinking by complexity) for single-module tasks; **Swarm mode (`/teamwork`)** with isolated `share` workspaces for multi-track Phase 2 delivery.
+- **Dev Orchestration**: `Orchestrator (Gemini 4 Neon)` with `Medium` for routine changes, `High`/`Extra High` for complex state/architecture, and **Swarm mode (`/teamwork` or `/swarm`)** with isolated `share` workspaces for parallel Phase 2 tracks.
+- **Ops Prerequisite (NapCat Login Stability)**:
+  - Root cause found in `C:\ProgramData\NapCatQQ Desktop\logs\bots\bots\*.log`: Clash Verge (`127.0.0.1:7892`) lacked QQ/NapCat bypass rules, causing simultaneous ~2h TCP resets (`10060`/`10053`) and QQ ticket invalidation (`你的用户身份已失效`).
+  - Fix on host: Clash Verge Rule mode + `DIRECT` rules for `NapCatWinBootMain.exe`, `NapCatQQ-Desktop.exe`, `QQ.exe`, `qq.com`, `tencent.com`, `qpic.cn`, `gtimg.cn` (plus System Proxy Bypass).
 - **Parallel Phase 2 Tracks**:
-  1. **Track A — Module 3: Natural Ambient Participation (`participation-policy.ts`, `participation-planner.ts`, `runtime.ts`)**:
+  1. **Track A — Module 3: Natural Ambient Participation (`src/voice-room/participation-policy.ts`, `src/voice-room/participation-planner.ts`, `src/voice-room/runtime.ts`)**:
      - Diagnose why ambient chiming rarely triggers in live QQ; relax overly strict multi-person/quiet-window gates while keeping anti-spam cooldowns and natural topic relevance.
-  2. **Track B — Runtime Model Routing (`src/config.ts`, `src/voice-room/qq-config.ts`, `src/voice-room/model.ts`)**:
-     - Support optional `PA_FAST_MODEL` (casual chat / ambient planner / Rin voice translation) + `PA_DEEP_MODEL` (deep Q&A / URL analysis / tool loop) + per-tier thinking effort (`low`/`med`/`high`), falling back cleanly to `PA_MODEL`.
-  3. **Track C — Optional MCP Client & Long-Term Memory (Deferred until Track A/B verified)**:
-     - Lightweight read-only MCP tool bridge for external capabilities, plus scoped cross-day topic memory without overnight chat pollution.
+  2. **Track B — NapCat Resilience & Graceful Degradation (`src/voice-room/runtime.ts`, `src/voice-room/qq-server.ts`)**:
+     - **Single-account degradation**: keep room `ready` when ingress account is online even if the secondary account drops (skip only the offline character; auto-restore when it reconnects).
+     - **Short reconnect grace window (~15s)**: do not immediately cancel in-flight generation on brief 1–2s WS blinks.
+     - **Offline alert (>30s)**: surface clear offline warning via online sibling account (or structured notice) when one account stays disconnected.
+  3. **Track C — Deferred (Phase 3 after Track A/B verified)**:
+     - Optional search provider keys (`BOCHA_API_KEY` / `EXA_API_KEY` / `TAVILY_API_KEY`), lightweight read-only MCP client bridge, and scoped cross-day topic memory without overnight chat pollution.
