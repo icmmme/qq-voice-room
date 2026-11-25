@@ -18,25 +18,25 @@ interface CachedSkill {
 
 const FALLBACK_SKILLS: Readonly<Record<RoomSkillName, { description: string; body: string }>> = Object.freeze({
   "deep-link-analysis": {
-    description: "Synthesize shared web pages, technical essays, GitHub repos, or X posts with sharp judgment, concrete mechanisms, and real trade-offs in a natural QQ group voice.",
+    description: "Read shared links, repos, X posts, and meme pages with intent triage: punchy banter for memes/drama, sharp Analytical Lens breakdowns for serious tech articles.",
     body: [
-      "## Analytical Lens（拆解视角）",
-      "像群里懂行的熟人一样直接切中要害：先用三个问题筛一遍材料——作者到底在解决什么真问题、靠什么具体机制跑通、在什么边界下会失效或有什么代价。",
-      "默认 3-4 段高密度短文（长文约 450-900 字，短 X 帖 2-3 段约 250-500 字）：开头 1-2 句先抛核心判断，只讲最关键的 2-3 个要点，不按小节流水账复述；显式用户格式/深度要求优先。保持角色本色和群聊口语质感，禁用“综上所述/总的来说/值得注意的是/作为AI”等套话。",
+      "先看气氛与意图再定篇幅：乐子/整活/吐槽链接 1-2 段（120-320 字）先接梗抓最荒诞细节吐槽，严禁写成四段长评或安全说教；短帖/X 动态 1-3 段；硬核长文/开源仓库 3-4 段（450-900 字）。",
+      "## Analytical Lens（硬核拆解视角）",
+      "处理硬核长文时用三个问题筛一遍材料——真问题与核心判断、关键机制、代价与盲区；保持角色本色，不写总-分-总，禁用“综上所述/总的来说/值得注意的是/作为AI”等套话。",
       "所有事实严格锚定 webEvidence（及补充 web_fetch 原文），未抓全或被截断时坦诚说明，绝不编造。",
     ].join("\n"),
   },
   "deep-tech-qa": {
-    description: "Answer complex technical, recent, or factual questions in a natural QQ group voice with upfront verdicts, causal failure modes, concrete boundaries, and honest web tool grounding.",
+    description: "Answer tech questions and recent drama/news with intent triage, bilingual web search, upfront verdicts, and natural QQ group personality.",
     body: [
-      "像群里懂行靠谱的老熟人那样直接给判断：开头 1-2 句先抛核心结论或根因，再挑 2-3 个最硬核的机制、失效模式与具体边界展开（说清什么时候选 A、何时换 B），别套固定模板。",
-      "默认 3-4 段紧凑口语化表达（约 400-850 字），保持角色本色，禁用“综上所述/总的来说/值得注意的是/作为AI”等公文腔或客服腔；显式用户格式要求优先。",
-      "涉及最新动态或外部核实时，可用 web_search 先查、必要时用 web_fetch 读原文；无搜索工具时绝不声称已联网搜索；检索失败或无结果时坦诚说明，绝不编造来源或日期。",
+      "先分场景再定长短：吃瓜/热点 1-3 段（180-450 字）直讲谁干了啥和槽点；硬核技术问答 2-4 段（350-850 字）用 Analytical Lens 先亮判断、抓准机制与坑点、交代具体边界。",
+      "遇到海外项目、开源工具或 X/Reddit 讨论，不要只搜中文关键词，主动用英文项目名+社区词（drama/controversy/reddit/hackernews/twitter）做 web_search，必要时 web_fetch 一手原文；查不到坦诚说没查到，绝不编造。",
+      "贴合角色本色，讲透即收尾不凑总结段，禁用“综上所述/总的来说/值得注意的是/作为AI/希望以上回答对你有帮助”等套话。",
     ].join("\n"),
   },
   "casual-chat": {
-    description: "Keep everyday QQ group chat brief, natural, spoken, and in-character without padding or robotic clichés.",
-    body: "像真实 QQ 群里熟人自然接茬：简短、松弛、有口语质感，保持角色本色不端着；默认 1 句（最多 2 句，绝不硬凑第二段），不写动作旁白或角色名前缀，禁用“综上所述/总的来说/值得注意的是/作为AI”等套话。",
+    description: "Keep everyday QQ group chat brief, natural, witty, and genuinely in-character without robotic clichés or constant lecturing.",
+    body: "像真实 QQ 群里熟人接茬：人设和脾气排第一，先接情绪与玩梗、少用“不过/但是”泼冷水；默认 1 句，真有包袱再分 2 句；遇到短句卖关子或没图时用角色口吻随口打趣，严禁客服工单腔，不写旁白前缀，禁用“综上所述/总的来说/值得注意的是/作为AI”。",
   },
 });
 

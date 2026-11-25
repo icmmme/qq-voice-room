@@ -5961,14 +5961,18 @@ test("room skills provide idiomatic Chinese QQ group-chat guidance with Analytic
   assert.ok(linkSkill.includes("webEvidence"));
   assert.ok(linkSkill.includes("web_fetch"));
   assert.ok(linkSkill.includes("综上所述"));
+  assert.ok(linkSkill.includes("乐子 / 整活"));
 
   const qaSkill = loadRoomSkill("deep-tech-qa");
   assert.ok(qaSkill.includes("Analytical Lens"));
   assert.ok(qaSkill.includes("web_search"));
   assert.ok(qaSkill.includes("web_fetch"));
+  assert.ok(qaSkill.includes("reddit"));
+  assert.ok(qaSkill.includes("controversy"));
 
   const casualSkill = loadRoomSkill("casual-chat");
   assert.ok(casualSkill.includes("QQ 群"));
+  assert.ok(casualSkill.includes("客服工单腔"));
 
   // Fallback skills when skillsDir does not exist
   const missingDir = join(tmpdir(), "qq-room-nonexistent-skills-dir");
