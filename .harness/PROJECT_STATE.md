@@ -4,22 +4,21 @@
 
 <!-- CANONICAL_STATE:BEGIN -->
 
-- Phase: `M5 - Product Fix Program`
-- Predecessor: `M5-FIX2-AMBIENT-STATUS`
-- Predecessor status: `ACCEPTED`, merged by PR `#6` at
-  `6b6a4502031b1b1168d7854e96adb00808bc808f`, tree
-  `b0d4c2c8ef9f3dc97b56073bdd072f837eb65d8d`, and deployed.
-- Active task: `VR-PRODUCT-TAKEOVER-01 / M5-FIX3-RETENTION-CACHE`
-- Active status: `ACCEPTED` (offline contract closed; no follow-on task activated)
-- Active contract: `.harness/M5_FIX3_RETENTION_CACHE.md`
-- Baseline: `6b6a4502031b1b1168d7854e96adb00808bc808f`, tree
-  `b0d4c2c8ef9f3dc97b56073bdd072f837eb65d8d`.
-- Scope: turn-scoped lifecycle translation prompt lifetime plus a
-  transactional body-retention path for expired persisted request, message,
-  delivery and lifecycle text.
-- Owner decision: [M5 Fix-3 offline closeout](#m5-fix-3-offline-closeout).
-  Production data cleanup, merge, release and cutover require separate Owner
-  authorization.
+- Phase: `Product CI`
+- Predecessor: `VR-PRODUCT-TAKEOVER-01 / M5-FIX3-RETENTION-CACHE`
+- Predecessor status: `ACCEPTED` for the offline contract. The [closeout](#m5-fix-3-offline-closeout)
+  was squash-merged into `main` by [PR 8](https://github.com/icmmme/qq-voice-room/pull/8).
+- Active task: `VR-CI-01 / PRODUCT-PR-GATE`
+- Active status: `IN_PROGRESS` (contract registered; implementation not started)
+- Active contract: [Product CI for pull requests](CI_PRODUCT_PR_GATE.md)
+- Baseline: `3767178596ced9019c8f2f2936a95ac87b55ff62`, tree
+  `3e0700348b08124503782af82768e22bcb83bd8e`.
+- Scope: a read-only offline product check for PRs targeting `main`, separate
+  from historical M1 foundation acceptance.
+- Owner decision: the contract draft was approved on `2026-11-24`. The Owner
+  authorized task registration on `2026-11-25` (`Asia/Shanghai`). Implementation,
+  remote validation, and required-check status need separate authorization.
+  This task does not authorize deployment or production data cleanup.
 
 <!-- CANONICAL_STATE:END -->
 

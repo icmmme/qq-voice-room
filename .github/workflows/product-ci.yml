@@ -1,0 +1,93 @@
+name: Product CI
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  product-ci:
+    name: Windows / Node 24
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out PR
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        id: setup-node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.21.0'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Log checkout, toolchain, and cache status
+        env:
+          NPM_CACHE_HIT: ${{ steps.setup-node.outputs.cache-hit }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          git log -1 --format='Checkout HEAD: %H%nCheckout tree: %T' HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $nodeVersion = node --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Node version: $nodeVersion"
+          $npmVersion = npm.cmd --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "npm version: $npmVersion"
+          if ($env:NPM_CACHE_HIT -eq 'true') {
+            Write-Host 'npm cache: hit'
+          } else {
+            Write-Host 'npm cache: miss'
+          }
+
+      - name: Install locked dependencies
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+          npm.cmd ci --ignore-scripts --no-audit --no-fund
+          $exitCode = $LASTEXITCODE
+          $timer.Stop()
+          Write-Host ('Install elapsed: {0:F3} seconds' -f $timer.Elapsed.TotalSeconds)
+          exit $exitCode
+
+      - name: Compile and check types
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+          npm.cmd run build
+          $exitCode = $LASTEXITCODE
+          $timer.Stop()
+          Write-Host ('Compile elapsed: {0:F3} seconds' -f $timer.Elapsed.TotalSeconds)
+          exit $exitCode
+
+      - name: Run the complete compiled lifecycle suite
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+          node --test --test-reporter=tap dist/tests/voice-room-request-lifecycle.test.js
+          $exitCode = $LASTEXITCODE
+          $timer.Stop()
+          Write-Host ('Lifecycle suite elapsed: {0:F3} seconds' -f $timer.Elapsed.TotalSeconds)
+          exit $exitCode
+
+      - name: Run the standalone architecture guard
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+          node tools/architecture-guard.mjs
+          $exitCode = $LASTEXITCODE
+          $timer.Stop()
+          Write-Host ('Architecture guard elapsed: {0:F3} seconds' -f $timer.Elapsed.TotalSeconds)
+          exit $exitCode
