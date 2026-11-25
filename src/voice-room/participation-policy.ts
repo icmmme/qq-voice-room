@@ -3,7 +3,8 @@ import type { RoomCharacter, RoomMessage } from "./types.js";
 
 export type ParticipationReason = "disabled" | "paused" | "stopped" | "busy" | "no-input" | "quiet"
   | "cooldown" | "offline" | "budget" | "other-conversation" | "trivial" | "repetition"
-  | "recent-bots" | "no-signal" | "named-question" | "public-question" | "follow-up" | "share" | "group-question";
+  | "recent-bots" | "no-signal" | "named-question" | "group-question" | "public-question"
+  | "follow-up" | "share" | "named-mention" | "open-question" | "natural-topic";
 export interface ParticipationNotice { shouldReply: boolean; reason: ParticipationReason; maxTurns: 0 | 1 | 2 }
 export type ParticipationDecision = ParticipationNotice & { firstSpeaker?: string };
 export interface ParticipationContext {
@@ -210,6 +211,15 @@ export class ParticipationPolicy {
       }
     }
     if (sharing.test(text) && [...normalized].length >= 8) return reply(rank(online)[0], "share");
+    if (named.length && [...normalized].length >= 4) {
+      return reply(rank(named.filter(c => ctx.online.has(c.accountKey)))[0], "named-mention", named.length === 2 && bothViews.test(text));
+    }
+    if (question.test(text) && [...normalized].length >= 5) {
+      return reply(rank(online)[0], "open-question", bothViews.test(text));
+    }
+    if (/https?:\/\//i.test(text) || [...normalized].length >= 10) {
+      return reply(rank(online)[0], "natural-topic");
+    }
     return silence("no-signal");
   }
 }

@@ -44,7 +44,12 @@ export async function startRoomQq(settings: RoomQqSettings,
     & Partial<Pick<RoomDependencies, "generate" | "translateVoice">>
     & { lifecycleModel?: RoomLifecycleModelPort; web?: RoomWebToolkit },
   onNotice: (notice: RoomQqNotice) => void = () => {},
-  voice?: { synthesize: RoomDependencies["synthesize"] }) {
+  voice?: { synthesize: RoomDependencies["synthesize"] },
+  options: { disconnectGraceMs?: number; offlineAlertMs?: number; startupSingleAccountMs?: number } = {}) {
+  const testMode = settings.apiTimeoutMs <= 1000;
+  const disconnectGraceMs = options.disconnectGraceMs ?? (testMode ? 0 : 10_000);
+  const offlineAlertMs = options.offlineAlertMs ?? (testMode ? 150 : 30_000);
+  const startupSingleAccountMs = options.startupSingleAccountMs ?? (testMode ? 250 : 15_000);
   const workerSelected = settings.execution === "worker";
   const workerTts = typeof voice?.synthesize === "function";
   const startupModes = workerSelected ? workerDeliveryModes(settings.room.deliveryMode, workerTts) : undefined;
@@ -102,8 +107,69 @@ export async function startRoomQq(settings: RoomQqSettings,
   };
   const peers = new Map<string, QqPeer>();
   const ackAt = new Map<string, number>();
+  const disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const offlineAlertTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  let startupFallbackTimer: ReturnType<typeof setTimeout> | undefined;
   let closing = false, closePromise: Promise<void> | undefined;
   let workerStarted = false;
+  const clearTimerMap = (timers: Map<string, ReturnType<typeof setTimeout>>, key?: string) => {
+    if (key !== undefined) {
+      const existing = timers.get(key);
+      if (existing) { clearTimeout(existing); timers.delete(key); }
+      return;
+    }
+    for (const timer of timers.values()) clearTimeout(timer);
+    timers.clear();
+  };
+  const ensureWorkerStarted = () => {
+    if (!workerSelected || workerStarted || closing) return;
+    workerStarted = true;
+    if (startupFallbackTimer) { clearTimeout(startupFallbackTimer); startupFallbackTimer = undefined; }
+    void room.startLifecycleProductionWorker({ model: deps.lifecycleModel!, ambientPlanner,
+      ...(deps.web ? { web: deps.web } : {}),
+      apiTimeoutMs: settings.apiTimeoutMs,
+      closePolicy, dispatch: async request => {
+        if (closing || request.signal.aborted) throw new RoomSendError("rejected");
+        const peer = peers.get(request.attempt.accountKey);
+        if (!peer?.open) throw new RoomSendError("rejected");
+        if (request.medium === "audio" && !request.bytes) throw new RoomSendError("rejected");
+        const attemptOptions = {
+          attemptId: request.attempt.attemptId, beforeSend: request.beforeSend, observe: request.observe,
+          released: request.released, physicalSettled: request.physicalSettled, notSent: request.notSent,
+          capacity: closePolicy.perAccountCapacity,
+        };
+        const forwardNodes = request.medium === "text"
+          ? (request.forwardNodes?.length
+            ? request.forwardNodes
+            : request.item.segment.deliveryMode === "text" && [...request.item.segment.text].length > 200
+              ? request.item.segment.text.split(/\n{2,}/).map(part => part.trim()).filter(Boolean)
+              : undefined)
+          : undefined;
+        if (forwardNodes && forwardNodes.length > 0) {
+          const messages = forwardNodes.map(nodeText => ({
+            type: "node",
+            data: {
+              uin: request.item.character.selfId,
+              name: request.item.character.name,
+              content: [{ type: "text", data: { text: nodeText } }],
+            },
+          }));
+          try {
+            return await peer.requestAttempt("send_group_forward_msg",
+              { group_id: Number(config.groupId), messages }, attemptOptions);
+          } catch (error) {
+            throw new RoomSendError(error instanceof QqApiError && error.code === "api-rejected" ? "rejected" : "uncertain");
+          }
+        }
+        const message = request.medium === "audio" ? [roomRecord(request.bytes!)]
+          : [{ type: "text", data: { text: request.item.segment.text } }];
+        try { return await peer.requestAttempt("send_group_msg", { group_id: Number(config.groupId), message, auto_escape: true },
+          attemptOptions); }
+        catch (error) { throw new RoomSendError(error instanceof QqApiError && error.code === "api-rejected" ? "rejected" : "uncertain"); }
+      }, beginClose: until => { for (const p of peers.values()) p.beginObservationClose(until); },
+      sealObservations: () => Promise.all([...peers.values()].map(p => p.sealObservations())).then(() => {}),
+    }).catch(() => notice("error", "room-worker-startup-failed"));
+  };
   const room = new VoiceRoom(join(settings.dataDir, "room.sqlite"), config, {
     persona: deps.persona, ...(deps.translateVoice ? { translateVoice: deps.translateVoice } : {}),
     permitsText: deps.permitsText, ...(deps.permitsPrompt ? { permitsPrompt: deps.permitsPrompt } : {}),
@@ -200,53 +266,19 @@ export async function startRoomQq(settings: RoomQqSettings,
         }
       });
       peers.set(account.accountKey, peer);
+      clearTimerMap(disconnectTimers, account.accountKey);
+      clearTimerMap(offlineAlertTimers, account.accountKey);
       room.setOnline(account.accountKey, true);
-      if (workerSelected && !workerStarted && peers.size === config.characters.length) {
-        workerStarted = true;
-        void room.startLifecycleProductionWorker({ model: deps.lifecycleModel!, ambientPlanner,
-          ...(deps.web ? { web: deps.web } : {}),
-          apiTimeoutMs: settings.apiTimeoutMs,
-          closePolicy, dispatch: async request => {
-            if (closing || request.signal.aborted) throw new RoomSendError("rejected");
-            const peer = peers.get(request.attempt.accountKey);
-            if (!peer?.open) throw new RoomSendError("rejected");
-            if (request.medium === "audio" && !request.bytes) throw new RoomSendError("rejected");
-            const attemptOptions = {
-              attemptId: request.attempt.attemptId, beforeSend: request.beforeSend, observe: request.observe,
-              released: request.released, physicalSettled: request.physicalSettled, notSent: request.notSent,
-              capacity: closePolicy.perAccountCapacity,
-            };
-            const forwardNodes = request.medium === "text"
-              ? (request.forwardNodes?.length
-                ? request.forwardNodes
-                : request.item.segment.deliveryMode === "text" && [...request.item.segment.text].length > 200
-                  ? request.item.segment.text.split(/\n{2,}/).map(part => part.trim()).filter(Boolean)
-                  : undefined)
-              : undefined;
-            if (forwardNodes && forwardNodes.length > 0) {
-              const messages = forwardNodes.map(nodeText => ({
-                type: "node",
-                data: {
-                  uin: request.item.character.selfId,
-                  name: request.item.character.name,
-                  content: [{ type: "text", data: { text: nodeText } }],
-                },
-              }));
-              try {
-                return await peer.requestAttempt("send_group_forward_msg",
-                  { group_id: Number(config.groupId), messages }, attemptOptions);
-              } catch (error) {
-                throw new RoomSendError(error instanceof QqApiError && error.code === "api-rejected" ? "rejected" : "uncertain");
-              }
-            }
-            const message = request.medium === "audio" ? [roomRecord(request.bytes!)]
-              : [{ type: "text", data: { text: request.item.segment.text } }];
-            try { return await peer.requestAttempt("send_group_msg", { group_id: Number(config.groupId), message, auto_escape: true },
-              attemptOptions); }
-            catch (error) { throw new RoomSendError(error instanceof QqApiError && error.code === "api-rejected" ? "rejected" : "uncertain"); }
-          }, beginClose: until => { for (const p of peers.values()) p.beginObservationClose(until); },
-          sealObservations: () => Promise.all([...peers.values()].map(p => p.sealObservations())).then(() => {}),
-        }).catch(() => notice("error", "room-worker-startup-failed"));
+      if (workerSelected && !workerStarted) {
+        if (peers.size === config.characters.length) {
+          ensureWorkerStarted();
+        } else if (peers.has(config.ingressAccountKey) && !startupFallbackTimer && startupSingleAccountMs >= 0) {
+          startupFallbackTimer = setTimeout(() => {
+            startupFallbackTimer = undefined;
+            if (!closing && peers.has(config.ingressAccountKey)) ensureWorkerStarted();
+          }, startupSingleAccountMs);
+          startupFallbackTimer.unref();
+        }
       }
       notice("connected", "account-online");
       publishWorkerStatus();
@@ -254,9 +286,38 @@ export async function startRoomQq(settings: RoomQqSettings,
         if (peers.get(account.accountKey) !== peer) return;
         peers.delete(account.accountKey);
         if (!closing) {
-          try { room.setOnline(account.accountKey, false); } catch { notice("error", "disconnect-state-failed"); }
-          notice("disconnected", "account-offline");
-          publishWorkerStatus();
+          const applyOffline = () => {
+            if (closing || peers.has(account.accountKey)) return;
+            try { room.setOnline(account.accountKey, false); } catch { notice("error", "disconnect-state-failed"); }
+            notice("disconnected", "account-offline");
+            publishWorkerStatus();
+          };
+          if (account.accountKey === config.ingressAccountKey && disconnectGraceMs > 0) {
+            clearTimerMap(disconnectTimers, account.accountKey);
+            const timer = setTimeout(() => {
+              disconnectTimers.delete(account.accountKey);
+              applyOffline();
+            }, disconnectGraceMs);
+            timer.unref();
+            disconnectTimers.set(account.accountKey, timer);
+            publishWorkerStatus();
+          } else {
+            applyOffline();
+          }
+          if (account.accountKey !== config.ingressAccountKey && offlineAlertMs > 0) {
+            clearTimerMap(offlineAlertTimers, account.accountKey);
+            const alertTimer = setTimeout(() => {
+              offlineAlertTimers.delete(account.accountKey);
+              if (closing || peers.has(account.accountKey)) return;
+              notice("disconnected", "account-offline-alert");
+              if (peers.get(config.ingressAccountKey)?.open) {
+                void acknowledge(config.ingressAccountKey,
+                  `提醒：${character.name} 的 NapCat 连接已断开，当前由在线账号继续服务，请检查登录状态。`);
+              }
+            }, offlineAlertMs);
+            alertTimer.unref();
+            offlineAlertTimers.set(account.accountKey, alertTimer);
+          }
         }
       });
     });
@@ -284,6 +345,8 @@ export async function startRoomQq(settings: RoomQqSettings,
     close(): Promise<void> {
       return closePromise ??= (async () => {
         closing = true; clearInterval(poll); clearInterval(heartbeat);
+        clearTimerMap(disconnectTimers); clearTimerMap(offlineAlertTimers);
+        if (startupFallbackTimer) { clearTimeout(startupFallbackTimer); startupFallbackTimer = undefined; }
         try {
           if (!workerSelected) { for (const peer of peers.values()) peer.close(); peers.clear(); }
           await room.close();

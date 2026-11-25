@@ -107,7 +107,7 @@ export class VoiceRoom {
   private lifecycleWorker?: RoomLifecycleWorker;
   private lifecycleOwnerToken?: string;
   private readonly lifecycleGenerations = new Map<string, { claim: LifecycleGenerationClaim; controller: AbortController }>();
-  private lifecycleDelivery?: { requestId: string; controller: AbortController; promise: Promise<void> };
+  private lifecycleDelivery?: { requestId: string; accountKey: string; controller: AbortController; promise: Promise<void> };
   private lifecyclePumpPromise?: Promise<void>;
   private lifecycleDeliveryPumpPromise?: Promise<void>;
   private lifecycleWakeRequested = false;
@@ -144,19 +144,23 @@ export class VoiceRoom {
     if (!this.config.characters.some(c => c.accountKey === accountKey)) throw new Error("room-account-unknown");
     if (value) {
       this.online.add(accountKey);
-      if (this.config.characters.every(character => this.online.has(character.accountKey))) {
+      if (this.online.has(this.config.ingressAccountKey)) {
         this.wakeLifecycleGenerations();
         this.wakeLifecycleDelivery();
       }
     } else {
       this.online.delete(accountKey);
-      this.cancelLifecycleConnectionWork();
+      if (accountKey === this.config.ingressAccountKey) {
+        this.cancelLifecycleConnectionWork();
+      } else {
+        this.cancelLifecycleAccountWork(accountKey);
+      }
     }
   }
-  /** Read-only readiness gate: ready only after recovery/control init and all accounts online. */
+  /** Read-only readiness gate: ready once recovery/control init completes and ingress account is online. */
   get ready(): boolean {
     return !this.closed && this.workerPhase === "ready"
-      && this.config.characters.every(character => this.online.has(character.accountKey));
+      && this.online.has(this.config.ingressAccountKey);
   }
   private controlResult(kind: RoomControlResult["kind"], action: RoomControlAction, reason: string | null,
     state: RoomControlState, cancelledQueued = 0, cancelledActive = false): RoomControlResult {
@@ -328,15 +332,19 @@ export class VoiceRoom {
         ? undefined : this.store.trustedLifecycleReplyTarget(input.replyToMessageId);
       const quotedCharacter = quoted && this.config.characters.find(character =>
         character.id === quoted.speakerId && character.accountKey === quoted.accountKey);
-      const selectedCharacterIds = Object.freeze(explicitCharacterIds.length
-        ? explicitCharacterIds : quotedCharacter ? [quotedCharacter.id] : []);
+      const rawSelected = explicitCharacterIds.length
+        ? explicitCharacterIds : quotedCharacter ? [quotedCharacter.id] : [];
+      const selectedCharacterIds = Object.freeze(rawSelected.filter(id => {
+        const character = this.config.characters.find(item => item.id === id);
+        return Boolean(character && this.online.has(character.accountKey));
+      }));
       const lifecycleMode = this.lifecycleControl().mode;
       const admitted: LifecycleAdmission = this.store.acceptLifecycleInput(input, {
         ownerToken: token, expectedEpoch: this.readyEpoch!, now: this.now(),
         source: selectedCharacterIds.length ? "direct" : lifecycleMode === "ambient" ? "ambient" : "direct",
         characterIds: selectedCharacterIds,
-        admissionReason: explicitCharacterIds.length ? "explicit_direct"
-          : quotedCharacter ? "quoted_direct" : null,
+        admissionReason: explicitCharacterIds.length && selectedCharacterIds.length ? "explicit_direct"
+          : quotedCharacter && selectedCharacterIds.length ? "quoted_direct" : null,
         enqueue: selectedCharacterIds.length > 0, deliveryMode, policy,
       });
       if (admitted.kind === "enqueue") {
@@ -479,7 +487,7 @@ export class VoiceRoom {
       const control = this.lifecycleControl();
       return this.lifecycleOwnerLive() && !control.paused && control.executionRevision === revision
         && control.epoch === this.readyEpoch
-        && this.config.characters.every(character => this.online.has(character.accountKey))
+        && this.online.has(this.config.ingressAccountKey)
         && (accountKey === undefined || this.online.has(accountKey));
     } catch { return false; }
   }
@@ -505,7 +513,7 @@ export class VoiceRoom {
     }
     return this.lifecycleOwnerLiveStrict() && !control.paused && control.executionRevision === revision
       && control.epoch === this.readyEpoch
-      && this.config.characters.every(character => this.online.has(character.accountKey))
+      && this.online.has(this.config.ingressAccountKey)
       && (accountKey === undefined || this.online.has(accountKey));
   }
   private onLifecyclePauseChange(paused: boolean): void {
@@ -545,6 +553,19 @@ export class VoiceRoom {
     } catch {
       this.faultWorker("room-lifecycle-disconnect-cancel-failed");
     }
+  }
+  private cancelLifecycleAccountWork(accountKey: string): void {
+    if (this.closed || this.workerPhase === "closed" || this.workerPhase === "faulted") return;
+    for (const generation of this.lifecycleGenerations.values()) {
+      if (generation.claim.character.accountKey === accountKey) {
+        generation.controller.abort();
+      }
+    }
+    if (this.lifecycleDelivery?.accountKey === accountKey) {
+      this.lifecycleDelivery.controller.abort();
+    }
+    this.wakeLifecycleGenerations();
+    this.wakeLifecycleDelivery();
   }
   private scheduleAmbientOpportunity(anchorRowId: number, policy: RoomQueuePolicy, blocked: boolean): void {
     if (this.consumer !== "lifecycle" || !this.lifecycleWorker?.ambientPlanner || this.closed) return;
@@ -623,7 +644,8 @@ export class VoiceRoom {
       }
       const history = this.store.historyPage(Math.min(ROOM_HISTORY_PAGE_LIMIT, Math.max(this.config.limits.historyPageRows,
         this.config.limits.ambientMessages + 2)));
-      const batch = this.store.ambientHumanBatch(anchorRowId, anchor.createdAt - this.config.limits.ambientQuietMs,
+      const batch = this.store.ambientHumanBatch(anchorRowId,
+        anchor.createdAt - Math.max(this.config.limits.ambientQuietMs, 120_000),
         Math.min(ROOM_HISTORY_PAGE_LIMIT, Math.max(this.config.limits.historyPageRows,
           this.config.limits.ambientMessages + 2)));
       const pending = batch.at(-1)?.id === anchorRowId ? batch : Object.freeze([anchor]);
@@ -644,11 +666,13 @@ export class VoiceRoom {
         this.ambientParticipationNotice(`ambient_rule_${participation.reason}`, anchorRowId);
         return;
       }
+      const onlineCharacters = this.config.characters.filter(character => this.online.has(character.accountKey));
+      if (!onlineCharacters.length) return;
       const historyRows = this.store.historyPage(AMBIENT_HISTORY_LIMIT, { beforeId: anchorRowId });
       if (pending.some(row => !this.permits(row.text)) || historyRows.some(row => !this.permits(row.text))) return;
       let characters;
       try {
-        characters = ambientPlannerCharacters(this.config.characters, character => {
+        characters = ambientPlannerCharacters(onlineCharacters, character => {
           const persona = this.deps.persona(character);
           if (typeof persona !== "string" || !this.permits(persona)) throw new Error("room-ambient-private");
           return persona;
@@ -904,6 +928,12 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
       this.store.settleLifecycleGeneration(turn.turnId, "failed", reason, ownerToken, this.now());
     };
     try {
+      if (!this.online.has(character.accountKey) && this.online.has(this.config.ingressAccountKey)) {
+        if (this.lifecycleOwnerLive() && this.store.lifecycleControlState().executionRevision === revision) {
+          this.store.settleLifecycleGeneration(turn.turnId, "failed", "account_offline", ownerToken, this.now());
+        }
+        return;
+      }
       if (!this.lifecycleRevisionLive(revision, character.accountKey)) return;
       const quotedMessage = (target?.targetId ? this.store.historyMessage(target.targetId) : undefined)
         ?? (request.input.replyToMessageId
@@ -1096,7 +1126,13 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
         continue;
       }
       const controller = new AbortController();
-      const entry = { requestId: head.requestId, controller, promise: Promise.resolve() };
+      const headItems = this.store.lifecycleDeliveryItems(head.requestId);
+      const entry = {
+        requestId: head.requestId,
+        accountKey: headItems[0]?.character.accountKey ?? this.config.ingressAccountKey,
+        controller,
+        promise: Promise.resolve(),
+      };
       const fingerprint = this.lifecycleDeliveryFingerprint(head.requestId);
       entry.promise = this.runLifecycleDelivery(head.requestId, token, controller.signal);
       this.lifecycleDelivery = entry;
@@ -1168,8 +1204,13 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
       const item = this.store.lifecycleDeliveryItems(requestId)[0];
       if (!item) return;
       const before = this.lifecycleDeliveryFingerprint(requestId);
-      if (item.segment.state === "pending") await this.deliverLifecycleText(item, ownerToken, signal);
-      else await this.deliverLifecycleAudio(item, ownerToken, signal);
+      if (item.segment.state === "pending") {
+        if (this.lifecycleDelivery) this.lifecycleDelivery.accountKey = item.character.accountKey;
+        await this.deliverLifecycleText(item, ownerToken, signal);
+      } else {
+        if (this.lifecycleDelivery) this.lifecycleDelivery.accountKey = item.character.accountKey;
+        await this.deliverLifecycleAudio(item, ownerToken, signal);
+      }
       if (this.lifecycleAudioInFlight()) return;
       // No settlement and no head movement means this step cannot make
       // progress; wait for the next explicit wake rather than re-enter.
@@ -1178,6 +1219,14 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
   }
   private async deliverLifecycleText(item: Readonly<LifecycleDeliveryItem>, ownerToken: string,
     signal: AbortSignal): Promise<void> {
+    if (!this.online.has(item.character.accountKey) && this.online.has(this.config.ingressAccountKey)
+      && this.lifecycleRevisionLiveStrict(item.request.executionRevision)) {
+      this.settleLifecycleDelivery(item, "lifecycle_account_offline_settle_failed", () => {
+        this.store.finishLifecycleSegment(item.segment.segmentId, "failed", "account_offline", ownerToken, this.now());
+      });
+      this.releaseInactiveLifecycleTranslationPrompts();
+      return;
+    }
     if (!this.lifecycleRevisionLiveStrict(item.request.executionRevision, item.character.accountKey)) return;
     let attempt: LifecycleAttempt;
     try {
@@ -1197,6 +1246,11 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
   }
   private async deliverLifecycleAudio(item: Readonly<LifecycleDeliveryItem>, ownerToken: string,
     signal: AbortSignal): Promise<void> {
+    if (!this.online.has(item.character.accountKey) && this.online.has(this.config.ingressAccountKey)
+      && this.lifecycleRevisionLiveStrict(item.request.executionRevision)) {
+      this.settleLifecycleTextOnly(item, "account_offline", ownerToken, this.now());
+      return;
+    }
     if (!this.lifecycleRevisionLiveStrict(item.request.executionRevision, item.character.accountKey)) return;
     const character = item.character;
     const language = this.config.characterLanguages[character.id]!;

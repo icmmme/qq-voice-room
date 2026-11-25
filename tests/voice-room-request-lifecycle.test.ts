@@ -3552,7 +3552,7 @@ test("B2-05 bridge status follows connectivity and pause while an old audio fenc
   peerB.terminate();
   await waitFor(() => bridge.status().online === 1, "peer disconnected");
   assert.partialDeepStrictEqual(bridge.status(), { worker: { connectedAccountCount: 1, phase: "ready",
-    ingressReady: false, textCanProgress: false, audioBlockReason: "audio_result_unknown" } });
+    ingressReady: true, textCanProgress: true, audioBlockReason: "audio_result_unknown" } });
   const statusNotices = notices.filter(notice => String(notice.type) === "runtime-status");
   assert.doesNotMatch(JSON.stringify(statusNotices), /canary|account-a|account-b|1000[0-3]/);
   assert.ok(!JSON.stringify(statusNotices).includes(oldFence!));
@@ -5299,6 +5299,194 @@ test("web fetch module blocks SSRF, routes GitHub/Jina/HTML fallback, masks thir
   const linkSkill = loadRoomSkill("deep-link-analysis");
   assert.ok(linkSkill.includes('<skill name="deep-link-analysis">'));
   assert.ok(linkSkill.includes("Analytical Lens"));
+});
+
+test("Module 3 natural ambient participation triggers on named mentions, open questions, and substantial topics/links", async t => {
+  const { ParticipationPolicy } = await import("../src/voice-room/participation-policy.js");
+  const cfg = checkRoomConfig(roomConfig());
+  const policy = new ParticipationPolicy(cfg);
+  const now = Date.parse("2026-11-25T15:00:00Z");
+  const baseCtx = {
+    now,
+    observedAt: now - 5000,
+    lastAttemptAt: null,
+    online: new Set(["account-a", "account-b"]),
+    paused: false,
+    stopped: false,
+    busy: false,
+    blockedTarget: false,
+    hasBudget: true,
+  };
+  const msg = (id: number, text: string, speakerId = "20001") => ({
+    id,
+    speakerType: "user" as const,
+    speakerId,
+    accountKey: "account-a",
+    targetId: null,
+    text,
+    platformId: String(90000 + id),
+    createdAt: now - 5000,
+  });
+
+  // Named mention (even without question mark)
+  const namedRes = policy.decide({ ...baseCtx, history: [msg(1, "我记得 Character A 之前提过类似的东西")], pendingIds: [1] });
+  assert.equal(namedRes.shouldReply, true);
+  assert.equal(namedRes.reason, "named-mention");
+
+  // Open question from a single speaker
+  const openQ = policy.decide({ ...baseCtx, history: [msg(2, "这套方案上线后会不会很卡？")], pendingIds: [2] });
+  assert.equal(openQ.shouldReply, true);
+  assert.equal(openQ.reason, "open-question");
+
+  // Natural topic / URL shared without explicit @
+  const urlTopic = policy.decide({ ...baseCtx, history: [msg(3, "https://github.com/XartLab/design-pipeline")], pendingIds: [3] });
+  assert.equal(urlTopic.shouldReply, true);
+  assert.equal(urlTopic.reason, "natural-topic");
+
+  const longTopic = policy.decide({ ...baseCtx, history: [msg(4, "我刚把本地部署脚本改完了，顺便加了个状态面板")], pendingIds: [4] });
+  assert.equal(longTopic.shouldReply, true);
+  assert.equal(longTopic.reason, "natural-topic");
+
+  // Trivial filler and short low-signal chat stay silent
+  const trivialRes = policy.decide({ ...baseCtx, history: [msg(5, "嗯嗯")], pendingIds: [5] });
+  assert.equal(trivialRes.shouldReply, false);
+  assert.equal(trivialRes.reason, "trivial");
+  const noSignalRes = policy.decide({ ...baseCtx, history: [msg(6, "哈哈真行")], pendingIds: [6] });
+  assert.equal(noSignalRes.shouldReply, false);
+  assert.equal(noSignalRes.reason, "no-signal");
+
+  // Single-account ambient batch filters offline secondary account from planner characters
+  let simNow = now;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ limits: { ambientQuietMs: 1000, ambientCooldownMs: 1, modelAttemptsPerHour: null } }),
+    deps: { now: () => simNow },
+    ambientPlanner: { plan: async () => ({ kind: "join", characterIds: ["character-a"] }) },
+    model: { generate: async () => ({ kind: "reply", segments: ["这个仓库设计流水线思路挺有意思"] }) },
+  });
+  assert.equal(h.receive("9601", "/room mode ambient"), "control");
+  h.room.setOnline("account-b", false);
+  assert.equal(h.receive("9602", "https://github.com/XartLab/design-pipeline"), "observed");
+  const anchor = h.room.store.historyPage(10).at(-1)!;
+  simNow += 1000;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  await h.room.whenIdle();
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  assert.deepEqual(h.ambientPlannerCalls[0]!.characters.map(c => c.id), ["character-a"]);
+  assert.equal(h.dispatches.length, 1);
+});
+
+test("NapCat resilience: secondary account disconnect keeps ingress ready, handles dual @ gracefully, and alerts after timeout", async () => {
+  const { startRoomQq } = await import("../src/voice-room/qq-server.js");
+  const { checkRoomConfig } = await import("../src/voice-room/config.js");
+  const dir = mkdtempSync(join(tmpdir(), "qq-room-resilience-"));
+  const personaA = join(dir, "a.md");
+  const personaB = join(dir, "b.md");
+  writeFileSync(personaA, "你是甲。");
+  writeFileSync(personaB, "你是乙。");
+
+  const notices: Array<{ type: string; code: string }> = [];
+  const actions: Array<{ account: string; text: string }> = [];
+  const bridge = await startRoomQq({
+    room: checkRoomConfig(roomConfig({ deliveryMode: "text" })),
+    dataDir: join(dir, "data"),
+    port: 0,
+    apiTimeoutMs: 500,
+    execution: "worker",
+    workerQueue: QUEUE,
+    closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 200, releaseMs: 200, writeWaitMs: 50 },
+    accounts: [
+      { accountKey: "account-a", token: "token-aaaaaaaaaaaaaaaa", personaFile: personaA },
+      { accountKey: "account-b", token: "token-bbbbbbbbbbbbbbbb", personaFile: personaB },
+    ],
+  }, {
+    persona: c => c.id === "character-a" ? "你是甲。" : "你是乙。",
+    permitsText: () => true,
+    lifecycleModel: {
+      generate: async prompt => ({
+        kind: "reply",
+        segments: [prompt.characterId === "character-a" ? "甲在线回复" : "乙恢复回复"],
+      }),
+    },
+  }, notice => { notices.push({ type: notice.type, code: notice.code }); }, undefined, {
+    disconnectGraceMs: 0,
+    offlineAlertMs: 80,
+    startupSingleAccountMs: 100,
+  });
+
+  const { WebSocket } = await import("ws");
+  const connect = (accountKey: string, selfId: string, token: string) => new Promise<InstanceType<typeof WebSocket>>((resolve, reject) => {
+    const ws = new WebSocket(`${bridge.url}/room/${accountKey}`, {
+      headers: { Authorization: `Bearer ${token}`, "x-self-id": selfId, "x-client-role": "Universal" },
+    });
+    ws.on("message", raw => {
+      const msg = JSON.parse(String(raw)) as { action?: string; params?: Record<string, unknown>; echo?: string };
+      if (msg.action && msg.echo) {
+        const message = msg.params?.message as Array<{ data?: { text?: string } }> | undefined;
+        actions.push({ account: accountKey, text: String(message?.[0]?.data?.text ?? "") });
+        ws.send(JSON.stringify({ status: "ok", retcode: 0, data: 99100 + actions.length, echo: msg.echo }));
+      }
+    });
+    ws.once("open", () => resolve(ws));
+    ws.once("error", reject);
+  });
+
+  let wsA: InstanceType<typeof WebSocket> | undefined;
+  let wsB: InstanceType<typeof WebSocket> | undefined;
+  let wsB2: InstanceType<typeof WebSocket> | undefined;
+  try {
+    wsA = await connect("account-a", "10002", "token-aaaaaaaaaaaaaaaa");
+    // Secondary account-b not connected at startup: fallback starts worker single-account
+    await waitFor(() => bridge.status().worker?.phase === "ready" && bridge.status().worker?.ingressReady === true, "single-account-startup");
+
+    // Connect and then drop account-b -> triggers offline alert after 80ms, while @a @b still delivers a
+    wsB = await connect("account-b", "10003", "token-bbbbbbbbbbbbbbbb");
+    await waitFor(() => bridge.status().online === 2, "two-online");
+    wsB.terminate();
+    await waitFor(() => notices.some(n => n.code === "account-offline-alert"), "offline-alert-emitted");
+    assert.equal(bridge.status().worker?.ingressReady, true);
+
+    wsA.send(JSON.stringify({
+      post_type: "message",
+      message_type: "group",
+      group_id: 10000,
+      user_id: 10001,
+      self_id: 10002,
+      message_id: 97001,
+      message: [
+        { type: "at", data: { qq: "10002" } },
+        { type: "at", data: { qq: "10003" } },
+        { type: "text", data: { text: " 你们谁在线？" } },
+      ],
+    }));
+
+    await waitFor(() => bridge.room.store.lifecycleRequests().length === 1
+      && bridge.room.store.lifecycleRequests()[0]!.status === "completed", "degraded-dual-mention-completed");
+    assert.ok(actions.some(a => a.account === "account-a" && a.text.includes("连接已断开")));
+    assert.ok(actions.some(a => a.account === "account-a" && a.text === "甲在线回复"));
+
+    // Reconnect account-b and verify dual operation recovers
+    wsB2 = await connect("account-b", "10003", "token-bbbbbbbbbbbbbbbb");
+    await waitFor(() => bridge.status().online === 2, "account-b-recovered");
+    wsA.send(JSON.stringify({
+      post_type: "message",
+      message_type: "group",
+      group_id: 10000,
+      user_id: 10001,
+      self_id: 10002,
+      message_id: 97002,
+      message: [
+        { type: "at", data: { qq: "10003" } },
+        { type: "text", data: { text: " 欢迎回来" } },
+      ],
+    }));
+    await waitFor(() => actions.some(a => a.account === "account-b" && a.text === "乙恢复回复"), "recovered-b-delivered");
+  } finally {
+    wsA?.terminate();
+    wsB?.terminate();
+    wsB2?.terminate();
+    await bridge.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("deep URL summary uses webEvidence, multi-paragraph output, QQ forward card, and Strategy A (zero TTS)", async () => {
