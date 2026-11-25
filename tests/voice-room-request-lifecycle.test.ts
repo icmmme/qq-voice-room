@@ -6470,3 +6470,60 @@ test("VoiceRoom lifecycle handles pure image+@bot with vision off and vision on 
   assert.equal(on.reqJson.includes(Buffer.from(pngBytes).toString("base64")), false);
   assert.equal(on.segJson.includes(Buffer.from(pngBytes).toString("base64")), false);
 });
+
+test("direct @ requests receive web tools autonomously without relying on keyword regexes", async () => {
+  const { createRoomWebToolkit } = await import("../src/voice-room/web.js");
+  const web = createRoomWebToolkit({
+    exaApiKey: "exa-test-key",
+    fetchImpl: (async () => new Response(JSON.stringify({ results: [] }), { status: 200 })) as typeof fetch,
+  });
+  let capturedWebCount = 0;
+  let capturedPromptSystem = "";
+  const root = mkdtempSync(join(tmpdir(), "qq-room-autosearch-"));
+  const checkedConfig = checkRoomConfig(roomConfig({ deliveryMode: "text" }));
+  const deps: RoomDependencies = {
+    now: () => Date.parse("2026-11-25T16:00:00Z"),
+    persona: character => `# ${character.name}\nSynthetic public persona.`,
+    synthesize: async () => new Uint8Array([1, 2, 3]),
+    permitsText: () => true,
+    permitsPrompt: () => true,
+  };
+  const room = new VoiceRoom(join(root, "room.sqlite"), checkedConfig, deps, { execution: "lifecycle" });
+  const dispatches: Array<{ text: string }> = [];
+  let sent = 0;
+  await room.startLifecycleProductionWorker({
+    web,
+    model: {
+      generate: async (prompt, _signal, _maxChars, options) => {
+        capturedPromptSystem = prompt.systemPrompt;
+        if (options?.web) capturedWebCount += 1;
+        return { kind: "reply", segments: ["查了一下，t3code 最近主要围绕模型配额和工具流改进在更新。"] };
+      },
+    },
+    apiTimeoutMs: 100,
+    closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 100, releaseMs: 100, writeWaitMs: 50 },
+    dispatch: async request => {
+      dispatches.push({ text: request.item.segment.text });
+      const messageId = String(710000 + ++sent);
+      request.beforeSend();
+      await request.observe({ kind: "ack", messageId });
+      request.released();
+      return messageId;
+    },
+    beginClose: () => {},
+    sealObservations: async () => {},
+  });
+  for (const character of checkedConfig.characters) room.setOnline(character.accountKey, true);
+  try {
+    // Message has NO deep keywords ("啥情况"), yet web tool is still provided autonomously
+    assert.equal(room.receiveLifecycle(roomInput("99301", "t3code 啥情况", ["10002"]), QUEUE), "scheduled");
+    await room.whenIdle();
+    assert.equal(capturedWebCount, 1);
+    assert.ok(!capturedPromptSystem.includes("本请求完全离线且 tools-free"));
+    assert.ok(capturedPromptSystem.includes("可自主调用 web_search"));
+    assert.equal(dispatches.length, 1);
+  } finally {
+    await room.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

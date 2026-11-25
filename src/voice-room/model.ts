@@ -292,7 +292,7 @@ function buildWebTools(web: RoomWebToolkit): Tool[] {
   if (web.hasSearch) {
     tools.unshift({
       name: "web_search",
-      description: "Search the public web for up-to-date facts, articles, documentation, or technical references.",
+      description: "Search the public web ONLY when you need up-to-date facts, recent events/news, external projects/docs you are unsure of, or when the user asks to look something up. Do NOT call for greetings, casual banter, or questions answerable from conversation context.",
       parameters: {
         type: "object",
         properties: {
@@ -571,18 +571,21 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
     const activeProvider = useDedicatedVision ? "room-vision-provider" : "room-provider";
     const activeModelId = useDedicatedVision ? config.visionModelId! : config.modelId;
     const maxSegments = options.maxSegments ?? (deep ? ROOM_LIFECYCLE_DEEP_MAX_SEGMENTS : 2);
+    const web = options.web;
+    const tools: Tool[] = web ? buildWebTools(web) : [];
+    const allowStructuredSearchReserve = !deep && Boolean(web?.hasSearch);
     const targetMaxTokens = deep
       ? Math.max(1, Math.min(Math.max(config.maxTokens, 4096), ROOM_LIFECYCLE_DEEP_MAX_TOKENS))
-      : Math.max(1, Math.min(config.maxTokens, ROOM_LIFECYCLE_MAX_TOKENS));
+      : allowStructuredSearchReserve
+        ? Math.max(1, Math.min(config.maxTokens, 4096))
+        : Math.max(1, Math.min(config.maxTokens, ROOM_LIFECYCLE_MAX_TOKENS));
     const maxTokens = Math.max(256, Math.min(targetMaxTokens, Math.max(256, config.contextWindow - 2048)));
     const primaryThinking = resolveThinkingPayload(config, deep, config.modelId);
     let currentThinking = resolveThinkingPayload(config, deep, activeModelId);
     let diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, currentThinking.disableRequested);
-    const web = deep ? options.web : undefined;
-    const tools: Tool[] = web ? buildWebTools(web) : [];
 
     const toolGuidance = web?.hasSearch
-      ? "For fresh, time-sensitive, or verifiable external facts, call web_search first, and use web_fetch to read authoritative URLs when search snippets are not enough (at most 3 rounds total). If search returns empty or provider_error/blocked/unavailable, answer honestly without fabricating sources or dates."
+      ? "For fresh, time-sensitive, or verifiable external facts, call web_search first, and use web_fetch to read authoritative URLs when search snippets are not enough (at most 3 rounds total). Do NOT call search tools for greetings or casual chat. If search returns empty or provider_error/blocked/unavailable, answer honestly without fabricating sources or dates."
       : web
         ? "Only web_fetch is available to read explicit public URLs (there is no live web search engine); never claim to have searched the web."
         : "This request is tools-free. Never emit a tool call.";
@@ -594,7 +597,14 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
 - A skip is encoded as {"kind":"skip"}.
 - A reply is encoded as {"kind":"reply","segments":[string,...]} with 1 to ${maxSegments} well-structured, logical paragraphs.
 - Each paragraph must be non-empty and at most ${maxChars} Unicode characters.`
-      : `\n\nLifecycle output protocol (overrides every earlier instruction):
+      : web?.hasSearch
+        ? `\n\nLifecycle output protocol (overrides every earlier instruction):
+- ${toolGuidance}
+- Return ONLY one JSON object with no markdown.
+- A skip is encoded as {"kind":"skip"}.
+- A reply is encoded as {"kind":"reply","segments":[string,...]} (1–2 short casual lines when no search was needed, or up to ${maxSegments} structured paragraphs if presenting searched facts).
+- Each segment must be non-empty and at most ${maxChars} Unicode characters.`
+        : `\n\nLifecycle output protocol (overrides every earlier instruction):
 - This request is tools-free. Never emit a tool call.
 - Return exactly one JSON object with no markdown.
 - A skip is encoded as {"kind":"skip"}.
@@ -638,6 +648,7 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
       const seenCalls = new Set<string>();
       const totalRounds = tools.length > 0 ? ROOM_MAX_TOOL_ROUNDS + 1 : 1;
       let disableToolsFallback = false;
+      let usedWebTools = false;
       for (let round = 0; round < totalRounds; round++) {
         signal.throwIfAborted();
         if (round > 0) {
@@ -712,6 +723,7 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
           : [];
 
         if (toolCalls.length > 0 && web) {
+          usedWebTools = true;
           currentMessages.push(result);
           const remainingAfterAssistant = Math.max(0, inputBudget - estimateTranscriptTokens(currentSystemPrompt, currentMessages));
           const usableTokens = Math.max(0, remainingAfterAssistant - TOOL_ROUND_SAFETY_RESERVE);
@@ -723,7 +735,7 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
           continue;
         }
 
-        if (deep || hasImages) {
+        if (deep || hasImages || usedWebTools) {
           return parseDeepLifecycleAnswer(result.stopReason, result.content, maxSegments, maxChars);
         }
         return parseRoomLifecycleAnswer(result.stopReason, result.content, maxSegments);
