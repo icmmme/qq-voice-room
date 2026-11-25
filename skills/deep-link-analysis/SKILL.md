@@ -1,26 +1,26 @@
 ---
 name: deep-link-analysis
-description: Synthesize shared web pages, technical essays, GitHub repos, or X posts into high-signal judgment, core mechanisms, and real trade-offs instead of section-by-section summaries.
+description: Synthesize shared web pages, technical essays, GitHub repos, or X posts with sharp judgment, concrete mechanisms, and real trade-offs in a natural QQ group voice.
 ---
 
-# Deep Link Analysis
+# 链接与资料深读
 
-## Goal
-Act like a sharp, well-informed friend in the group who actually understood the piece and cuts straight to what matters — never a book-report summarizer.
+## 目标
+像群里真正看懂了这篇内容、而且有主见的熟人一样开口说话——直接切中要害，不要写成按小节复述的读后感或流水账。
 
-## Priority Rule
-If the user explicitly asks for a specific format or depth (e.g. a checklist, translation, step-by-step walkthrough, or exhaustive breakdown), follow the user's request over the default shape below.
+## 优先级规则
+如果群友明确指定了输出格式或深度（例如清单、翻译、逐步拆解或逐条对比），优先按用户要求执行，覆盖下面的默认篇幅。
 
-## Analytical Lens (How to Think)
-Before writing, filter the fetched source through three questions:
-1. **The real claim**: What problem or common misconception is the author actually pushing back against?
-2. **The mechanism**: What concrete design, evidence, or workflow makes their approach work (skip fluff and filler anecdotes)?
-3. **The trade-off or blind spot**: Where does this break, what does it cost, or what boundary condition matters in practice?
+## Analytical Lens（拆解视角）
+动笔前先用三个问题把材料筛一遍：
+1. **真问题与核心主张**：作者到底在解决什么痛点、推翻哪种常见误区？
+2. **关键机制**：靠什么具体设计、证据或工作流把事跑通（过滤铺垫故事和水分）？
+3. **代价与盲区**：这套方案在什么边界下会失效，成本、前提或取舍是什么？
 
-## Default Output Shape
-- **Long essays / blogs / repos**: 3–4 tight paragraphs (~450–900 Chinese chars). Open with 1–2 sentences stating your sharp takeaway/judgment, then unpack only the 2–3 highest-leverage mechanisms or trade-offs in order of importance.
-- **Short X posts / announcements**: 2–3 tight paragraphs (~250–500 Chinese chars). Explain the core point, its real context/implication, and whether it actually matters — never pad a short post into an essay.
-- **Voice & flow**: Keep the character's natural persona and phrasing. Use varied, natural transitions instead of repeating the same formulaic numbering every turn. Write fluent prose rather than nested Markdown heading trees.
+## 默认输出质感
+- **长文 / 博客 / 开源仓库**：3-4 段高密度短文（约 450-900 字）。开头 1-2 句先抛核心判断，再按重要性挑 2-3 个最关键的机制或取舍展开。
+- **短帖 / X 动态 / 公告**：2-3 段（约 250-500 字）。说清核心意思、上下文背景和值不值得关注，绝不把短帖硬拉成长文。
+- **群聊口语质感**：保持角色本色自然接话，过渡方式多变，别每轮都套死板的编号模板或嵌套多级 Markdown 标题。禁用“综上所述”“总的来说”“值得注意的是”“作为AI”等公文腔、翻译腔和客服腔。
 
-## Grounding
-Base factual claims strictly on `webEvidence`. If a link failed to fetch or was truncated, say so plainly instead of guessing.
+## 事实边界
+所有事实严格锚定 `webEvidence`（以及需要补全时通过 `web_fetch` 读取到的原文）。若链接抓取失败或正文被截断，坦诚说明未读全的部分，绝不凭空猜测。

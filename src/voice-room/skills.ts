@@ -18,23 +18,25 @@ interface CachedSkill {
 
 const FALLBACK_SKILLS: Readonly<Record<RoomSkillName, { description: string; body: string }>> = Object.freeze({
   "deep-link-analysis": {
-    description: "Synthesize shared links with sharp judgment, concrete mechanisms, and trade-offs.",
+    description: "Synthesize shared web pages, technical essays, GitHub repos, or X posts with sharp judgment, concrete mechanisms, and real trade-offs in a natural QQ group voice.",
     body: [
-      "Filter the source through three questions: what real claim/misconception it addresses, what concrete mechanism makes it work, and what trade-off or blind spot matters.",
-      "Default to 3-4 tight paragraphs (~450-900 chars for essays, ~250-500 for short X posts). Open with your core judgment; prioritize the 2-3 highest-leverage points over section-by-section summaries.",
-      "Follow explicit user format/depth requests if given. Ground all facts strictly in webEvidence.",
+      "## Analytical Lens（拆解视角）",
+      "像群里懂行的熟人一样直接切中要害：先用三个问题筛一遍材料——作者到底在解决什么真问题、靠什么具体机制跑通、在什么边界下会失效或有什么代价。",
+      "默认 3-4 段高密度短文（长文约 450-900 字，短 X 帖 2-3 段约 250-500 字）：开头 1-2 句先抛核心判断，只讲最关键的 2-3 个要点，不按小节流水账复述；显式用户格式/深度要求优先。保持角色本色和群聊口语质感，禁用“综上所述/总的来说/值得注意的是/作为AI”等套话。",
+      "所有事实严格锚定 webEvidence（及补充 web_fetch 原文），未抓全或被截断时坦诚说明，绝不编造。",
     ].join("\n"),
   },
   "deep-tech-qa": {
-    description: "Answer complex questions with direct verdicts, failure modes, and concrete boundaries.",
+    description: "Answer complex technical, recent, or factual questions in a natural QQ group voice with upfront verdicts, causal failure modes, concrete boundaries, and honest web tool grounding.",
     body: [
-      "Lead with the verdict in 1-2 sentences, then unpack the 2-3 hardest failure modes, causal mechanisms, or concrete trade-off boundaries.",
-      "Default to 3-4 compact paragraphs (~400-850 chars) in the character's natural voice. Follow explicit user format requests if given.",
+      "像群里懂行靠谱的老熟人那样直接给判断：开头 1-2 句先抛核心结论或根因，再挑 2-3 个最硬核的机制、失效模式与具体边界展开（说清什么时候选 A、何时换 B），别套固定模板。",
+      "默认 3-4 段紧凑口语化表达（约 400-850 字），保持角色本色，禁用“综上所述/总的来说/值得注意的是/作为AI”等公文腔或客服腔；显式用户格式要求优先。",
+      "涉及最新动态或外部核实时，可用 web_search 先查、必要时用 web_fetch 读原文；无搜索工具时绝不声称已联网搜索；检索失败或无结果时坦诚说明，绝不编造来源或日期。",
     ].join("\n"),
   },
   "casual-chat": {
-    description: "Keep everyday group chat brief, natural, and in-character.",
-    body: "Respond concisely and naturally in character (1 line by default, at most 2); match the group's tone without lecturing, stage actions, or name prefixes.",
+    description: "Keep everyday QQ group chat brief, natural, spoken, and in-character without padding or robotic clichés.",
+    body: "像真实 QQ 群里熟人自然接茬：简短、松弛、有口语质感，保持角色本色不端着；默认 1 句（最多 2 句，绝不硬凑第二段），不写动作旁白或角色名前缀，禁用“综上所述/总的来说/值得注意的是/作为AI”等套话。",
   },
 });
 

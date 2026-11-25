@@ -5612,3 +5612,364 @@ test("deep URL summary uses webEvidence, multi-paragraph output, QQ forward card
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("isDeepRequest triggers on no-link search and factual intents while keeping casual chat fast", async () => {
+  const { isDeepRequest } = await import("../src/voice-room/web.js");
+  assert.equal(isDeepRequest("查一下 Node 24 最新特性", false), true);
+  assert.equal(isDeepRequest("搜一下 DeepSeek V4 最新消息", false), true);
+  assert.equal(isDeepRequest("什么是 MCP 协议", false), true);
+  assert.equal(isDeepRequest("TypeScript 5.8 release notes", false), true);
+  assert.equal(isDeepRequest("pnpm 报错怎么解决", false), true);
+
+  assert.equal(isDeepRequest("最近咋样", false), false);
+  assert.equal(isDeepRequest("吃饭了吗", false), false);
+  assert.equal(isDeepRequest("早安", false), false);
+  assert.equal(isDeepRequest("hi", false), false);
+});
+
+test("searchPublicWebDetailed supports Bocha -> Exa -> Tavily failover, outcome status, and hit hygiene", async () => {
+  const { searchPublicWebDetailed, searchPublicWeb } = await import("../src/voice-room/web.js");
+
+  // 1. Bocha 500 -> Exa success + URL dedupe + whitespace normalization + empty snippet fallback
+  const callOrder1: string[] = [];
+  const fetchBochaFailExaOk = (async (input: string | URL | Request) => {
+    const url = String(input);
+    callOrder1.push(url);
+    if (url.includes("bochaai.com")) {
+      return new Response("upstream error", { status: 500 });
+    }
+    if (url.includes("exa.ai")) {
+      return new Response(JSON.stringify({
+        results: [
+          {
+            title: "  Node.js   v24\nRelease  ",
+            url: "https://nodejs.org/en/blog/v24",
+            text: "  V8\tupgrade   and\npermission model  ",
+            publishedDate: "  2026-05-06T00:00:00Z  ",
+          },
+          {
+            title: "Duplicate URL",
+            url: "https://nodejs.org/en/blog/v24",
+            text: "Should be deduplicated",
+          },
+          {
+            title: "Title Only Entry",
+            url: "https://example.org/title-only",
+            text: "   ",
+            publishedDate: "SECRET_DATE",
+          },
+        ],
+      }), { status: 200 });
+    }
+    throw new Error("unexpected provider");
+  }) as typeof fetch;
+
+  const sanitize = (text: string) => text.includes("SECRET") ? null : text;
+  const res1 = await searchPublicWebDetailed("Node 24", {
+    bochaApiKey: "bocha-k",
+    exaApiKey: "exa-k",
+    tavilyApiKey: "tavily-k",
+    fetchImpl: fetchBochaFailExaOk,
+    sanitizeText: sanitize,
+  });
+  assert.equal(res1.status, "ok");
+  assert.equal(res1.provider, "exa");
+  assert.deepEqual(callOrder1, ["https://api.bochaai.com/v1/web-search", "https://api.exa.ai/search"]);
+  assert.equal(res1.hits.length, 2);
+  assert.equal(res1.hits[0]!.title, "Node.js v24 Release");
+  assert.equal(res1.hits[0]!.snippet, "V8 upgrade and permission model");
+  assert.equal(res1.hits[0]!.publishedDate, "2026-05-06T00:00:00Z");
+  assert.equal(res1.hits[1]!.snippet, "Title Only Entry");
+  assert.equal(res1.hits[1]!.publishedDate, undefined);
+
+  // 2. Exa 200 empty -> Tavily success
+  const fetchExaEmptyTavilyOk = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.includes("exa.ai")) return new Response(JSON.stringify({ results: [] }), { status: 200 });
+    if (url.includes("tavily.com")) {
+      return new Response(JSON.stringify({
+        results: [{ title: "Tavily Hit", url: "https://tavily.example.org/doc", content: "Clean summary", published_date: "2026-11-01" }],
+      }), { status: 200 });
+    }
+    return new Response("err", { status: 500 });
+  }) as typeof fetch;
+  const res2 = await searchPublicWebDetailed("MCP spec", {
+    exaApiKey: "exa-k",
+    tavilyApiKey: "tavily-k",
+    fetchImpl: fetchExaEmptyTavilyOk,
+  });
+  assert.equal(res2.status, "ok");
+  assert.equal(res2.provider, "tavily");
+  assert.equal(res2.hits[0]!.title, "Tavily Hit");
+  const legacyHits = await searchPublicWeb("MCP spec", { exaApiKey: "exa-k", tavilyApiKey: "tavily-k", fetchImpl: fetchExaEmptyTavilyOk });
+  assert.equal(legacyHits.length, 1);
+
+  // 3. All providers error -> provider_error; all 200 empty -> empty; no keys -> unavailable; privacy -> blocked
+  const fetchAllFail = (async () => new Response("bad gateway", { status: 502 })) as typeof fetch;
+  const errRes = await searchPublicWebDetailed("query", { bochaApiKey: "b", tavilyApiKey: "t", fetchImpl: fetchAllFail });
+  assert.equal(errRes.status, "provider_error");
+  assert.equal(errRes.hits.length, 0);
+
+  const fetchAllEmpty = (async () => new Response(JSON.stringify({ results: [] }), { status: 200 })) as typeof fetch;
+  const emptyRes = await searchPublicWebDetailed("query", { exaApiKey: "e", fetchImpl: fetchAllEmpty });
+  assert.equal(emptyRes.status, "empty");
+
+  const unavailRes = await searchPublicWebDetailed("query", {});
+  assert.equal(unavailRes.status, "unavailable");
+
+  const blockedRes = await searchPublicWebDetailed("my SECRET token", { tavilyApiKey: "t", sanitizeText: sanitize });
+  assert.equal(blockedRes.status, "blocked");
+
+  // 4. Abort stops failover immediately
+  const ac = new AbortController();
+  let abortCalls = 0;
+  const fetchAbort = (async () => {
+    abortCalls++;
+    ac.abort(new Error("user-cancelled"));
+    throw new Error("aborted");
+  }) as typeof fetch;
+  await assert.rejects(
+    searchPublicWebDetailed("abort test", { bochaApiKey: "b", exaApiKey: "e", fetchImpl: fetchAbort }, ac.signal),
+  );
+  assert.equal(abortCalls, 1);
+});
+
+test("roomLifecycleGenerator runs multi-round web_search + web_fetch, handles search failure, dedupes, compacts budget, and falls back tools-free", async t => {
+  const { createServer } = await import("node:http");
+  const { roomLifecycleGenerator } = await import("../src/voice-room/model.js");
+  const { createRoomWebToolkit } = await import("../src/voice-room/web.js");
+
+  interface RecordedRequest {
+    readonly tools?: unknown[];
+    readonly response_format?: unknown;
+    readonly messages: Array<{ role: string; content?: unknown; tool_calls?: unknown[] }>;
+  }
+
+  type PlannedResponse =
+    | { readonly kind: "http-error"; readonly status: number; readonly body: string }
+    | { readonly kind: "tool-calls"; readonly calls: ReadonlyArray<{ id: string; name: string; arguments: string }> }
+    | { readonly kind: "text"; readonly text: string };
+
+  const startMockSse = async () => {
+    const requests: RecordedRequest[] = [];
+    let queue: PlannedResponse[] = [];
+    const server = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", chunk => chunks.push(chunk as Buffer));
+      req.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as RecordedRequest;
+        requests.push(body);
+        const next = queue.shift() ?? { kind: "text", text: JSON.stringify({ kind: "reply", segments: ["fallback"] }) };
+        if (next.kind === "http-error") {
+          res.writeHead(next.status, { "Content-Type": "application/json" });
+          res.end(next.body);
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+        const writeChunk = (payload: unknown) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        if (next.kind === "tool-calls") {
+          writeChunk({
+            id: "chatcmpl-tool",
+            object: "chat.completion.chunk",
+            model: "mock-model",
+            choices: [{
+              index: 0,
+              delta: {
+                role: "assistant",
+                tool_calls: next.calls.map((c, idx) => ({
+                  index: idx,
+                  id: c.id,
+                  type: "function",
+                  function: { name: c.name, arguments: c.arguments },
+                })),
+              },
+              finish_reason: null,
+            }],
+          });
+          writeChunk({
+            id: "chatcmpl-tool",
+            object: "chat.completion.chunk",
+            model: "mock-model",
+            choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+          });
+        } else {
+          writeChunk({
+            id: "chatcmpl-text",
+            object: "chat.completion.chunk",
+            model: "mock-model",
+            choices: [{
+              index: 0,
+              delta: { role: "assistant", content: next.text },
+              finish_reason: null,
+            }],
+          });
+          writeChunk({
+            id: "chatcmpl-text",
+            object: "chat.completion.chunk",
+            model: "mock-model",
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          });
+        }
+        res.write("data: [DONE]\n\n");
+        res.end();
+      });
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", () => resolve()));
+    const address = server.address() as AddressInfo;
+    t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+    return {
+      baseUrl: `http://127.0.0.1:${address.port}/v1`,
+      requests,
+      reset(planned: PlannedResponse[]) {
+        requests.length = 0;
+        queue = [...planned];
+      },
+    };
+  };
+
+  const sse = await startMockSse();
+  const dataDir = mkdtempSync(join(tmpdir(), "qq-room-model-loop-"));
+  t.after(() => rmSync(dataDir, { recursive: true, force: true }));
+
+  const modelCfg: ModelConfig = {
+    baseUrl: sse.baseUrl,
+    modelId: "mock-model",
+    apiKey: "mock-key",
+    contextWindow: 12000,
+    maxTokens: 1024,
+    requestTimeoutMs: 5000,
+  };
+  const generate = roomLifecycleGenerator(modelCfg, dataDir);
+  const prompt = {
+    characterId: "character-a",
+    accountKey: "account-a",
+    voiceKey: "voice-a",
+    personaHash: "hash-a",
+    targetId: 1,
+    systemPrompt: "你是群里的技术老哥。",
+    tools: [] as const,
+    messages: [{ role: "user" as const, content: JSON.stringify({ question: "查一下 Node 24 最新特性" }) }] as const,
+  };
+
+  // 1. Multi-round web_search -> web_fetch -> final JSON reply
+  const webMockFetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.includes("exa.ai")) {
+      return new Response(JSON.stringify({
+        results: [{ title: "Node 24 Release", url: "https://nodejs.org/en/blog/release/v24.0.0", text: "V8 13.6 and global URLPattern" }],
+      }), { status: 200 });
+    }
+    if (url.startsWith("https://r.jina.ai/https://nodejs.org/en/blog/release/v24.0.0")) {
+      return new Response("Title: Node 24\nMarkdown Content:\nNode.js 24 brings V8 13.6, npm 11, and global URLPattern support.", { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  }) as typeof fetch;
+  const webOk = createRoomWebToolkit({ exaApiKey: "exa-k", fetchImpl: webMockFetch });
+
+  sse.reset([
+    { kind: "tool-calls", calls: [{ id: "c1", name: "web_search", arguments: JSON.stringify({ query: "Node 24 features" }) }] },
+    { kind: "tool-calls", calls: [{ id: "c2", name: "web_fetch", arguments: JSON.stringify({ url: "https://nodejs.org/en/blog/release/v24.0.0" }) }] },
+    { kind: "text", text: JSON.stringify({ kind: "reply", segments: ["Node 24 刚升级了 V8 13.6。", "顺带把 URLPattern 直接挂全局了。"] }) },
+  ]);
+  const ans1 = await generate(prompt, new AbortController().signal, 2000, { deep: true, web: webOk });
+  assert.deepEqual(ans1, { kind: "reply", segments: ["Node 24 刚升级了 V8 13.6。", "顺带把 URLPattern 直接挂全局了。"] });
+  assert.equal(sse.requests.length, 3);
+  const round1ToolMsg = sse.requests[1]!.messages.find(m => m.role === "tool");
+  assert.ok(String(round1ToolMsg?.content).includes('"status":"ok"'));
+  assert.ok(String(round1ToolMsg?.content).includes('"provider":"exa"'));
+  const round2ToolMsgs = sse.requests[2]!.messages.filter(m => m.role === "tool");
+  assert.equal(round2ToolMsgs.length, 2);
+  assert.ok(String(round2ToolMsgs[1]?.content).includes("URLPattern"));
+
+  // 2. Search provider_error graceful degradation
+  const webErr = createRoomWebToolkit({
+    exaApiKey: "exa-k",
+    fetchImpl: (async () => new Response("server down", { status: 503 })) as typeof fetch,
+  });
+  sse.reset([
+    { kind: "tool-calls", calls: [{ id: "c3", name: "web_search", arguments: JSON.stringify({ query: "DeepSeek V4 release" }) }] },
+    { kind: "text", text: JSON.stringify({ kind: "reply", segments: ["刚联网查了下但搜索源挂了，没拿到一手消息，这里先不瞎猜日期。"] }) },
+  ]);
+  const ans2 = await generate(prompt, new AbortController().signal, 2000, { deep: true, web: webErr });
+  assert.equal(ans2.kind, "reply");
+  const errToolMsg = sse.requests[1]!.messages.find(m => m.role === "tool");
+  assert.ok(String(errToolMsg?.content).includes('"status":"provider_error"'));
+
+  // 3. Duplicate tool call guard + tool-result context-budget compaction
+  const tightModelCfg: ModelConfig = { ...modelCfg, contextWindow: 8500, maxTokens: 4096 };
+  const generateTight = roomLifecycleGenerator(tightModelCfg, dataDir);
+  let fetchCalls = 0;
+  const bloatedWeb = {
+    hasSearch: true,
+    search: async () => [],
+    searchDetailed: async () => ({ status: "ok" as const, provider: "exa" as const, hits: [{ title: "H", url: "https://example.org/giant", snippet: "S" }] }),
+    fetchUrl: async () => {
+      fetchCalls++;
+      return {
+        kind: "page" as const,
+        url: "https://example.org/giant",
+        title: "Giant Page",
+        content: "Dense technical detail about runtime internals. ".repeat(450),
+        truncated: false,
+      };
+    },
+  };
+  sse.reset([
+    {
+      kind: "tool-calls",
+      calls: [
+        { id: "d1", name: "web_search", arguments: JSON.stringify({ query: "Node 24" }) },
+        { id: "d2", name: "web_fetch", arguments: JSON.stringify({ url: "https://example.org/giant" }) },
+      ],
+    },
+    {
+      kind: "tool-calls",
+      calls: [{ id: "d3", name: "web_search", arguments: JSON.stringify({ query: "  node   24 " }) }],
+    },
+    { kind: "text", text: JSON.stringify({ kind: "reply", segments: ["压缩上下文后依然顺利完成总结。"] }) },
+  ]);
+  const ans3 = await generateTight(prompt, new AbortController().signal, 2000, { deep: true, web: bloatedWeb });
+  assert.deepEqual(ans3, { kind: "reply", segments: ["压缩上下文后依然顺利完成总结。"] });
+  assert.equal(fetchCalls, 1);
+  const dupMsg = sse.requests[2]!.messages.filter(m => m.role === "tool").at(-1);
+  assert.ok(String(dupMsg?.content).includes('"duplicate":true'));
+
+  // 4. Round-0 tools-free fallback when provider rejects tool schema
+  sse.reset([
+    { kind: "http-error", status: 400, body: JSON.stringify({ error: { message: "tools not supported" } }) },
+    { kind: "text", text: JSON.stringify({ kind: "reply", segments: ["退回到无工具模式后也正常回答了。"] }) },
+  ]);
+  const ans4 = await generate(prompt, new AbortController().signal, 2000, { deep: true, web: webOk });
+  assert.deepEqual(ans4, { kind: "reply", segments: ["退回到无工具模式后也正常回答了。"] });
+  assert.equal(sse.requests.length, 2);
+  assert.ok((sse.requests[0]!.tools?.length ?? 0) > 0);
+  assert.equal(sse.requests[1]!.tools?.length ?? 0, 0);
+  assert.deepEqual(sse.requests[1]!.response_format, { type: "json_object" });
+});
+
+test("room skills provide idiomatic Chinese QQ group-chat guidance with Analytical Lens and grounding", async () => {
+  const { listRoomSkills, loadRoomSkill } = await import("../src/voice-room/skills.js");
+  const index = listRoomSkills();
+  assert.equal(index.length, 3);
+  for (const item of index) {
+    assert.ok(item.description.length > 10);
+  }
+  const linkSkill = loadRoomSkill("deep-link-analysis");
+  assert.ok(linkSkill.includes("Analytical Lens"));
+  assert.ok(linkSkill.includes("webEvidence"));
+  assert.ok(linkSkill.includes("web_fetch"));
+  assert.ok(linkSkill.includes("综上所述"));
+
+  const qaSkill = loadRoomSkill("deep-tech-qa");
+  assert.ok(qaSkill.includes("Analytical Lens"));
+  assert.ok(qaSkill.includes("web_search"));
+  assert.ok(qaSkill.includes("web_fetch"));
+
+  const casualSkill = loadRoomSkill("casual-chat");
+  assert.ok(casualSkill.includes("QQ 群"));
+
+  // Fallback skills when skillsDir does not exist
+  const missingDir = join(tmpdir(), "qq-room-nonexistent-skills-dir");
+  assert.ok(loadRoomSkill("deep-link-analysis", missingDir).includes("Analytical Lens"));
+  assert.ok(loadRoomSkill("deep-tech-qa", missingDir).includes("web_search"));
+});
