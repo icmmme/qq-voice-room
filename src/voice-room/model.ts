@@ -11,7 +11,7 @@ export const ROOM_MODEL_ROUND_TIMEOUT_MS = 90000;
 export const ROOM_LIFECYCLE_MAX_TOKENS = 1024;
 export const ROOM_LIFECYCLE_DEEP_MAX_TOKENS = 6144;
 export const ROOM_LIFECYCLE_PROTOCOL_RESERVE_TOKENS = 256;
-export const ROOM_LIFECYCLE_DEEP_MAX_SEGMENTS = 6;
+export const ROOM_LIFECYCLE_DEEP_MAX_SEGMENTS = 12;
 const ROOM_MAX_TOOL_ROUNDS = 3;
 const ROOM_MAX_TOOL_CALLS_PER_ROUND = 3;
 
@@ -86,21 +86,110 @@ export function parseRoomLifecycleAnswer(stopReason: string,
   throw new RoomModelError("invalid-schema");
 }
 
-function proseToSegments(text: string, maxSegments: number, maxChars: number): readonly string[] | null {
-  const cleaned = text.replace(/\r\n?/g, "\n").trim();
-  if (!cleaned || cleaned.includes("\0") || cleaned.startsWith("{") || cleaned.startsWith("```")) return null;
-  const paragraphs = cleaned.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
-  if (!paragraphs.length) return null;
+function normalizeDeepSegments(rawSegments: readonly string[], maxSegments: number, maxChars: number): readonly string[] | null {
+  const expanded: string[] = [];
+  for (const raw of rawSegments) {
+    const cleaned = raw.replace(/\r\n?/g, "\n").trim();
+    if (!cleaned || cleaned.includes("\0")) continue;
+    if ([...cleaned].length <= maxChars) {
+      expanded.push(cleaned);
+      continue;
+    }
+    // Split overlong paragraphs cleanly at newline or sentence boundaries.
+    let rest = cleaned;
+    while ([...rest].length > maxChars) {
+      const slice = [...rest].slice(0, maxChars).join("");
+      const breakAt = Math.max(slice.lastIndexOf("\n"), slice.lastIndexOf("。"), slice.lastIndexOf("！"), slice.lastIndexOf("？"), slice.lastIndexOf(". "));
+      const cut = breakAt >= Math.floor(slice.length * 0.4) ? breakAt + 1 : slice.length;
+      expanded.push(rest.slice(0, cut).trim());
+      rest = rest.slice(cut).trim();
+    }
+    if (rest) expanded.push(rest);
+  }
+  if (!expanded.length) return null;
   const merged: string[] = [];
-  for (const para of paragraphs) {
+  for (const para of expanded) {
     if (merged.length < maxSegments) {
       merged.push(para);
     } else {
-      merged[merged.length - 1] = `${merged[merged.length - 1]}\n\n${para}`;
+      const combined = `${merged[merged.length - 1]}\n\n${para}`;
+      if ([...combined].length <= maxChars) {
+        merged[merged.length - 1] = combined;
+      } else {
+        // Keep last slot within maxChars rather than failing the whole deep answer.
+        merged[merged.length - 1] = [...combined].slice(0, maxChars).join("");
+      }
     }
   }
-  if (merged.some(segment => [...segment].length > maxChars)) return null;
   return Object.freeze(merged);
+}
+
+/**
+ * Tolerant deep-mode parser: handles 1..12+ segments (merging gracefully if needed),
+ * `{ kind: "reply", text: "..." }`, extra metadata fields, `{ text }` segment objects,
+ * or clean plain-text paragraphs, so high-quality long answers are never discarded.
+ */
+export function parseDeepLifecycleAnswer(stopReason: string,
+  content: readonly { readonly type: string; readonly text?: string }[],
+  maxSegments = ROOM_LIFECYCLE_DEEP_MAX_SEGMENTS,
+  maxChars = 4000): RoomLifecycleAnswer {
+  if (stopReason !== "stop") throw new RoomModelError("incomplete");
+  const rawText = extractAssistantText(content);
+  if (!rawText.trim()) throw new RoomModelError("empty");
+  const stripped = stripJsonFence(rawText);
+
+  let parsed: unknown;
+  let parsedOk = false;
+  try {
+    parsed = JSON.parse(stripped);
+    parsedOk = true;
+  } catch {
+    // Try extracting the outermost JSON object if the model added prose before/after JSON.
+    const start = stripped.indexOf("{");
+    const end = stripped.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try {
+        parsed = JSON.parse(stripped.slice(start, end + 1));
+        parsedOk = true;
+      } catch { /* Fall through to prose fallback. */ }
+    }
+  }
+
+  if (parsedOk && parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const row = parsed as Record<string, unknown>;
+    if (row.kind === "skip") return Object.freeze({ kind: "skip" });
+    if (Array.isArray(row.segments)) {
+      const texts = row.segments.map(item => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object" && typeof (item as Record<string, unknown>).text === "string") {
+          return String((item as Record<string, unknown>).text);
+        }
+        return "";
+      }).filter(item => item.trim().length > 0);
+      const normalized = normalizeDeepSegments(texts, maxSegments, maxChars);
+      if (normalized) return Object.freeze({ kind: "reply", segments: normalized });
+    }
+    if (typeof row.text === "string" && row.text.trim()) {
+      const parts = row.text.replace(/\r\n?/g, "\n").split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+      const normalized = normalizeDeepSegments(parts, maxSegments, maxChars);
+      if (normalized) return Object.freeze({ kind: "reply", segments: normalized });
+    }
+    if (typeof row.content === "string" && row.content.trim()) {
+      const parts = row.content.replace(/\r\n?/g, "\n").split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+      const normalized = normalizeDeepSegments(parts, maxSegments, maxChars);
+      if (normalized) return Object.freeze({ kind: "reply", segments: normalized });
+    }
+    throw new RoomModelError("invalid-schema");
+  }
+
+  // Plain prose / Markdown fallback (e.g. when tools were enabled and response_format wasn't forced)
+  const cleaned = rawText.replace(/\r\n?/g, "\n").trim();
+  if (!cleaned.startsWith("{")) {
+    const parts = cleaned.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+    const normalized = normalizeDeepSegments(parts, maxSegments, maxChars);
+    if (normalized) return Object.freeze({ kind: "reply", segments: normalized });
+  }
+  throw new RoomModelError("invalid-json");
 }
 
 function diagnosticStage(prompt: RoomPrompt): RoomModelDiagnostic["stage"] {
@@ -399,15 +488,10 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
           continue;
         }
 
-        try {
-          return parseRoomLifecycleAnswer(result.stopReason, result.content, maxSegments);
-        } catch (parseError) {
-          if (deep && allowToolsThisRound && result.stopReason === "stop") {
-            const fallback = proseToSegments(extractAssistantText(result.content), maxSegments, maxChars);
-            if (fallback) return Object.freeze({ kind: "reply", segments: fallback });
-          }
-          throw parseError;
+        if (deep) {
+          return parseDeepLifecycleAnswer(result.stopReason, result.content, maxSegments, maxChars);
         }
+        return parseRoomLifecycleAnswer(result.stopReason, result.content, maxSegments);
       }
       throw new RoomModelError("incomplete");
     } catch (error) {

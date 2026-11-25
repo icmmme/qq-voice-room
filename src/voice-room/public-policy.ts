@@ -1,5 +1,4 @@
 import { PrivacyGuard } from "../privacy.js";
-import { containsSensitive } from "../memory-safety.js";
 import { suspectedAdult, textVariants } from "../identity-safety.js";
 import { readFilePersona } from "../file-persona.js";
 import type { ModelConfig } from "../config.js";
@@ -17,8 +16,8 @@ export function roomPublicPolicy(settings: RoomQqSettings, model: ModelConfig, c
     identityIds: [settings.room.ownerId, settings.room.groupId, ...settings.room.characters.map(c => c.selfId)],
     internalValues: [settings.dataDir, model.baseUrl, configFile, ...settings.accounts.map(a => a.personaFile)],
   });
-  const privacy = (text: string) => textVariants(text).every(v => !containsSensitive(v)
-    && guard.sanitizeForModel(v) === v && guard.redactOutbound(v) === v);
+  const privacy = (text: string) => textVariants(text).every(v =>
+    guard.sanitizeForModel(v) === v && guard.redactOutbound(v) === v);
   const permitsText = (text: string) => privacy(text) && !suspectedAdult(text);
   /**
    * Sanitize fetched public web text:

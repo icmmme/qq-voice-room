@@ -2271,7 +2271,7 @@ export class RoomStore {
       for (let index = 0; index < segments.length; index++) {
         const segment = segments[index]!;
         const maxStoredChars = mode === "text"
-          ? Math.max(this.config.limits.maxTextChars, 12000)
+          ? Math.max(this.config.limits.maxTextChars, 24000)
           : this.config.limits.maxTextChars;
         if (!segment || typeof segment.text !== "string" || !segment.text.trim() || segment.text.includes("\0")
           || [...segment.text.trim()].length > maxStoredChars

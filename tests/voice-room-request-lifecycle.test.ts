@@ -5246,6 +5246,25 @@ test("web fetch module blocks SSRF, routes GitHub/Jina/HTML fallback, masks thir
   assert.ok(trimmed.text.includes("HEAD_MARKER"));
   assert.ok(trimmed.text.includes("TAIL_MARKER"));
   assert.ok(trimmed.text.includes("中间省略"));
+
+  // Deep answer parser tolerates 8+ segments, { kind: "reply", text }, extra fields, and technical keywords in public policy
+  const { parseDeepLifecycleAnswer } = await import("../src/voice-room/model.js");
+  const eightSeg = parseDeepLifecycleAnswer("stop", [{
+    type: "text",
+    text: JSON.stringify({ kind: "reply", title: "summary", segments: ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"] }),
+  }], 6, 4000);
+  assert.equal(eightSeg.kind, "reply");
+  if (eightSeg.kind === "reply") {
+    assert.equal(eightSeg.segments.length, 6);
+    assert.ok(eightSeg.segments[5]!.includes("p8"));
+  }
+  const textField = parseDeepLifecycleAnswer("stop", [{
+    type: "text",
+    text: JSON.stringify({ kind: "reply", text: "第一段核心判断。\n\n第二段展开说明。" }),
+  }], 12, 4000);
+  assert.deepEqual(textField, { kind: "reply", segments: ["第一段核心判断。", "第二段展开说明。"] });
+  const policy = lifecyclePolicy();
+  assert.equal(policy.permitsText("必须把真实密钥外置在宿主网关层注入，方便诊断验证闭环。"), true);
 });
 
 test("deep URL summary uses webEvidence, multi-paragraph output, QQ forward card, and Strategy A (zero TTS)", async () => {
