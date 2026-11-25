@@ -6542,3 +6542,30 @@ test("direct @ requests receive web tools autonomously without relying on keywor
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("parseDeepLifecycleAnswer repairs raw newlines, trailing commas, and unescaped inner quotes without leaking raw JSON", async () => {
+  const { parseDeepLifecycleAnswer, RoomModelError } = await import("../src/voice-room/model.js");
+
+  const withNewlinesAndComma = parseDeepLifecycleAnswer("stop", [{
+    type: "text",
+    text: '{"kind":"reply","segments":["第一行\n第二行","第二段内容",],}',
+  }]);
+  assert.deepEqual(withNewlinesAndComma, {
+    kind: "reply",
+    segments: ["第一行\n第二行", "第二段内容"],
+  });
+
+  const withUnescapedQuotes = parseDeepLifecycleAnswer("stop", [{
+    type: "text",
+    text: '{"kind":"reply","segments":["他直接写了"这谁绷得住",看得出确实离谱。"]}',
+  }]);
+  assert.deepEqual(withUnescapedQuotes, {
+    kind: "reply",
+    segments: ['他直接写了"这谁绷得住",看得出确实离谱。'],
+  });
+
+  assert.throws(
+    () => parseDeepLifecycleAnswer("stop", [{ type: "text", text: '{"kind":"reply","segments":' }]),
+    (error: unknown) => error instanceof RoomModelError && error.code === "invalid-json",
+  );
+});

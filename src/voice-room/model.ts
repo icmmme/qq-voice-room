@@ -136,9 +136,129 @@ function normalizeDeepSegments(rawSegments: readonly string[], maxSegments: numb
   return Object.freeze(merged);
 }
 
+function repairJsonControlCharsAndTrailingCommas(raw: string): string {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (inString) {
+      if (escaped) {
+        out += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        const next = raw[i + 1];
+        const validSimple = next !== undefined && "\"\\/bfnrt".includes(next);
+        const validUnicode = next === "u" && /^[0-9a-fA-F]{4}$/.test(raw.slice(i + 2, i + 6));
+        if (validSimple || validUnicode) {
+          out += ch;
+          escaped = true;
+        } else {
+          out += "\\\\";
+        }
+        continue;
+      }
+      if (ch === "\"") {
+        out += ch;
+        inString = false;
+        continue;
+      }
+      if (ch === "\n") { out += "\\n"; continue; }
+      if (ch === "\r") { out += "\\r"; continue; }
+      if (ch === "\t") { out += "\\t"; continue; }
+      if (ch.charCodeAt(0) < 0x20) { out += " "; continue; }
+      out += ch;
+      continue;
+    }
+    if (ch === "\"") {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === ",") {
+      let j = i + 1;
+      while (j < raw.length && /\s/.test(raw[j]!)) j++;
+      if (raw[j] === "}" || raw[j] === "]") continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+function repairJsonUnescapedQuotes(raw: string): string {
+  const base = repairJsonControlCharsAndTrailingCommas(raw);
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < base.length; i++) {
+    const ch = base[i]!;
+    if (inString) {
+      if (escaped) {
+        out += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        out += ch;
+        escaped = true;
+        continue;
+      }
+      if (ch === "\"") {
+        let j = i + 1;
+        while (j < base.length && /\s/.test(base[j]!)) j++;
+        const next = base[j];
+        let isClosing = next === undefined || next === "}" || next === "]" || next === ":";
+        if (next === ",") {
+          let k = j + 1;
+          while (k < base.length && /\s/.test(base[k]!)) k++;
+          const afterComma = base[k];
+          isClosing = afterComma !== undefined && /["0-9\-{[tfn]/.test(afterComma);
+        }
+        if (isClosing) {
+          out += ch;
+          inString = false;
+        } else {
+          out += "\\\"";
+        }
+        continue;
+      }
+      out += ch;
+      continue;
+    }
+    if (ch === "\"") inString = true;
+    out += ch;
+  }
+  return out;
+}
+
+function tryParseJsonTolerant(raw: string): { readonly ok: true; readonly value: unknown } | { readonly ok: false } {
+  const candidates = [raw];
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    const slice = raw.slice(start, end + 1);
+    if (slice !== raw) candidates.push(slice);
+  }
+  for (const candidate of candidates) {
+    for (const attempt of [
+      () => JSON.parse(candidate),
+      () => JSON.parse(repairJsonControlCharsAndTrailingCommas(candidate)),
+      () => JSON.parse(repairJsonUnescapedQuotes(candidate)),
+    ]) {
+      try {
+        return { ok: true, value: attempt() };
+      } catch { /* Try next repair strategy. */ }
+    }
+  }
+  return { ok: false };
+}
+
 /**
  * Tolerant deep-mode parser: handles 1..12+ segments (merging gracefully if needed),
  * `{ kind: "reply", text: "..." }`, extra metadata fields, `{ text }` segment objects,
+ * slightly malformed JSON (raw newlines, trailing commas, unescaped quotes),
  * or clean plain-text paragraphs, so high-quality long answers are never discarded.
  */
 export function parseDeepLifecycleAnswer(stopReason: string,
@@ -150,22 +270,9 @@ export function parseDeepLifecycleAnswer(stopReason: string,
   if (!rawText.trim()) throw new RoomModelError("empty");
   const stripped = stripJsonFence(rawText);
 
-  let parsed: unknown;
-  let parsedOk = false;
-  try {
-    parsed = JSON.parse(stripped);
-    parsedOk = true;
-  } catch {
-    // Try extracting the outermost JSON object if the model added prose before/after JSON.
-    const start = stripped.indexOf("{");
-    const end = stripped.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      try {
-        parsed = JSON.parse(stripped.slice(start, end + 1));
-        parsedOk = true;
-      } catch { /* Fall through to prose fallback. */ }
-    }
-  }
+  const attempt = tryParseJsonTolerant(stripped);
+  const parsed = attempt.ok ? attempt.value : undefined;
+  const parsedOk = attempt.ok;
 
   if (parsedOk && parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     const row = parsed as Record<string, unknown>;
@@ -195,7 +302,7 @@ export function parseDeepLifecycleAnswer(stopReason: string,
   }
 
   // Plain prose / Markdown fallback (e.g. when tools were enabled and response_format wasn't forced)
-  const cleaned = rawText.replace(/\r\n?/g, "\n").trim();
+  const cleaned = stripped.replace(/\r\n?/g, "\n").trim();
   if (!cleaned.startsWith("{")) {
     const parts = cleaned.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
     const normalized = normalizeDeepSegments(parts, maxSegments, maxChars);
@@ -735,10 +842,20 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
           continue;
         }
 
-        if (deep || hasImages || usedWebTools) {
-          return parseDeepLifecycleAnswer(result.stopReason, result.content, maxSegments, maxChars);
+        try {
+          if (deep || hasImages || usedWebTools || allowToolsThisRound) {
+            return parseDeepLifecycleAnswer(result.stopReason, result.content, maxSegments, maxChars);
+          }
+          return parseRoomLifecycleAnswer(result.stopReason, result.content, maxSegments);
+        } catch (error) {
+          if (allowToolsThisRound && error instanceof RoomModelError && error.code === "invalid-json"
+            && round + 1 < totalRounds) {
+            // Re-run once without tools so response_format: json_object is enforced on output.
+            disableToolsFallback = true;
+            continue;
+          }
+          throw error;
         }
-        return parseRoomLifecycleAnswer(result.stopReason, result.content, maxSegments);
       }
       throw new RoomModelError("incomplete");
     } catch (error) {
