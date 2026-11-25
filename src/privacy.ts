@@ -8,8 +8,49 @@ const SEP = "[\\s\\-_.:/|,·\\\\]";
 const PHONE = new RegExp(`(?<!\\d)1${SEP}*[3-9](?:${SEP}*\\d){9}(?!\\d)`, "g");
 const EMAIL = /[A-Za-z0-9._%+-]+(?:\s*@\s*)[A-Za-z0-9-]+(?:\s*\.\s*[A-Za-z0-9-]+)*\s*\.\s*[A-Za-z]{2,}/g;
 const ID_CARD = new RegExp(`(?<!\\d)\\d(?:${SEP}*\\d){16}${SEP}*[\\dXx](?!\\d)`, "g");
-const BANK_CARD = new RegExp(`(?<!\\d)\\d(?:${SEP}*\\d){15,18}(?!\\d)`, "g");
+const BANK_CARD = new RegExp(`(?<!\\d)[3-6](?:${SEP}*\\d){15,18}(?!\\d)`, "g");
 const STREET_ADDRESS = new RegExp(`[\\u4e00-\\u9fff]{1,12}(?:路|街|道|巷|胡同|里弄|弄|小区|花园|公寓|大厦|大楼)${SEP}*[\\d０-９一二三四五六七八九十百千]{1,6}${SEP}*(?:号|弄|栋|幢|单元|室|楼|层)`, "g");
+const PUBLIC_URL_SPAN = /https?:\/\/[^\s<>"'()[\]{}，。！？、；：）》】]+/gi;
+
+function passesLuhn(digits: string): boolean {
+  let sum = 0;
+  let alt = false;
+  for (let i = digits.length - 1; i >= 0; i -= 1) {
+    let n = digits.charCodeAt(i) - 48;
+    if (n < 0 || n > 9) return false;
+    if (alt) {
+      n *= 2;
+      if (n > 9) n -= 9;
+    }
+    sum += n;
+    alt = !alt;
+  }
+  return sum % 10 === 0;
+}
+
+function replaceBankCards(text: string): string {
+  return text.replace(BANK_CARD, match => {
+    const digits = match.replace(/\D/g, "");
+    return digits.length >= 16 && digits.length <= 19 && passesLuhn(digits) ? MASK : match;
+  });
+}
+
+function maskPiiOutsideUrls(text: string): string {
+  let out = "";
+  let lastIndex = 0;
+  PUBLIC_URL_SPAN.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  const maskPlain = (segment: string) =>
+    replaceBankCards(segment.replace(PHONE, MASK).replace(EMAIL, MASK).replace(ID_CARD, MASK))
+      .replace(STREET_ADDRESS, MASK);
+  while ((match = PUBLIC_URL_SPAN.exec(text)) !== null) {
+    if (match.index > lastIndex) out += maskPlain(text.slice(lastIndex, match.index));
+    out += match[0];
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < text.length) out += maskPlain(text.slice(lastIndex));
+  return out;
+}
 
 /** A privacy rejection with a fixed message: the triggering value is never included. */
 export class PrivacyBlockedError extends Error {
@@ -192,10 +233,8 @@ export class PrivacyGuard {
 
   /** Mask known values, private fragments, and obvious PII before an auxiliary model request. */
   sanitizeForModel(text: string): string {
-    let value = this.maskProtectedValues(text);
-    value = value.replace(PHONE, MASK).replace(EMAIL, MASK).replace(ID_CARD, MASK)
-      .replace(BANK_CARD, MASK).replace(STREET_ADDRESS, MASK);
-    return value;
+    const value = this.maskProtectedValues(text);
+    return maskPiiOutsideUrls(value);
   }
 
   /** Output guard. Known values and a large system-prompt reproduction are always protected. */
@@ -315,10 +354,7 @@ export class PrivacyGuard {
 
   private containsPii(text: string): boolean {
     for (const view of this.canonicalViews(text)) {
-      for (const pattern of [PHONE, EMAIL, ID_CARD, BANK_CARD, STREET_ADDRESS]) {
-        pattern.lastIndex = 0;
-        if (pattern.test(view)) return true;
-      }
+      if (maskPiiOutsideUrls(view) !== view) return true;
     }
     return false;
   }

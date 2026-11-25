@@ -359,11 +359,105 @@ async function fetchGithubTarget(target: ParsedGithubTarget, options: RoomWebCon
   return null;
 }
 
+interface ParsedXTarget {
+  readonly user: string;
+  readonly id: string;
+}
+
+const X_HOSTS = new Set([
+  "x.com", "www.x.com", "mobile.x.com",
+  "twitter.com", "www.twitter.com", "mobile.twitter.com",
+  "fxtwitter.com", "www.fxtwitter.com",
+  "vxtwitter.com", "www.vxtwitter.com",
+  "fixupx.com", "www.fixupx.com",
+]);
+
+function parseXUrl(url: URL): ParsedXTarget | null {
+  if (!X_HOSTS.has(url.hostname.toLowerCase())) return null;
+  const parts = url.pathname.split("/").filter(Boolean);
+  // Supports /<user>/status/<id> and /i/status/<id> and /<user>/article/<id>
+  if (parts.length >= 3 && (parts[1] === "status" || parts[1] === "statuses" || parts[1] === "article")
+    && /^[A-Za-z0-9_]{1,50}$/.test(parts[0]!) && /^\d{6,25}$/.test(parts[2]!)) {
+    return { user: parts[0]!, id: parts[2]! };
+  }
+  return null;
+}
+
+async function fetchXTarget(target: ParsedXTarget, options: RoomWebConfig,
+  signal: AbortSignal): Promise<{ title: string; content: string } | null> {
+  const fetchFn = options.fetchImpl ?? globalThis.fetch;
+  const res = await fetchFn(`https://api.fxtwitter.com/${target.user}/status/${target.id}`, {
+    headers: { Accept: "application/json", "User-Agent": "qq-voice-room/1.0" },
+    signal,
+  });
+  if (!res.ok) return null;
+  const parsed: unknown = JSON.parse(await readBoundedText(res, WEB_MAX_RESPONSE_BYTES));
+  if (!parsed || typeof parsed !== "object") return null;
+  const tweet = (parsed as { tweet?: Record<string, unknown> }).tweet;
+  if (!tweet || typeof tweet !== "object") return null;
+  const author = (tweet.author ?? {}) as Record<string, unknown>;
+  const authorName = String(author.name ?? target.user);
+  const handle = String(author.screen_name ?? target.user);
+  const createdAt = typeof tweet.created_at === "string" ? tweet.created_at : "";
+  const body = typeof tweet.text === "string" ? tweet.text.trim() : "";
+
+  const lines: string[] = [
+    `# X 帖子：${authorName} (@${handle})`,
+    [
+      createdAt ? `发布时间：${createdAt}` : "",
+      typeof tweet.likes === "number" ? `点赞：${tweet.likes}` : "",
+      typeof tweet.retweets === "number" ? `转发：${tweet.retweets}` : "",
+      typeof tweet.replies === "number" ? `回复：${tweet.replies}` : "",
+      typeof tweet.views === "number" ? `浏览：${tweet.views}` : "",
+    ].filter(Boolean).join("｜"),
+  ].filter(Boolean);
+
+  if (body) lines.push("", body);
+
+  // X long-form Article support
+  const article = tweet.article as Record<string, unknown> | undefined;
+  if (article && typeof article === "object") {
+    const articleTitle = typeof article.title === "string" ? article.title.trim() : "";
+    if (articleTitle) lines.push("", `## X 长文：${articleTitle}`);
+    const blocks = (article.content as { blocks?: Array<Record<string, unknown>> } | undefined)?.blocks;
+    if (Array.isArray(blocks) && blocks.length > 0) {
+      const articleBody = blocks.map(b => typeof b?.text === "string" ? b.text.trim() : "").filter(Boolean).join("\n\n");
+      if (articleBody) lines.push("", articleBody);
+    } else if (typeof article.preview_text === "string" && article.preview_text.trim()) {
+      lines.push("", article.preview_text.trim());
+    }
+  }
+
+  // Quoted tweet support
+  const quote = tweet.quote as Record<string, unknown> | undefined;
+  if (quote && typeof quote === "object" && typeof quote.text === "string" && quote.text.trim()) {
+    const qAuthor = (quote.author ?? {}) as Record<string, unknown>;
+    const qName = String(qAuthor.name ?? "");
+    const qHandle = String(qAuthor.screen_name ?? "");
+    lines.push("", `## 引用推文（${qName}${qHandle ? ` @${qHandle}` : ""}）`, quote.text.trim());
+  }
+
+  // Media alt texts if any
+  const mediaAll = (tweet.media as { all?: Array<Record<string, unknown>> } | undefined)?.all;
+  if (Array.isArray(mediaAll)) {
+    const alts = mediaAll.map(m => typeof m?.altText === "string" ? m.altText.trim() : "").filter(Boolean);
+    if (alts.length) lines.push("", "配图说明：" + alts.join(" / "));
+  }
+
+  const content = lines.join("\n").trim();
+  if (!content) return null;
+  const title = article && typeof article.title === "string" && article.title.trim()
+    ? `${authorName} (@${handle}) - ${article.title.trim()}`
+    : `${authorName} (@${handle}) on X`;
+  return { title, content };
+}
+
 /**
  * Fetch a single public URL with smart routing:
  * 1. GitHub URLs -> GitHub REST API (fallback to Jina Reader if rate-limited)
- * 2. General / JS-rendered pages -> Jina Reader Markdown
- * 3. Fallback -> Direct HTTP fetch + HTML-to-text cleaner (SSRF-checked after redirect)
+ * 2. X / Twitter URLs -> FxTwitter public JSON API (tweets, quotes, X Articles)
+ * 3. General / JS-rendered pages -> Jina Reader Markdown
+ * 4. Fallback -> Direct HTTP fetch + HTML-to-text cleaner (SSRF-checked after redirect)
  */
 export async function fetchPublicUrl(rawUrl: string, options: RoomWebFetchOptions = {},
   parentSignal?: AbortSignal): Promise<WebEvidenceItem | null> {
@@ -384,6 +478,19 @@ export async function fetchPublicUrl(rawUrl: string, options: RoomWebFetchOption
         const result = await fetchGithubTarget(gh, options, signal);
         if (result && result.content.trim()) {
           kind = "github";
+          title = result.title;
+          rawContent = result.content;
+        }
+      } catch { /* Fall through to Jina Reader. */ }
+    }
+
+    // Route 1.5: X / Twitter via FxTwitter API (works on tweets, quotes, and X Articles without login)
+    const xTarget = !rawContent ? parseXUrl(url) : null;
+    if (xTarget) {
+      try {
+        const result = await fetchXTarget(xTarget, options, signal);
+        if (result && result.content.trim()) {
+          kind = "page";
           title = result.title;
           rawContent = result.content;
         }

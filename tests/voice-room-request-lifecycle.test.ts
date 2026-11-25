@@ -5265,6 +5265,36 @@ test("web fetch module blocks SSRF, routes GitHub/Jina/HTML fallback, masks thir
   assert.deepEqual(textField, { kind: "reply", segments: ["第一段核心判断。", "第二段展开说明。"] });
   const policy = lifecyclePolicy();
   assert.equal(policy.permitsText("必须把真实密钥外置在宿主网关层注入，方便诊断验证闭环。"), true);
+  assert.equal(policy.permitsText("帮我看下这条 X 帖子 https://x.com/alice/status/2012345678901234567"), true);
+  assert.equal(policy.permitsText("我的手机号是13812345678"), false);
+
+  // FxTwitter X/Twitter route + Room Skills loading
+  const xMockFetch = (async (input: string | URL | Request) => {
+    if (String(input) === "https://api.fxtwitter.com/alice/status/2012345678901234567") {
+      return new Response(JSON.stringify({
+        code: 200,
+        tweet: {
+          author: { name: "Alice", screen_name: "alice" },
+          text: "Verification loops beat giant prompts every time.",
+          created_at: "Wed Nov 25 12:00:00 +0000 2026",
+          likes: 1200,
+          retweets: 300,
+          quote: { author: { name: "Bob", screen_name: "bob" }, text: "Deterministic hooks are key." },
+        },
+      }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  }) as typeof fetch;
+  const xItem = await fetchPublicUrl("https://x.com/alice/status/2012345678901234567", { fetchImpl: xMockFetch });
+  assert.equal(xItem?.kind, "page");
+  assert.ok(xItem?.content.includes("Verification loops beat giant prompts every time."));
+  assert.ok(xItem?.content.includes("Deterministic hooks are key."));
+
+  const { loadRoomSkill, selectRoomSkill } = await import("../src/voice-room/skills.js");
+  assert.equal(selectRoomSkill({ deep: true, hasWebEvidence: true, hasUrls: true }), "deep-link-analysis");
+  assert.equal(selectRoomSkill({ deep: true, hasWebEvidence: false, hasUrls: false }), "deep-tech-qa");
+  assert.equal(selectRoomSkill({ deep: false, hasWebEvidence: false, hasUrls: false }), "casual-chat");
+  assert.ok(loadRoomSkill("deep-link-analysis").includes("反流水账"));
 });
 
 test("deep URL summary uses webEvidence, multi-paragraph output, QQ forward card, and Strategy A (zero TTS)", async () => {
