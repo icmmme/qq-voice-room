@@ -22,6 +22,10 @@ export interface RoomWebFetchOptions extends RoomWebConfig {
   readonly maxTokens?: number;
 }
 
+export type WebSearchProvider = "bocha" | "exa" | "tavily";
+
+export type WebSearchStatus = "ok" | "empty" | "blocked" | "provider_error" | "unavailable";
+
 export interface WebSearchHit {
   readonly title: string;
   readonly url: string;
@@ -29,9 +33,16 @@ export interface WebSearchHit {
   readonly publishedDate?: string;
 }
 
+export interface WebSearchOutcome {
+  readonly status: WebSearchStatus;
+  readonly provider?: WebSearchProvider;
+  readonly hits: readonly WebSearchHit[];
+}
+
 export interface RoomWebToolkit {
   readonly hasSearch: boolean;
   readonly search: (query: string, signal?: AbortSignal) => Promise<readonly WebSearchHit[]>;
+  readonly searchDetailed?: (query: string, signal?: AbortSignal) => Promise<WebSearchOutcome>;
   readonly fetchUrl: (url: string, options: { maxChars?: number; maxTokens?: number }, signal?: AbortSignal) => Promise<WebEvidenceItem | null>;
 }
 
@@ -122,7 +133,13 @@ export function isDeepRequest(text: string, hasUrls: boolean): boolean {
   if (!trimmed) return false;
   const chars = [...trimmed].length;
   if (chars >= 60) return true;
+  if (/(查一下|查查|查一查|搜一下|搜搜|搜一搜|联网查|联网搜|帮我查|帮我搜|search for|look up|check online)/i.test(trimmed)) {
+    return true;
+  }
   if (/(总结|概括|解读|分析|评测|对比|比较|区别|原理|机制|架构|设计|详细|深入|展开|科普|优缺点|利弊|源码|论文|报告|攻略|教程|怎么评价|怎么看待|介绍一下|讲讲|聊聊这个|explain|analyze|compare|summarize|summary|architecture|benchmark|tradeoff|verification|deep dive)/i.test(trimmed)) {
+    return true;
+  }
+  if (chars >= 8 && /(最新发布|最新版本|最新进展|最新消息|最新动态|更新日志|发布说明|官方文档|官网地址|价格对比|收费标准|什么时候发布|出了什么新|什么版本|什么是|怎么实现|怎么配置|怎么部署|怎么解决|报错|排查|踩坑|选型|推荐个|推荐几个|release notes|changelog|pricing|benchmarks?|what is|how to|why does|how does)/i.test(trimmed)) {
     return true;
   }
   if (chars >= 12 && /(为什么|为何|如何|怎样|怎么回事|发生了什么|有什么|推荐一下|怎么选|值得吗|靠谱吗|how does|why does|what is)/i.test(trimmed)) {
@@ -572,114 +589,214 @@ export function hasWebSearchProvider(config: RoomWebConfig): boolean {
   return Boolean(config.bochaApiKey || config.exaApiKey || config.tavilyApiKey);
 }
 
-/** Search public web using Bocha -> Exa -> Tavily priority order. */
-export async function searchPublicWeb(query: string, config: RoomWebConfig,
-  parentSignal?: AbortSignal): Promise<readonly WebSearchHit[]> {
-  const trimmed = typeof query === "string" ? query.trim() : "";
-  if (!trimmed || trimmed.length > 400) return Object.freeze([]);
-  const sanitize = config.sanitizeText;
-  const safeQuery = sanitize ? sanitize(trimmed) : trimmed;
-  if (!safeQuery || safeQuery !== trimmed) return Object.freeze([]);
+interface RawSearchHit {
+  readonly title: string;
+  readonly url: string;
+  readonly snippet: string;
+  readonly publishedDate?: string;
+}
 
-  const fetchFn = config.fetchImpl ?? globalThis.fetch;
-  const timeoutMs = config.timeoutMs ?? WEB_DEFAULT_TIMEOUT_MS;
-  const { signal, cleanup } = combineSignal(parentSignal, timeoutMs);
-  try {
-    let rawHits: Array<{ title: string; url: string; snippet: string; publishedDate?: string }> = [];
+interface SearchProviderSpec {
+  readonly name: WebSearchProvider;
+  readonly apiKey: string | undefined;
+  readonly buildRequest: (query: string, apiKey: string) => { url: string; init: RequestInit };
+  readonly parseHits: (body: unknown) => readonly RawSearchHit[];
+}
 
-    if (config.bochaApiKey) {
-      const res = await fetchFn("https://api.bochaai.com/v1/web-search", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${config.bochaApiKey}`,
+function normalizeSearchHits(
+  rawHits: readonly RawSearchHit[],
+  sanitize?: (text: string) => string | null,
+): readonly WebSearchHit[] {
+  const hits: WebSearchHit[] = [];
+  const seenUrls = new Set<string>();
+  for (const hit of rawHits) {
+    const parsed = parsePublicUrl(hit.url);
+    if (!parsed) continue;
+    const canonicalUrl = parsed.toString();
+    if (seenUrls.has(canonicalUrl)) continue;
+    const normalizedTitle = hit.title.replace(/\s+/g, " ").trim();
+    if (!normalizedTitle) continue;
+    const safeTitle = sanitize ? sanitize(normalizedTitle) : normalizedTitle;
+    const safeUrl = sanitize ? sanitize(canonicalUrl) : canonicalUrl;
+    if (!safeTitle || !safeUrl) continue;
+
+    const normalizedSnippet = hit.snippet.replace(/\s+/g, " ").trim().slice(0, 1200);
+    let safeSnippet: string | null;
+    if (normalizedSnippet) {
+      safeSnippet = sanitize ? sanitize(normalizedSnippet) : normalizedSnippet;
+      if (!safeSnippet) continue;
+    } else {
+      safeSnippet = safeTitle;
+    }
+
+    let safePublishedDate: string | undefined;
+    if (typeof hit.publishedDate === "string") {
+      const normalizedDate = hit.publishedDate.replace(/\s+/g, " ").trim().slice(0, 64);
+      if (normalizedDate) {
+        const sanitizedDate = sanitize ? sanitize(normalizedDate) : normalizedDate;
+        if (sanitizedDate) safePublishedDate = sanitizedDate.slice(0, 64);
+      }
+    }
+
+    seenUrls.add(canonicalUrl);
+    hits.push(Object.freeze({
+      title: safeTitle,
+      url: safeUrl,
+      snippet: safeSnippet,
+      ...(safePublishedDate ? { publishedDate: safePublishedDate } : {}),
+    }));
+    if (hits.length >= 5) break;
+  }
+  return Object.freeze(hits);
+}
+
+function buildSearchProviders(config: RoomWebConfig): readonly SearchProviderSpec[] {
+  return [
+    {
+      name: "bocha",
+      apiKey: config.bochaApiKey,
+      buildRequest: (query, apiKey) => ({
+        url: "https://api.bochaai.com/v1/web-search",
+        init: {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({ query, summary: true, count: 5 }),
         },
-        body: JSON.stringify({ query: safeQuery, summary: true, count: 5 }),
-        signal,
-      });
-      if (res.ok) {
-        const body = JSON.parse(await readBoundedText(res)) as {
-          data?: { webPages?: { value?: Array<Record<string, unknown>> } };
-        };
-        const items = body.data?.webPages?.value ?? [];
-        rawHits = items.map(item => ({
+      }),
+      parseHits: body => {
+        const items = (body as { data?: { webPages?: { value?: Array<Record<string, unknown>> } } } | null)
+          ?.data?.webPages?.value ?? [];
+        return items.map(item => ({
           title: String(item.name ?? ""),
           url: String(item.url ?? ""),
           snippet: String(item.summary ?? item.snippet ?? ""),
           ...(typeof item.datePublished === "string" ? { publishedDate: item.datePublished } : {}),
         }));
-      }
-    } else if (config.exaApiKey) {
-      const res = await fetchFn("https://api.exa.ai/search", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": config.exaApiKey,
+      },
+    },
+    {
+      name: "exa",
+      apiKey: config.exaApiKey,
+      buildRequest: (query, apiKey) => ({
+        url: "https://api.exa.ai/search",
+        init: {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKey,
+          },
+          body: JSON.stringify({ query, numResults: 5, contents: { text: { maxCharacters: 1200 } } }),
         },
-        body: JSON.stringify({ query: safeQuery, numResults: 5, contents: { text: { maxCharacters: 1200 } } }),
-        signal,
-      });
-      if (res.ok) {
-        const body = JSON.parse(await readBoundedText(res)) as { results?: Array<Record<string, unknown>> };
-        rawHits = (body.results ?? []).map(item => ({
+      }),
+      parseHits: body => {
+        const items = (body as { results?: Array<Record<string, unknown>> } | null)?.results ?? [];
+        return items.map(item => ({
           title: String(item.title ?? ""),
           url: String(item.url ?? ""),
           snippet: String(item.text ?? item.summary ?? ""),
           ...(typeof item.publishedDate === "string" ? { publishedDate: item.publishedDate } : {}),
         }));
-      }
-    } else if (config.tavilyApiKey) {
-      const res = await fetchFn("https://api.tavily.com/search", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          api_key: config.tavilyApiKey,
-          query: safeQuery,
-          max_results: 5,
-          search_depth: "basic",
-          include_answer: false,
-        }),
-        signal,
-      });
-      if (res.ok) {
-        const body = JSON.parse(await readBoundedText(res)) as { results?: Array<Record<string, unknown>> };
-        rawHits = (body.results ?? []).map(item => ({
+      },
+    },
+    {
+      name: "tavily",
+      apiKey: config.tavilyApiKey,
+      buildRequest: (query, apiKey) => ({
+        url: "https://api.tavily.com/search",
+        init: {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            api_key: apiKey,
+            query,
+            max_results: 5,
+            search_depth: "basic",
+            include_answer: false,
+          }),
+        },
+      }),
+      parseHits: body => {
+        const items = (body as { results?: Array<Record<string, unknown>> } | null)?.results ?? [];
+        return items.map(item => ({
           title: String(item.title ?? ""),
           url: String(item.url ?? ""),
           snippet: String(item.content ?? ""),
           ...(typeof item.published_date === "string" ? { publishedDate: item.published_date } : {}),
         }));
-      }
-    }
+      },
+    },
+  ];
+}
 
-    const hits: WebSearchHit[] = [];
-    for (const hit of rawHits) {
-      const parsed = parsePublicUrl(hit.url);
-      if (!parsed) continue;
-      const safeTitle = sanitize ? sanitize(hit.title.trim()) : hit.title.trim();
-      const safeUrl = sanitize ? sanitize(parsed.toString()) : parsed.toString();
-      const safeSnippet = sanitize ? sanitize(hit.snippet.trim().slice(0, 1200)) : hit.snippet.trim().slice(0, 1200);
-      if (!safeTitle || !safeUrl || !safeSnippet) continue;
-      hits.push(Object.freeze({
-        title: safeTitle,
-        url: safeUrl,
-        snippet: safeSnippet,
-        ...(hit.publishedDate ? { publishedDate: hit.publishedDate } : {}),
-      }));
-      if (hits.length >= 5) break;
-    }
-    return Object.freeze(hits);
-  } catch {
-    return Object.freeze([]);
-  } finally {
-    cleanup();
+/**
+ * Search public web across configured providers in Bocha -> Exa -> Tavily priority order
+ * with per-provider automatic failover and structured outcome reporting.
+ */
+export async function searchPublicWebDetailed(query: string, config: RoomWebConfig,
+  parentSignal?: AbortSignal): Promise<WebSearchOutcome> {
+  if (parentSignal?.aborted) {
+    throw parentSignal.reason instanceof Error ? parentSignal.reason : new Error("web-search-aborted");
   }
+  if (!hasWebSearchProvider(config)) {
+    return Object.freeze({ status: "unavailable", hits: Object.freeze([]) });
+  }
+  const trimmed = typeof query === "string" ? query.trim() : "";
+  if (!trimmed || trimmed.length > 400) {
+    return Object.freeze({ status: "empty", hits: Object.freeze([]) });
+  }
+  const sanitize = config.sanitizeText;
+  const safeQuery = sanitize ? sanitize(trimmed) : trimmed;
+  if (!safeQuery || safeQuery !== trimmed) {
+    return Object.freeze({ status: "blocked", hits: Object.freeze([]) });
+  }
+
+  const fetchFn = config.fetchImpl ?? globalThis.fetch;
+  const timeoutMs = config.timeoutMs ?? WEB_DEFAULT_TIMEOUT_MS;
+  const providers = buildSearchProviders(config).filter(spec => Boolean(spec.apiKey));
+  let anyOkResponse = false;
+
+  for (const spec of providers) {
+    if (parentSignal?.aborted) {
+      throw parentSignal.reason instanceof Error ? parentSignal.reason : new Error("web-search-aborted");
+    }
+    const { signal, cleanup } = combineSignal(parentSignal, timeoutMs);
+    try {
+      const req = spec.buildRequest(safeQuery, spec.apiKey!);
+      const res = await fetchFn(req.url, { ...req.init, signal });
+      if (!res.ok) continue;
+      const body: unknown = JSON.parse(await readBoundedText(res));
+      anyOkResponse = true;
+      const hits = normalizeSearchHits(spec.parseHits(body), sanitize);
+      if (hits.length > 0) {
+        return Object.freeze({ status: "ok", provider: spec.name, hits });
+      }
+    } catch (error) {
+      if (parentSignal?.aborted) throw error;
+    } finally {
+      cleanup();
+    }
+  }
+
+  return Object.freeze({
+    status: anyOkResponse ? "empty" : "provider_error",
+    hits: Object.freeze([]),
+  });
+}
+
+/** Search public web using Bocha -> Exa -> Tavily priority order. */
+export async function searchPublicWeb(query: string, config: RoomWebConfig,
+  parentSignal?: AbortSignal): Promise<readonly WebSearchHit[]> {
+  return searchPublicWebDetailed(query, config, parentSignal).then(result => result.hits);
 }
 
 export function createRoomWebToolkit(config: RoomWebConfig): RoomWebToolkit {
   return Object.freeze({
     hasSearch: hasWebSearchProvider(config),
     search: (query: string, signal?: AbortSignal) => searchPublicWeb(query, config, signal),
+    searchDetailed: (query: string, signal?: AbortSignal) => searchPublicWebDetailed(query, config, signal),
     fetchUrl: (url: string, options: { maxChars?: number; maxTokens?: number }, signal?: AbortSignal) =>
       fetchPublicUrl(url, { ...config, ...options }, signal),
   });

@@ -5,7 +5,13 @@ import type { ModelConfig } from "../config.js";
 import { estimateTokens } from "../prompting/token-estimate.js";
 import type { RoomAnswer, RoomPrompt } from "./types.js";
 import { RoomModelDiagnostics, type RoomModelDiagnostic } from "./model-diagnostics.js";
-import { dynamicPageTokenBudget, WEB_HARD_CHAR_CEILING, type RoomWebToolkit } from "./web.js";
+import {
+  dynamicPageTokenBudget,
+  parsePublicUrl,
+  truncateByBudget,
+  WEB_HARD_CHAR_CEILING,
+  type RoomWebToolkit,
+} from "./web.js";
 
 export const ROOM_MODEL_ROUND_TIMEOUT_MS = 90000;
 export const ROOM_LIFECYCLE_MAX_TOKENS = 1024;
@@ -14,6 +20,7 @@ export const ROOM_LIFECYCLE_PROTOCOL_RESERVE_TOKENS = 256;
 export const ROOM_LIFECYCLE_DEEP_MAX_SEGMENTS = 12;
 const ROOM_MAX_TOOL_ROUNDS = 3;
 const ROOM_MAX_TOOL_CALLS_PER_ROUND = 3;
+const TOOL_ROUND_SAFETY_RESERVE = 512;
 
 export type RoomModelFailure = "incomplete" | "empty" | "invalid-json" | "invalid-schema"
   | "request" | "cancelled" | "deadline" | "budget" | "context-budget";
@@ -282,23 +289,111 @@ function buildWebTools(web: RoomWebToolkit): Tool[] {
   return tools;
 }
 
-function estimateTranscriptTokens(systemPrompt: string, messages: readonly Message[]): number {
-  let total = estimateTokens(systemPrompt);
-  for (const message of messages) {
-    if (typeof message.content === "string") {
-      total += estimateTokens(message.content);
-    } else if (Array.isArray(message.content)) {
-      for (const block of message.content) {
-        if (block.type === "text") total += estimateTokens(block.text);
-        else if (block.type === "toolCall") total += estimateTokens(block.name + JSON.stringify(block.arguments));
-      }
+function estimateMessageTokens(message: Message): number {
+  let total = 0;
+  if (typeof message.content === "string") {
+    total += estimateTokens(message.content);
+  } else if (Array.isArray(message.content)) {
+    for (const block of message.content) {
+      if (block.type === "text") total += estimateTokens(block.text);
+      else if (block.type === "toolCall") total += estimateTokens(block.name + JSON.stringify(block.arguments));
     }
   }
   return total;
 }
 
-async function executeWebToolCall(call: ToolCall, web: RoomWebToolkit, remainingTokens: number,
-  signal: AbortSignal): Promise<ToolResultMessage> {
+function estimateTranscriptTokens(systemPrompt: string, messages: readonly Message[]): number {
+  let total = estimateTokens(systemPrompt);
+  for (const message of messages) {
+    total += estimateMessageTokens(message);
+  }
+  return total;
+}
+
+function compactToolResultText(rawText: string, targetTokens: number, aggressive: boolean): string {
+  const safeTokens = Math.max(48, targetTokens);
+  try {
+    const parsed: unknown = JSON.parse(rawText);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const obj = parsed as Record<string, unknown>;
+      if (typeof obj.content === "string") {
+        if (aggressive) {
+          return JSON.stringify({
+            ...(typeof obj.url === "string" ? { url: obj.url } : {}),
+            ...(typeof obj.title === "string" ? { title: obj.title } : {}),
+            content: obj.content.slice(0, 120),
+            truncated: true,
+            compacted: true,
+          });
+        }
+        const targetChars = Math.max(200, Math.min(obj.content.length, safeTokens * 3));
+        const shrunk = truncateByBudget(obj.content, targetChars, Math.max(60, safeTokens - 32));
+        return JSON.stringify({ ...obj, content: shrunk.text, truncated: true, compacted: true });
+      }
+      if (Array.isArray(obj.results)) {
+        const hits = (obj.results as Array<Record<string, unknown>>).slice(0, aggressive ? 2 : 3).map(hit => ({
+          ...(typeof hit.title === "string" ? { title: hit.title.slice(0, 80) } : {}),
+          ...(typeof hit.url === "string" ? { url: hit.url } : {}),
+          ...(typeof hit.snippet === "string" && !aggressive ? { snippet: hit.snippet.slice(0, 140) } : {}),
+        }));
+        return JSON.stringify({
+          ...(typeof obj.query === "string" ? { query: obj.query } : {}),
+          ...(typeof obj.status === "string" ? { status: obj.status } : {}),
+          results: hits,
+          compacted: true,
+        });
+      }
+    }
+  } catch { /* Fall through to plain excerpt. */ }
+  const keepChars = aggressive ? 80 : Math.max(100, safeTokens * 2);
+  return JSON.stringify({ compacted: true, excerpt: rawText.slice(0, keepChars) });
+}
+
+/**
+ * Compact older toolResult messages in place when multi-round web tool outputs
+ * push the transcript past `inputBudget`, so synthesis succeeds without crashing.
+ */
+function compactToolResultsToBudget(systemPrompt: string, messages: Message[], inputBudget: number): void {
+  let currentTotal = estimateTranscriptTokens(systemPrompt, messages);
+  if (currentTotal <= inputBudget) return;
+
+  for (const aggressive of [false, true]) {
+    for (let i = 0; i < messages.length; i++) {
+      if (currentTotal <= inputBudget) return;
+      const msg = messages[i];
+      if (!msg || msg.role !== "toolResult") continue;
+      const msgTokens = estimateMessageTokens(msg);
+      const excess = currentTotal - inputBudget;
+      const targetMsgTokens = Math.max(48, msgTokens - excess - 32);
+      if (!aggressive && targetMsgTokens >= msgTokens) continue;
+      const rawText = msg.content
+        .filter((block): block is { type: "text"; text: string } => block.type === "text" && typeof block.text === "string")
+        .map(block => block.text)
+        .join("\n");
+      const compactedText = compactToolResultText(rawText, targetMsgTokens, aggressive);
+      if (compactedText.length >= rawText.length && !aggressive) continue;
+      messages[i] = { ...msg, content: [{ type: "text", text: compactedText }] };
+      currentTotal = estimateTranscriptTokens(systemPrompt, messages);
+    }
+  }
+}
+
+function searchStatusNote(status: string): string | undefined {
+  if (status === "empty") return "No relevant search results were found; do not fabricate sources or dates.";
+  if (status === "blocked") return "Query was blocked by privacy policy; rephrase without sensitive details or answer directly.";
+  if (status === "provider_error") return "Search providers failed temporarily; answer honestly without fabricating sources or dates.";
+  if (status === "unavailable") return "Search provider is unavailable; answer honestly without fabricating sources or dates.";
+  return undefined;
+}
+
+async function executeWebToolCall(
+  call: ToolCall,
+  web: RoomWebToolkit,
+  remainingAfterAssistant: number,
+  perCallTokens: number,
+  seenCalls: Set<string>,
+  signal: AbortSignal,
+): Promise<ToolResultMessage> {
   const startedAt = Date.now();
   const makeResult = (payload: unknown, isError = false): ToolResultMessage => ({
     role: "toolResult",
@@ -309,23 +404,78 @@ async function executeWebToolCall(call: ToolCall, web: RoomWebToolkit, remaining
     timestamp: Date.now(),
     durationMs: Math.max(0, Date.now() - startedAt),
   });
+
+  if (call.argumentsError) {
+    return makeResult({ error: "invalid_arguments" }, true);
+  }
+
   try {
     if (call.name === "web_search" && web.hasSearch) {
       const query = typeof call.arguments?.query === "string" ? call.arguments.query : "";
-      if (!query.trim()) return makeResult({ error: "empty_query" }, true);
-      const hits = await web.search(query, signal);
-      return makeResult({ query, results: hits });
+      const trimmed = query.trim();
+      if (!trimmed) return makeResult({ error: "empty_query" }, true);
+      const callKey = `web_search:${trimmed.replace(/\s+/g, " ").toLowerCase()}`;
+      if (seenCalls.has(callKey)) {
+        return makeResult({
+          duplicate: true,
+          note: "Already queried earlier in this turn; synthesize your answer from existing evidence.",
+        }, false);
+      }
+      if (remainingAfterAssistant < TOOL_ROUND_SAFETY_RESERVE) {
+        return makeResult({
+          error: "context_budget_tight",
+          note: "Context budget is tight; answer directly using evidence already gathered.",
+        }, true);
+      }
+      seenCalls.add(callKey);
+      if (web.searchDetailed) {
+        const outcome = await web.searchDetailed(trimmed, signal);
+        const note = searchStatusNote(outcome.status);
+        return makeResult({
+          query: trimmed,
+          status: outcome.status,
+          ...(outcome.provider ? { provider: outcome.provider } : {}),
+          results: outcome.hits,
+          ...(note ? { note } : {}),
+        }, outcome.status === "provider_error" || outcome.status === "blocked" || outcome.status === "unavailable");
+      }
+      const hits = await web.search(trimmed, signal);
+      return makeResult({
+        query: trimmed,
+        status: hits.length > 0 ? "ok" : "empty",
+        results: hits,
+        ...(hits.length === 0 ? { note: searchStatusNote("empty") } : {}),
+      });
     }
+
     if (call.name === "web_fetch") {
       const url = typeof call.arguments?.url === "string" ? call.arguments.url : "";
-      if (!url.trim()) return makeResult({ error: "empty_url" }, true);
-      const pageTokens = dynamicPageTokenBudget(Math.max(1000, remainingTokens), 1);
-      const item = await web.fetchUrl(url, { maxChars: WEB_HARD_CHAR_CEILING, maxTokens: pageTokens }, signal);
-      if (!item) return makeResult({ url, error: "fetch_failed_or_blocked" }, true);
+      const trimmed = url.trim();
+      if (!trimmed) return makeResult({ error: "empty_url" }, true);
+      const canonical = parsePublicUrl(trimmed)?.toString() ?? trimmed;
+      const callKey = `web_fetch:${canonical}`;
+      if (seenCalls.has(callKey)) {
+        return makeResult({
+          duplicate: true,
+          note: "Already queried earlier in this turn; synthesize your answer from existing evidence.",
+        }, false);
+      }
+      if (remainingAfterAssistant < TOOL_ROUND_SAFETY_RESERVE || perCallTokens < 128) {
+        return makeResult({
+          error: "context_budget_tight",
+          note: "Context budget is tight; answer directly using evidence already gathered.",
+        }, true);
+      }
+      seenCalls.add(callKey);
+      const pageTokens = Math.min(perCallTokens, dynamicPageTokenBudget(perCallTokens, 1));
+      const item = await web.fetchUrl(trimmed, { maxChars: WEB_HARD_CHAR_CEILING, maxTokens: pageTokens }, signal);
+      if (!item) return makeResult({ url: trimmed, error: "fetch_failed_or_blocked" }, true);
       return makeResult(item);
     }
+
     return makeResult({ error: "unsupported_tool" }, true);
-  } catch {
+  } catch (error) {
+    if (signal.aborted) throw error;
     return makeResult({ error: "tool_execution_failed" }, true);
   }
 }
@@ -402,13 +552,19 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
       : Math.max(1, Math.min(config.maxTokens, ROOM_LIFECYCLE_MAX_TOKENS));
     const maxTokens = Math.max(256, Math.min(targetMaxTokens, Math.max(256, config.contextWindow - 2048)));
     const thinking = resolveThinkingPayload(config, deep);
-    const diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, thinking.disableRequested);
+    let diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, thinking.disableRequested);
     const web = deep ? options.web : undefined;
     const tools: Tool[] = web ? buildWebTools(web) : [];
 
+    const toolGuidance = web?.hasSearch
+      ? "For fresh, time-sensitive, or verifiable external facts, call web_search first, and use web_fetch to read authoritative URLs when search snippets are not enough (at most 3 rounds total). If search returns empty or provider_error/blocked/unavailable, answer honestly without fabricating sources or dates."
+      : web
+        ? "Only web_fetch is available to read explicit public URLs (there is no live web search engine); never claim to have searched the web."
+        : "This request is tools-free. Never emit a tool call.";
+
     const protocolSuffix = deep
       ? `\n\nLifecycle output protocol (overrides every earlier instruction):
-- ${tools.length ? "If you need fresher external facts or to read an unfetched link, call web_search or web_fetch first (at most 3 rounds). Otherwise answer directly." : "This request is tools-free. Never emit a tool call."}
+- ${toolGuidance}
 - For the final answer, return ONLY one JSON object with no extra prose outside the JSON.
 - A skip is encoded as {"kind":"skip"}.
 - A reply is encoded as {"kind":"reply","segments":[string,...]} with 1 to ${maxSegments} well-structured, logical paragraphs.
@@ -436,42 +592,64 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
       signal.throwIfAborted();
       const model = runtime.getModel("room-provider", config.modelId)!;
 
+      const seenCalls = new Set<string>();
       const totalRounds = tools.length > 0 ? ROOM_MAX_TOOL_ROUNDS + 1 : 1;
+      let disableToolsFallback = false;
       for (let round = 0; round < totalRounds; round++) {
         signal.throwIfAborted();
-        const allowToolsThisRound = tools.length > 0 && round < ROOM_MAX_TOOL_ROUNDS;
+        if (round > 0) {
+          compactToolResultsToBudget(systemPrompt, messages, inputBudget);
+        }
         const usedTokens = estimateTranscriptTokens(systemPrompt, messages);
         if (usedTokens > inputBudget) throw new RoomModelError("context-budget");
 
+        let allowToolsThisRound = !disableToolsFallback && tools.length > 0 && round < ROOM_MAX_TOOL_ROUNDS;
         let result: AssistantMessage;
-        try {
-          result = await runtime.complete(model, {
-            systemPrompt,
-            tools: allowToolsThisRound ? tools : [],
-            messages,
-          }, {
-            signal,
-            timeoutMs: ROOM_MODEL_ROUND_TIMEOUT_MS,
-            maxTokens,
-            maxRetries: 0,
-            onResponse: response => { try { diagnostic.response(response.status, response.headers); } catch { diagnostic.incomplete(); } },
-            onProviderStreamEvent: event => { try { diagnostic.event(event); } catch { diagnostic.incomplete(); } },
-            onPayload: payload => {
-              if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("room-model-payload");
-              return allowToolsThisRound
-                ? { ...payload, ...thinking.payload }
-                : { ...payload, ...thinking.payload, response_format: { type: "json_object" } };
-            },
-          });
-        } catch (error) {
-          if (signal.aborted) throw new RoomModelError("cancelled");
-          throw error;
+        for (;;) {
+          try {
+            result = await runtime.complete(model, {
+              systemPrompt,
+              tools: allowToolsThisRound ? tools : [],
+              messages,
+            }, {
+              signal,
+              timeoutMs: ROOM_MODEL_ROUND_TIMEOUT_MS,
+              maxTokens,
+              maxRetries: 0,
+              onResponse: response => { try { diagnostic.response(response.status, response.headers); } catch { diagnostic.incomplete(); } },
+              onProviderStreamEvent: event => { try { diagnostic.event(event); } catch { diagnostic.incomplete(); } },
+              onPayload: payload => {
+                if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("room-model-payload");
+                return allowToolsThisRound
+                  ? { ...payload, ...thinking.payload }
+                  : { ...payload, ...thinking.payload, response_format: { type: "json_object" } };
+              },
+            });
+          } catch (error) {
+            if (signal.aborted) throw new RoomModelError("cancelled");
+            if (round === 0 && allowToolsThisRound && !disableToolsFallback) {
+              disableToolsFallback = true;
+              allowToolsThisRound = false;
+              diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, thinking.disableRequested);
+              continue;
+            }
+            throw error;
+          }
+          try { diagnostic.result(result); } catch { diagnostic.incomplete(); }
+          signal.throwIfAborted();
+          if (result.stopReason === "aborted") throw new RoomModelError("cancelled");
+          if (diagnostic.snapshot().provider.finishReason === "content_filter") throw new RoomModelError("incomplete");
+          if (result.stopReason === "error") {
+            if (round === 0 && allowToolsThisRound && !disableToolsFallback) {
+              disableToolsFallback = true;
+              allowToolsThisRound = false;
+              diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, thinking.disableRequested);
+              continue;
+            }
+            throw new RoomModelError("request");
+          }
+          break;
         }
-        try { diagnostic.result(result); } catch { diagnostic.incomplete(); }
-        signal.throwIfAborted();
-        if (result.stopReason === "aborted") throw new RoomModelError("cancelled");
-        if (diagnostic.snapshot().provider.finishReason === "content_filter") throw new RoomModelError("incomplete");
-        if (result.stopReason === "error") throw new RoomModelError("request");
 
         const toolCalls = allowToolsThisRound
           ? result.content.filter((item): item is ToolCall => item.type === "toolCall").slice(0, ROOM_MAX_TOOL_CALLS_PER_ROUND)
@@ -480,9 +658,10 @@ export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
         if (toolCalls.length > 0 && web) {
           messages.push(result);
           const remainingAfterAssistant = Math.max(0, inputBudget - estimateTranscriptTokens(systemPrompt, messages));
-          const perCallTokens = Math.max(800, Math.floor(remainingAfterAssistant / Math.max(1, toolCalls.length)));
+          const usableTokens = Math.max(0, remainingAfterAssistant - TOOL_ROUND_SAFETY_RESERVE);
+          const perCallTokens = Math.floor(usableTokens / Math.max(1, toolCalls.length));
           const toolResults = await Promise.all(
-            toolCalls.map(call => executeWebToolCall(call, web, perCallTokens, signal)),
+            toolCalls.map(call => executeWebToolCall(call, web, remainingAfterAssistant, perCallTokens, seenCalls, signal)),
           );
           messages.push(...toolResults);
           continue;
