@@ -5,20 +5,35 @@
 <!-- CANONICAL_STATE:BEGIN -->
 
 - Phase: `Product CI`
-- Predecessor: `VR-PRODUCT-TAKEOVER-01 / M5-FIX3-RETENTION-CACHE`
-- Predecessor status: `ACCEPTED` for the offline contract. The [closeout](#m5-fix-3-offline-closeout)
-  was squash-merged into `main` by [PR 8](https://github.com/icmmme/qq-voice-room/pull/8).
 - Active task: `VR-CI-01 / PRODUCT-PR-GATE`
-- Active status: `IN_PROGRESS` (contract registered; implementation not started)
+- Active status: `REVIEW_PENDING`. Local QA and Review are complete. The full
+  contract is not accepted.
 - Active contract: [Product CI for pull requests](CI_PRODUCT_PR_GATE.md)
 - Baseline: `3767178596ced9019c8f2f2936a95ac87b55ff62`, tree
   `3e0700348b08124503782af82768e22bcb83bd8e`.
-- Scope: a read-only offline product check for PRs targeting `main`, separate
-  from historical M1 foundation acceptance.
-- Owner decision: the contract draft was approved on `2026-11-24`. The Owner
-  authorized task registration on `2026-11-25` (`Asia/Shanghai`). Implementation,
-  remote validation, and required-check status need separate authorization.
-  This task does not authorize deployment or production data cleanup.
+- Candidate: [Product CI PR](https://github.com/icmmme/qq-voice-room/pull/9),
+  head `7fc54b6cf9e972e535b06db44fe0ece747643f07`. GitHub squash-merged it
+  into `main` as `f4408e7f4505fe7269aa3a14826eb39ce548e69b`. The merged tree
+  `17567aac6a8b922f8c989a012dad6c25132e6328` matches the tested candidate.
+  The [M5 Fix-3 offline closeout](#m5-fix-3-offline-closeout) remains the
+  accepted predecessor.
+- Verified: independent local QA and Review cover this frozen candidate. The
+  [first hosted run](https://github.com/icmmme/qq-voice-room/actions/runs/45560564520)
+  used the same tree and passed all 114 tests and the architecture guard. It
+  installed from a cache miss and saved the cache. The closed
+  [control PR](https://github.com/icmmme/qq-voice-room/pull/10) verified all
+  three expected failures and same-PR cancellation. None of its fault
+  injections entered the candidate.
+- Unverified: docs-only PR triggering, isolation between concurrently active
+  PRs, and a hosted npm cache hit. Do not make the check required before the
+  contract's hosted verification is complete and the Owner authorizes it.
+- Owner decision: on `2026-11-25` (`Asia/Shanghai`), the Owner confirmed the
+  local result and separately authorized the hosted runs, the workflow merge,
+  and this docs-only PR. Those decisions do not accept the full task or
+  authorize required checks, deployment, or production changes.
+- Evidence: `Shared/vr-ci-01-product-pr-gate/`. Candidate and report hashes
+  remain in the evidence package. Evidence for the frozen candidate does not
+  transfer to a later documentation patch.
 
 <!-- CANONICAL_STATE:END -->
 

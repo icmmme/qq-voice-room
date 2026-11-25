@@ -2,10 +2,9 @@
 
 ## 1. Contract
 
-Every task starts from one frozen contract recorded in
-`.harness/CURRENT_TASK.md`. The contract states scope, allowed paths,
-acceptance, required tests, risks, evidence location and the candidate identity
-it will produce.
+Every task starts from one frozen contract linked from
+`.harness/CURRENT_TASK.md`. The contract defines the scope, allowed paths,
+acceptance criteria, checks, risks, and required candidate evidence.
 
 ## 2. Development
 
@@ -13,7 +12,8 @@ The Developer:
 
 1. records the baseline identity and a first failure or premise;
 2. implements only inside the contract scope;
-3. runs focused tests, then typecheck, build and the foundation entry;
+3. runs the checks in the active contract in the specified order. Do not add
+   M1 foundation checks to other tasks unless their contract requires them;
 4. freezes one candidate patch and its prospective tree;
 5. writes a handoff with commands, cwd, exit codes and raw-log hashes.
 
@@ -30,8 +30,9 @@ A candidate is frozen only when:
   case requires non-zero;
 - no unauthorized path changed.
 
-After freeze, source and test bytes do not change. Any change creates a new
-candidate and invalidates prior QA/Review results.
+After freeze, do not edit files in the candidate. A change to the patch or its
+bound inputs requires new evidence. A later status update can cite results for
+the original candidate, but those results do not verify the update.
 
 ## 4. Independent QA
 
@@ -54,15 +55,18 @@ Review is authored by someone other than the implementer.
 
 ## 6. Acceptance
 
-Only the Human accepts a phase. Independent QA and Review PASS is necessary but
-not sufficient. A new candidate requires new QA and Review.
+Only the Owner accepts a phase. Independent QA and Review PASS is necessary but
+not sufficient. Record which required checks remain unverified. Confirmation of
+local results does not accept a task that also requires hosted validation. A
+new candidate requires new QA and Review.
 
 ## 7. Status vocabulary
 
 - `IN_PROGRESS` — implementation not frozen.
-- `REVIEW_PENDING` — candidate frozen, independent QA/Review not complete.
+- `REVIEW_PENDING` — candidate frozen, with required verification, independent
+  QA or Review, or Owner acceptance still pending.
 - `REVIEW_FAILED` — independent review found blocking findings.
-- `ACCEPTED` — Human accepted the phase.
+- `ACCEPTED` — the Owner accepted the phase.
 
 Never write `PASS` for independent Review unless an independent reviewer
 produced it.

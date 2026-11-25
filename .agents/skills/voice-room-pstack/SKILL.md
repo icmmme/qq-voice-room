@@ -5,11 +5,14 @@ description: "Route QQ Voice Room progress, handoff, technical investigation, bu
 
 # Voice Room pstack
 
-Read the repository's `AGENTS.md`, the Active Task block of
-`.harness/CURRENT_TASK.md`, the Canonical Current State block of
-`.harness/PROJECT_STATE.md`, and the relevant part of `.harness/WORKFLOW.md`.
-Use the current contract's scope and verification commands. An accepted
-candidate does not authorize new changes beside it.
+Read [AGENTS.md](../../../AGENTS.md), then the [active task](../../../.harness/CURRENT_TASK.md),
+its linked contract, and the [canonical state](../../../.harness/PROJECT_STATE.md).
+Use the relevant steps in the [Harness workflow](../../../.harness/WORKFLOW.md).
+
+The contract selects the allowed paths, checks, and evidence. Read only the
+skill that matches the request and the references you need. A skill does not
+authorize repository writes, external actions, or a different check. Use
+verification evidence only for the candidate and scope it covers.
 
 Select one starting point:
 
@@ -28,7 +31,7 @@ Select one starting point:
   Use its own task classification to choose the playbook or workflow skill,
   then read the files it calls for as their steps become relevant.
 
-Follow [the Codex tool mapping](references/codex.md) for upstream steps that
-assume Cursor tools or external actions. If a needed file or capability is
-unavailable, carry on with the contract where possible and identify the material
-gap. Keep read-only requests read-only. Use the user's language.
+Follow [the tool mapping](references/codex.md) when an upstream step assumes
+Cursor. Use an available, authorized equivalent only when it meets the contract.
+Otherwise, record the gap. Keep read-only requests read-only. Use the user's
+language.
