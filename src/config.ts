@@ -1,6 +1,8 @@
 import { calculateContextBudget, HIGH_CONTEXT_WINDOW_THRESHOLD,
   type PaContextWindowSource } from "./prompting/context-budget.js";
 
+export type ModelThinkingMode = "auto" | "enabled" | "disabled";
+
 export interface ModelConfig {
   baseUrl: string;
   modelId: string;
@@ -11,7 +13,12 @@ export interface ModelConfig {
   maxTokens: number;
   requestTimeoutMs: number;
   requestTimeoutSource?: "env" | "default";
+  thinkingMode?: ModelThinkingMode;
   tavilyApiKey?: string;
+  bochaApiKey?: string;
+  exaApiKey?: string;
+  jinaApiKey?: string;
+  githubToken?: string;
   webTimeoutMs?: number;
   webTimeoutSource?: "env" | "default";
 }
@@ -52,16 +59,34 @@ export function readModelConfig(env: NodeJS.ProcessEnv = process.env): ModelConf
   const contextWindowSource: PaContextWindowSource = contextWindowInput ? "env" : "default";
   const contextWindowVerified = booleanSetting(env.PA_CONTEXT_WINDOW_VERIFIED, false, "PA_CONTEXT_WINDOW_VERIFIED");
   if (contextWindow > HIGH_CONTEXT_WINDOW_THRESHOLD && !contextWindowVerified) {
-    throw new Error("PA_CONTEXT_WINDOW 超过 65536 时必须显式设置 PA_CONTEXT_WINDOW_VERIFIED=true。");
+    throw new Error(`PA_CONTEXT_WINDOW 超过 ${HIGH_CONTEXT_WINDOW_THRESHOLD} 时必须显式设置 PA_CONTEXT_WINDOW_VERIFIED=true。`);
   }
-  const maxTokens = positiveInteger(env.PA_MAX_TOKENS, 2048, "PA_MAX_TOKENS");
+  const maxTokens = positiveInteger(env.PA_MAX_TOKENS, 4096, "PA_MAX_TOKENS");
   if (contextWindow < 4096 || calculateContextBudget(contextWindow, maxTokens).inputBudget < 1024) {
     throw new Error("上下文窗口至少设置为 4096，扣除 PA_MAX_TOKENS 和 1024 tokens 安全余量后至少留出 1024 tokens 作为输入预算。");
   }
-  const tavilyApiKey = env.TAVILY_API_KEY?.trim();
-  if (tavilyApiKey && /replace|your-|example/i.test(tavilyApiKey)) {
-    throw new Error("TAVILY_API_KEY 仍是示例占位值；暂不使用联网搜索时请留空。");
+  const optionalSecret = (value: string | undefined, name: string): string | undefined => {
+    const trimmed = value?.trim();
+    if (!trimmed) return undefined;
+    if (/replace|your-|example/i.test(trimmed)) {
+      throw new Error(`${name} 仍是示例占位值；暂不使用时请留空。`);
+    }
+    return trimmed;
+  };
+  const thinkingRaw = env.PA_THINKING?.trim().toLowerCase();
+  let thinkingMode: ModelThinkingMode = "auto";
+  if (thinkingRaw) {
+    if (thinkingRaw === "auto" || thinkingRaw === "enabled" || thinkingRaw === "disabled") {
+      thinkingMode = thinkingRaw;
+    } else {
+      throw new Error("PA_THINKING 仅支持 auto、enabled 或 disabled。");
+    }
   }
+  const tavilyApiKey = optionalSecret(env.TAVILY_API_KEY, "TAVILY_API_KEY");
+  const bochaApiKey = optionalSecret(env.BOCHA_API_KEY, "BOCHA_API_KEY");
+  const exaApiKey = optionalSecret(env.EXA_API_KEY, "EXA_API_KEY");
+  const jinaApiKey = optionalSecret(env.JINA_API_KEY, "JINA_API_KEY");
+  const githubToken = optionalSecret(env.GITHUB_TOKEN, "GITHUB_TOKEN");
   const webTimeoutInput = env.PA_WEB_TIMEOUT_MS?.trim();
   const requestTimeoutInput = env.PA_REQUEST_TIMEOUT_MS?.trim();
   return {
@@ -69,8 +94,13 @@ export function readModelConfig(env: NodeJS.ProcessEnv = process.env): ModelConf
     contextWindow, contextWindowSource, contextWindowVerified, maxTokens,
     requestTimeoutMs: positiveInteger(requestTimeoutInput, 60000, "PA_REQUEST_TIMEOUT_MS"),
     requestTimeoutSource: requestTimeoutInput ? "env" : "default",
-    tavilyApiKey: tavilyApiKey || undefined,
-    ...(webTimeoutInput ? { webTimeoutMs: positiveInteger(webTimeoutInput, 10000, "PA_WEB_TIMEOUT_MS") } : {}),
+    thinkingMode,
+    tavilyApiKey,
+    bochaApiKey,
+    exaApiKey,
+    jinaApiKey,
+    githubToken,
+    ...(webTimeoutInput ? { webTimeoutMs: positiveInteger(webTimeoutInput, 15000, "PA_WEB_TIMEOUT_MS") } : {}),
     webTimeoutSource: webTimeoutInput ? "env" : "default",
   };
 }

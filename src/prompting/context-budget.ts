@@ -1,6 +1,6 @@
 export const CONTEXT_SAFETY_MARGIN_TOKENS = 1024;
-export const HIGH_CONTEXT_WINDOW_THRESHOLD = 65536;
-export const SAFE_ROOM_CONTEXT_WINDOW = 8192;
+export const HIGH_CONTEXT_WINDOW_THRESHOLD = 262144;
+export const SAFE_ROOM_CONTEXT_WINDOW = 65536;
 
 export type PaContextWindowSource = "env" | "default";
 export type RoomContextWindowSource = "explicit-room" | "default-safe";

@@ -7,6 +7,25 @@ import type { RoomCharacter, RoomLimits, RoomMessage, RoomPrompt, WorkerContextB
 export type WorkerPromptBudgetComponent = WorkerContextBudgetComponent;
 export type WorkerPromptBudgetDiagnostic = WorkerContextBudgetDiagnostic;
 
+export const ROOM_HISTORY_GAP_MS = 45 * 60 * 1000;
+export const ROOM_HISTORY_MAX_ROWS = 25;
+
+export interface WebEvidenceItem {
+  readonly kind: "page" | "github" | "search";
+  readonly url?: string;
+  readonly title?: string;
+  readonly content: string;
+  readonly truncated?: boolean;
+}
+
+export interface RoomPromptOptions {
+  readonly now?: number;
+  readonly maxHistoryRows?: number;
+  readonly historyGapMs?: number;
+  readonly quotedMessage?: RoomMessage;
+  readonly webEvidence?: readonly WebEvidenceItem[];
+}
+
 /** Budget failures retain only counts and structural facts, never prompt text. */
 export class RoomContextBudgetError extends Error {
   readonly diagnostic: WorkerPromptBudgetDiagnostic;
@@ -120,14 +139,33 @@ function chronological(messages: readonly RoomMessage[]): RoomMessage[] {
   return [...messages].sort((left, right) => left.id - right.id);
 }
 
+function formatReadableTime(ms: number): string {
+  const date = new Date(ms);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatRelativeAge(nowMs: number, createdAt?: number): string | undefined {
+  if (createdAt === undefined || !Number.isFinite(createdAt)) return undefined;
+  const diff = Math.max(0, nowMs - createdAt);
+  if (diff < 60_000) return "刚刚";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}小时前`;
+  return `${Math.floor(diff / 86_400_000)}天前`;
+}
+
 /**
- * Select new-to-old history within the exact input budget. Required target stays
- * in every candidate; failure is explicit instead of dropping mandatory facts.
+ * Select new-to-old history within the active conversation session and input budget.
+ * Walks newest-to-oldest and stops when adjacent messages have a gap > historyGapMs
+ * (preventing overnight/stale context pollution) or when maxHistoryRows / inputBudget is reached.
+ * Required target stays in every candidate; failure is explicit instead of dropping mandatory facts.
  */
 function selectHistoryForPrompt(input: {
   requiredHistory?: RoomMessage;
   loadPage: RoomHistoryPageLoader;
   pageRows: number;
+  maxHistoryRows: number;
+  historyGapMs: number;
   limits: Readonly<RoomLimits>;
   outputReserve: number;
   systemPrompt: string;
@@ -158,6 +196,7 @@ function selectHistoryForPrompt(input: {
   }
 
   let beforeId: number | undefined;
+  let prevOlderCreatedAt = input.requiredHistory?.createdAt;
   pages: while (true) {
     const page = input.loadPage(input.pageRows, beforeId);
     state.historyPagesRead += 1;
@@ -174,7 +213,22 @@ function selectHistoryForPrompt(input: {
       }
     }
     for (const message of descending) {
-      if (selectedIds.has(message.id)) continue;
+      if (selectedIds.has(message.id)) {
+        if (message.createdAt !== undefined) prevOlderCreatedAt = message.createdAt;
+        continue;
+      }
+      if (selected.length >= input.maxHistoryRows) {
+        break pages;
+      }
+      if (input.requiredHistory && message.id > input.requiredHistory.id) {
+        if (input.requiredHistory.createdAt !== undefined && message.createdAt !== undefined
+          && Math.abs(message.createdAt - input.requiredHistory.createdAt) > input.historyGapMs) {
+          continue;
+        }
+      } else if (prevOlderCreatedAt !== undefined && message.createdAt !== undefined
+        && (prevOlderCreatedAt - message.createdAt) > input.historyGapMs) {
+        break pages;
+      }
       const candidate = chronological([...selected, message]);
       const candidatePayload = input.content(candidate);
       if (used(candidatePayload) > inputBudget) {
@@ -184,6 +238,9 @@ function selectHistoryForPrompt(input: {
       selected = candidate;
       selectedIds.add(message.id);
       payload = candidatePayload;
+      if ((!input.requiredHistory || message.id < input.requiredHistory.id) && message.createdAt !== undefined) {
+        prevOlderCreatedAt = message.createdAt;
+      }
     }
     if (page.length < input.pageRows) break;
     const next = Math.min(...descending.map(message => message.id));
@@ -234,37 +291,60 @@ function roomSystemPrompt(character: RoomCharacter, persona: string): string {
   return `${ROOM_CORE}\n\n当前角色：${character.name}\n\n${persona}\n\n公开回复的语义正文使用中文。语音语言由程序另行处理，不因此改变人格、姓名或关系。`;
 }
 
-function roomPayload(character: RoomCharacter, targetId: number, selected: readonly RoomMessage[],
-  limits: Readonly<RoomLimits>): string {
+function roomPayload(character: RoomCharacter, target: RoomMessage, selected: readonly RoomMessage[],
+  limits: Readonly<RoomLimits>, options: RoomPromptOptions = {}): string {
+  const nowMs = options.now ?? target.createdAt ?? Date.now();
+  const quoted = options.quotedMessage && !selected.some(message => message.id === options.quotedMessage!.id)
+    ? options.quotedMessage : undefined;
   return JSON.stringify({
     currentSpeakerId: character.id,
-    targetId,
-    visibleHistory: selected.map(message => ({
-      id: message.id,
-      speakerType: message.speakerType,
-      speakerId: message.speakerId,
-      targetId: message.targetId,
-      createdAt: message.createdAt,
-      medium: message.medium ?? "text",
-      text: message.text,
-    })),
+    currentTime: formatReadableTime(nowMs),
+    targetId: target.id,
+    ...(quoted ? {
+      quotedMessage: {
+        id: quoted.id,
+        speakerType: quoted.speakerType,
+        speakerId: quoted.speakerId,
+        createdAt: quoted.createdAt,
+        ...(formatRelativeAge(nowMs, quoted.createdAt) ? { ago: formatRelativeAge(nowMs, quoted.createdAt) } : {}),
+        text: quoted.text,
+      },
+    } : {}),
+    ...(options.webEvidence?.length ? { webEvidence: options.webEvidence } : {}),
+    visibleHistory: selected.map(message => {
+      const ago = formatRelativeAge(nowMs, message.createdAt);
+      return {
+        id: message.id,
+        speakerType: message.speakerType,
+        speakerId: message.speakerId,
+        targetId: message.targetId,
+        createdAt: message.createdAt,
+        ...(ago ? { ago } : {}),
+        medium: message.medium ?? "text",
+        text: message.text,
+      };
+    }),
     outputProtocol: `Return ONLY one JSON object matching {"kind":"reply","text":"your character dialogue"} or {"kind":"skip"}. text must be at most ${limits.maxTextChars} Unicode characters. No other output.`,
   });
 }
 
 export function buildRoomPromptFromPages(character: RoomCharacter, persona: string, target: RoomMessage,
-  loadPage: RoomHistoryPageLoader, limits: Readonly<RoomLimits>): RoomPrompt {
+  loadPage: RoomHistoryPageLoader, limits: Readonly<RoomLimits>, options: RoomPromptOptions = {}): RoomPrompt {
   if (typeof persona !== "string" || !persona.trim() || persona.includes("\0")
     || Buffer.byteLength(persona, "utf8") > 64 * 1024) throw new Error("room-persona-invalid");
   const systemPrompt = roomSystemPrompt(character, persona);
+  const maxHistoryRows = Math.max(1, Math.min(limits.maxHistory, options.maxHistoryRows ?? ROOM_HISTORY_MAX_ROWS));
+  const historyGapMs = options.historyGapMs ?? ROOM_HISTORY_GAP_MS;
   const selection = selectHistoryForPrompt({
     requiredHistory: target,
     loadPage,
     pageRows: limits.historyPageRows,
+    maxHistoryRows,
+    historyGapMs,
     limits,
     outputReserve: limits.outputTokens,
     systemPrompt,
-    content: selected => roomPayload(character, target.id, selected, limits),
+    content: selected => roomPayload(character, target, selected, limits, options),
     failure: (selected, payload, state) => budgetError(systemPrompt, payload, selected, state,
       limits, limits.outputTokens, limits.maxTextChars),
   });

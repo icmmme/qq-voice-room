@@ -136,6 +136,7 @@ interface LifecycleHarness {
 }
 
 async function lifecycleHarness(t: TestContext, options: {
+  root?: string;
   config?: RoomConfig;
   model: RoomLifecycleWorker["model"];
   translateVoice?: RoomDependencies["translateVoice"];
@@ -144,7 +145,7 @@ async function lifecycleHarness(t: TestContext, options: {
   ambientPlanner?: RoomAmbientPlanner;
   deps?: Partial<RoomDependencies>;
 }): Promise<LifecycleHarness> {
-  const root = mkdtempSync(join(tmpdir(), "pa-lifecycle-test-"));
+  const root = options.root ?? mkdtempSync(join(tmpdir(), "pa-lifecycle-test-"));
   const checkedConfig = checkRoomConfig(options.config ?? roomConfig());
   let sent = 0;
   let synthesisCalls = 0;
@@ -214,7 +215,7 @@ async function lifecycleHarness(t: TestContext, options: {
     if (closed) return;
     closed = true;
     await room.close();
-    rmSync(root, { recursive: true, force: true });
+    if (!options.root) rmSync(root, { recursive: true, force: true });
   };
   t.after(close);
   return {
@@ -5122,4 +5123,251 @@ test("lifecyclePrompt leaves room for 1024-token output and generator protocol s
   const payload = JSON.parse(prompt.messages[0].content) as { targetId: number; visibleHistory: Array<{ id: number }> };
   assert.ok(payload.visibleHistory.some(row => row.id === payload.targetId), "target message must remain in visibleHistory");
   assert.deepEqual(h.dispatches.map(d => d.text), ["满历史也能正常生成"]);
+});
+
+test("overnight 45-min context gap cutoff drops stale history while keeping explicitly quoted message", async t => {
+  let now = Date.parse("2026-11-24T22:00:00Z");
+  const dir = mkdtempSync(join(tmpdir(), "qq-room-overnight-"));
+
+  const h1 = await lifecycleHarness(t, {
+    root: dir,
+    deps: { now: () => now },
+    model: { generate: async () => ({ kind: "reply", segments: ["ok"] }) },
+  });
+  let h: LifecycleHarness | undefined;
+  try {
+    assert.equal(h1.receive("8101", "昨晚聊到一半的旧话题一"), "observed");
+    now += 60_000;
+    assert.equal(h1.receive("8102", "昨晚聊到一半的旧话题二"), "observed");
+    await h1.close();
+
+    // Advance 10 hours (next morning) and reopen the room store
+    now += 10 * 60 * 60 * 1000;
+    h = await lifecycleHarness(t, {
+      root: dir,
+      deps: { now: () => now },
+      model: { generate: async () => ({ kind: "reply", segments: ["早安，今天聊点新的"] }) },
+    });
+    assert.equal(h.receive("8103", "早安呀", ["10002"]), "scheduled");
+    await waitFor(() => h!.room.store.lifecycleRequests().length === 1 && h!.room.store.lifecycleRequests()[0]!.status === "completed", "morning-completed");
+    const morningPayload = JSON.parse(h.prompts[0]!.messages[0].content) as {
+      currentTime: string;
+      visibleHistory: Array<{ text: string; ago?: string }>;
+      quotedMessage?: { text: string };
+    };
+    assert.ok(typeof morningPayload.currentTime === "string" && morningPayload.currentTime.length >= 10);
+    assert.equal(morningPayload.visibleHistory.length, 1);
+    assert.equal(morningPayload.visibleHistory[0]!.text, "早安呀");
+    assert.equal(morningPayload.visibleHistory[0]!.ago, "刚刚");
+    assert.equal(morningPayload.quotedMessage, undefined);
+
+    // Now explicitly quote last night's message 8101 without pulling in 8102
+    now += 60_000;
+    assert.equal(h.receive("8104", "补充问一下昨晚那句", ["10002"], { replyToMessageId: "8101" }), "scheduled");
+    await waitFor(() => h!.room.store.lifecycleRequests().length === 2 && h!.room.store.lifecycleRequests()[1]!.status === "completed", "quoted-old-completed");
+    const quotedPayload = JSON.parse(h.prompts[1]!.messages[0].content) as {
+      visibleHistory: Array<{ text: string }>;
+      quotedMessage?: { text: string; ago?: string };
+    };
+    assert.ok(!quotedPayload.visibleHistory.some(row => row.text.includes("昨晚聊到一半")));
+    assert.equal(quotedPayload.quotedMessage?.text, "昨晚聊到一半的旧话题一");
+    assert.ok(quotedPayload.quotedMessage?.ago?.includes("小时前"));
+  } finally {
+    await h1.close();
+    await h?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("web fetch module blocks SSRF, routes GitHub/Jina/HTML fallback, masks third-party PII, and preserves 75/25 truncation", async () => {
+  const { extractPublicUrls, fetchPublicUrl, truncateByBudget, isDeepRequest } = await import("../src/voice-room/web.js");
+  assert.deepEqual(
+    extractPublicUrls("看下 http://127.0.0.1:3011/a https://localhost/b http://192.168.1.5/c https://claude.dev/blog/verify/ 和 https://github.com/octocat/hello-world"),
+    ["https://claude.dev/blog/verify/", "https://github.com/octocat/hello-world"],
+  );
+  assert.equal(isDeepRequest("早安", false), false);
+  assert.equal(isDeepRequest("hi", false), false);
+  assert.equal(isDeepRequest("帮我总结一下这篇文章 https://claude.dev/blog/verify/", true), true);
+  assert.equal(isDeepRequest("请详细对比一下这两种架构设计的优缺点", false), true);
+
+  const calls: string[] = [];
+  const mockFetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    calls.push(url);
+    if (url.startsWith("https://r.jina.ai/https://claude.dev/blog/verify/")) {
+      return new Response("Title: Verification Essay\nMarkdown Content:\n" + "Claude Code uses deterministic hooks and tests. ".repeat(20) + "Contact: team@example.com", {
+        status: 200,
+        headers: { "content-type": "text/markdown" },
+      });
+    }
+    if (url.startsWith("https://r.jina.ai/https://fallback.example.org/post")) {
+      return new Response("upstream error", { status: 502 });
+    }
+    if (url === "https://fallback.example.org/post") {
+      return new Response("<html><head><title>Fallback Title</title></head><body><script>bad()</script><p>Clean fallback article body with details.</p></body></html>", {
+        status: 200,
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+    if (url === "https://api.github.com/repos/octocat/hello-world") {
+      return new Response(JSON.stringify({ full_name: "octocat/hello-world", description: "Demo repo", language: "TypeScript", stargazers_count: 42, forks_count: 5 }), { status: 200 });
+    }
+    if (url === "https://api.github.com/repos/octocat/hello-world/readme") {
+      return new Response(JSON.stringify({ encoding: "base64", content: Buffer.from("# Hello World\nVerification details here.").toString("base64") }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  }) as typeof fetch;
+
+  const sanitize = (text: string) => text.includes("LOCAL_SECRET_XYZ") ? null : text.replace(/team@example\.com/g, "[已隐藏]");
+  const jinaItem = await fetchPublicUrl("https://claude.dev/blog/verify/", { fetchImpl: mockFetch, sanitizeText: sanitize });
+  assert.equal(jinaItem?.kind, "page");
+  assert.equal(jinaItem?.title, "Verification Essay");
+  assert.ok(jinaItem?.content.includes("[已隐藏]"));
+  assert.ok(!jinaItem?.content.includes("team@example.com"));
+
+  const fallbackItem = await fetchPublicUrl("https://fallback.example.org/post", { fetchImpl: mockFetch, sanitizeText: sanitize });
+  assert.equal(fallbackItem?.kind, "page");
+  assert.equal(fallbackItem?.title, "Fallback Title");
+  assert.ok(fallbackItem?.content.includes("Clean fallback article body"));
+  assert.ok(!fallbackItem?.content.includes("bad()"));
+
+  const ghItem = await fetchPublicUrl("https://github.com/octocat/hello-world", { fetchImpl: mockFetch, sanitizeText: sanitize });
+  assert.equal(ghItem?.kind, "github");
+  assert.ok(ghItem?.content.includes("octocat/hello-world"));
+  assert.ok(ghItem?.content.includes("Verification details here."));
+
+  // Dynamic 75/25 truncation preserves head & tail when over budget, keeps 15k English intact when within budget
+  const essay = `HEAD_MARKER ${"verification ".repeat(1100)} TAIL_MARKER`;
+  const intact = truncateByBudget(essay, 40_000, 10_000);
+  assert.equal(intact.truncated, false);
+  assert.equal(intact.text, essay);
+  const trimmed = truncateByBudget(essay, 1000, 400);
+  assert.equal(trimmed.truncated, true);
+  assert.ok(trimmed.text.includes("HEAD_MARKER"));
+  assert.ok(trimmed.text.includes("TAIL_MARKER"));
+  assert.ok(trimmed.text.includes("中间省略"));
+});
+
+test("deep URL summary uses webEvidence, multi-paragraph output, QQ forward card, and Strategy A (zero TTS)", async () => {
+  const { startRoomQq } = await import("../src/voice-room/qq-server.js");
+  const { createRoomWebToolkit } = await import("../src/voice-room/web.js");
+  const { checkRoomConfig } = await import("../src/voice-room/config.js");
+  const dir = mkdtempSync(join(tmpdir(), "qq-room-forward-"));
+  const personaA = join(dir, "a.md");
+  const personaB = join(dir, "b.md");
+  writeFileSync(personaA, "你是技术审校员甲。");
+  writeFileSync(personaB, "你是产品审校员乙。");
+
+  let synthesizeCalls = 0;
+  let capturedDeepFlag: boolean | undefined;
+  let capturedWebEvidenceCount = 0;
+  const mockFetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.startsWith("https://r.jina.ai/https://claude.dev/blog/verification/")) {
+      return new Response("Title: How Claude Code Thinks About Verification\nMarkdown Content:\nDeterministic hooks, isolated judges, and reproducible test loops keep coding agents reliable.", {
+        status: 200,
+        headers: { "content-type": "text/markdown" },
+      });
+    }
+    return new Response("not found", { status: 404 });
+  }) as typeof fetch;
+
+  const settings = {
+    room: checkRoomConfig(roomConfig({ deliveryMode: "both" })),
+    dataDir: join(dir, "data"),
+    port: 0,
+    apiTimeoutMs: 500,
+    execution: "worker" as const,
+    workerQueue: QUEUE,
+    closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 200, releaseMs: 200, writeWaitMs: 50 },
+    accounts: [
+      { accountKey: "account-a", token: "token-aaaaaaaaaaaaaaaa", personaFile: personaA },
+      { accountKey: "account-b", token: "token-bbbbbbbbbbbbbbbb", personaFile: personaB },
+    ],
+  };
+
+  const bridge = await startRoomQq(settings, {
+    persona: c => c.id === "character-a" ? "你是技术审校员甲。" : "你是产品审校员乙。",
+    permitsText: () => true,
+    web: createRoomWebToolkit({ fetchImpl: mockFetch }),
+    lifecycleModel: {
+      generate: async (prompt, _signal, maxChars, options) => {
+        capturedDeepFlag = options?.deep;
+        const payload = JSON.parse(prompt.messages[0].content) as { webEvidence?: Array<{ title?: string }> };
+        capturedWebEvidenceCount = payload.webEvidence?.length ?? 0;
+        assert.ok(maxChars >= 2000, `expected deep maxChars >= 2000, got ${maxChars}`);
+        return {
+          kind: "reply",
+          segments: [
+            "这篇文章核心在讲一件事：让 AI 写代码真正靠谱的不是更长的提示词，而是把验证做成不可绕过的工程闭环。",
+            "第一，确定性 Hook 门禁比模型自评可靠得多。把编译、测试、静态检查放到外部硬门禁里，才能避免模型自己宣布完成。",
+            "第二，把干活和裁判物理拆开。校验逻辑和被修改的代码不能混在同一层，否则模型很容易顺手把测试改弱来蒙混过关。",
+            "第三，把可复现的失败反馈直接喂回循环。只有每次失败都能快速定位并验证修复，长程任务才不会越跑越歪。",
+          ],
+        };
+      },
+    },
+  }, () => {}, {
+    synthesize: async () => {
+      synthesizeCalls += 1;
+      return new Uint8Array([1, 2, 3]);
+    },
+  });
+
+  const { WebSocket } = await import("ws");
+  const actions: Array<{ action: string; params: Record<string, unknown> }> = [];
+  const connect = (accountKey: string, selfId: string, token: string) => new Promise<InstanceType<typeof WebSocket>>((resolve, reject) => {
+    const ws = new WebSocket(`${bridge.url}/room/${accountKey}`, {
+      headers: { Authorization: `Bearer ${token}`, "x-self-id": selfId, "x-client-role": "Universal" },
+    });
+    ws.on("message", raw => {
+      const msg = JSON.parse(String(raw)) as { action?: string; params?: Record<string, unknown>; echo?: string };
+      if (msg.action && msg.echo) {
+        actions.push({ action: msg.action, params: msg.params ?? {} });
+        ws.send(JSON.stringify({ status: "ok", retcode: 0, data: 99001, echo: msg.echo }));
+      }
+    });
+    ws.once("open", () => resolve(ws));
+    ws.once("error", reject);
+  });
+
+  let wsA: InstanceType<typeof WebSocket> | undefined;
+  let wsB: InstanceType<typeof WebSocket> | undefined;
+  try {
+    wsA = await connect("account-a", "10002", "token-aaaaaaaaaaaaaaaa");
+    wsB = await connect("account-b", "10003", "token-bbbbbbbbbbbbbbbb");
+    await waitFor(() => bridge.status().worker?.phase === "ready", "qq-forward-ready");
+
+    wsA.send(JSON.stringify({
+      post_type: "message",
+      message_type: "group",
+      group_id: 10000,
+      user_id: 10001,
+      self_id: 10002,
+      message_id: 88001,
+      message: [
+        { type: "at", data: { qq: "10002" } },
+        { type: "text", data: { text: " 总结一下这篇 https://claude.dev/blog/verification/" } },
+      ],
+    }));
+
+    await waitFor(() => bridge.room.store.lifecycleRequests().length === 1
+      && bridge.room.store.lifecycleRequests()[0]!.status === "completed", "forward-request-completed");
+
+    assert.equal(capturedDeepFlag, true);
+    assert.equal(capturedWebEvidenceCount, 1);
+    assert.equal(synthesizeCalls, 0, "Strategy A must skip TTS for forwarded deep replies");
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0]!.action, "send_group_forward_msg");
+    const nodes = actions[0]!.params.messages as Array<{ type: string; data: { uin: string; name: string; content: Array<{ data: { text: string } }> } }>;
+    assert.equal(nodes.length, 4);
+    assert.equal(nodes[0]!.type, "node");
+    assert.equal(nodes[0]!.data.uin, "10002");
+    assert.ok(nodes[1]!.data.content[0]!.data.text.startsWith("第一"));
+  } finally {
+    wsA?.terminate();
+    wsB?.terminate();
+    await bridge.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -52,8 +52,10 @@ export class QqPeer {
         const tracked = this.tracked.get(value.echo);
         if (tracked && this.observationOpen) {
           const result = value as Record<string, unknown>;
-          const data = result.data as Record<string, unknown> | null;
-          const id = data && typeof data === "object" ? qqMessageId(data.message_id) : null;
+          const data = result.data as Record<string, unknown> | number | string | null;
+          const id = data && typeof data === "object"
+            ? qqMessageId((data as Record<string, unknown>).message_id)
+            : qqMessageId(data);
           const observation: QqAttemptObservation = result.status === "ok" && result.retcode === 0 && id !== null
             ? { kind: "ack", messageId: id }
             : { kind: result.status === "failed" && typeof result.retcode === "number" && result.retcode !== 0 && result.retcode !== 1 ? "rejected" : "uncertain" };
@@ -69,8 +71,10 @@ export class QqPeer {
         const pending = this.take(value.echo);
         if (!pending) return;
         const result = value as Record<string, unknown>;
-        const data = result.data as Record<string, unknown> | null;
-        const messageId = data && typeof data === "object" ? qqMessageId(data.message_id) : null;
+        const data = result.data as Record<string, unknown> | number | string | null;
+        const messageId = data && typeof data === "object"
+          ? qqMessageId((data as Record<string, unknown>).message_id)
+          : qqMessageId(data);
         if (result.status === "ok" && result.retcode === 0 && messageId !== null) pending.resolve(messageId);
         else pending.reject(new QqApiError(result.status === "failed" && typeof result.retcode === "number" &&
           result.retcode !== 0 && result.retcode !== 1 ? "api-rejected" : "api-unconfirmed"));
@@ -117,7 +121,7 @@ export class QqPeer {
     }
   }
   /** Optional production seam; legacy request() retains its original behavior. No retry. */
-  requestAttempt(action: "send_private_msg" | "send_group_msg", params: Record<string, unknown>, options: QqAttemptOptions): Promise<string> {
+  requestAttempt(action: "send_private_msg" | "send_group_msg" | "send_group_forward_msg", params: Record<string, unknown>, options: QqAttemptOptions): Promise<string> {
     if (!this.open || !this.acceptingAttempts || !this.observationOpen || this.socket.bufferedAmount > 1024 * 1024
       || !Number.isInteger(options.capacity ?? 16) || (options.capacity ?? 16) < 1
       || this.tracked.size >= (options.capacity ?? 16) || [...this.tracked.values()].some(t => t.options.attemptId === options.attemptId))

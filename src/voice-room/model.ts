@@ -1,14 +1,19 @@
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, Tool, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 import { join } from "node:path";
 import type { ModelConfig } from "../config.js";
 import { estimateTokens } from "../prompting/token-estimate.js";
 import type { RoomAnswer, RoomPrompt } from "./types.js";
 import { RoomModelDiagnostics, type RoomModelDiagnostic } from "./model-diagnostics.js";
+import { dynamicPageTokenBudget, WEB_HARD_CHAR_CEILING, type RoomWebToolkit } from "./web.js";
 
-export const ROOM_MODEL_ROUND_TIMEOUT_MS = 60000;
+export const ROOM_MODEL_ROUND_TIMEOUT_MS = 90000;
 export const ROOM_LIFECYCLE_MAX_TOKENS = 1024;
+export const ROOM_LIFECYCLE_DEEP_MAX_TOKENS = 6144;
 export const ROOM_LIFECYCLE_PROTOCOL_RESERVE_TOKENS = 256;
+export const ROOM_LIFECYCLE_DEEP_MAX_SEGMENTS = 6;
+const ROOM_MAX_TOOL_ROUNDS = 3;
+const ROOM_MAX_TOOL_CALLS_PER_ROUND = 3;
 
 export type RoomModelFailure = "incomplete" | "empty" | "invalid-json" | "invalid-schema"
   | "request" | "cancelled" | "deadline" | "budget" | "context-budget";
@@ -21,14 +26,30 @@ export class RoomModelError extends Error {
   }
 }
 
+export interface RoomLifecycleGenerateOptions {
+  readonly maxSegments?: number;
+  readonly deep?: boolean;
+  readonly web?: RoomWebToolkit;
+}
+
+function stripJsonFence(raw: string): string {
+  const trimmed = raw.trim();
+  const match = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
+  return match ? match[1]!.trim() : trimmed;
+}
+
+function extractAssistantText(content: readonly { readonly type: string; readonly text?: string }[]): string {
+  return content.filter((item): item is { type: "text"; text: string } =>
+    item.type === "text" && typeof item.text === "string").map(item => item.text).join("");
+}
+
 export function parseRoomAnswer(stopReason: string,
   content: readonly { readonly type: string; readonly text?: string }[]): RoomAnswer {
   if (stopReason !== "stop") throw new RoomModelError("incomplete");
-  const text = content.filter((item): item is { type: "text"; text: string } =>
-    item.type === "text" && typeof item.text === "string").map(item => item.text).join("");
+  const text = extractAssistantText(content);
   if (!text.trim()) throw new RoomModelError("empty");
   let answer: unknown;
-  try { answer = JSON.parse(text); }
+  try { answer = JSON.parse(stripJsonFence(text)); }
   catch { throw new RoomModelError("invalid-json"); }
   if (!answer || typeof answer !== "object" || Array.isArray(answer)) throw new RoomModelError("invalid-schema");
   const row = answer as Record<string, unknown>;
@@ -43,21 +64,21 @@ export type RoomLifecycleAnswer =
   | { readonly kind: "skip" }
   | { readonly kind: "reply"; readonly segments: readonly string[] };
 
-/** Strict tools-free lifecycle protocol. A target @ may never be swallowed by `skip`. */
+/** Strict lifecycle protocol parser. Casual mode allows 1..2 segments; deep mode allows up to `maxSegments`. */
 export function parseRoomLifecycleAnswer(stopReason: string,
-  content: readonly { readonly type: string; readonly text?: string }[]): RoomLifecycleAnswer {
+  content: readonly { readonly type: string; readonly text?: string }[],
+  maxSegments = 2): RoomLifecycleAnswer {
   if (stopReason !== "stop") throw new RoomModelError("incomplete");
-  const text = content.filter((item): item is { type: "text"; text: string } =>
-    item.type === "text" && typeof item.text === "string").map(item => item.text).join("");
+  const text = extractAssistantText(content);
   if (!text.trim()) throw new RoomModelError("empty");
   let answer: unknown;
-  try { answer = JSON.parse(text); }
+  try { answer = JSON.parse(stripJsonFence(text)); }
   catch { throw new RoomModelError("invalid-json"); }
   if (!answer || typeof answer !== "object" || Array.isArray(answer)) throw new RoomModelError("invalid-schema");
   const row = answer as Record<string, unknown>;
   if (row.kind === "skip" && Object.keys(row).length === 1) return Object.freeze({ kind: "skip" });
   if (row.kind === "reply" && Object.keys(row).sort().join(",") === "kind,segments"
-    && Array.isArray(row.segments) && row.segments.length >= 1 && row.segments.length <= 2
+    && Array.isArray(row.segments) && row.segments.length >= 1 && row.segments.length <= maxSegments
     && row.segments.every(segment => typeof segment === "string" && segment.trim().length > 0
       && !segment.includes("\0"))) {
     return Object.freeze({ kind: "reply", segments: Object.freeze(row.segments.map(segment => segment.trim())) });
@@ -65,9 +86,21 @@ export function parseRoomLifecycleAnswer(stopReason: string,
   throw new RoomModelError("invalid-schema");
 }
 
-interface RoomModelRun<T> {
-  readonly maxTokens: number;
-  readonly parse: (result: AssistantMessage) => T;
+function proseToSegments(text: string, maxSegments: number, maxChars: number): readonly string[] | null {
+  const cleaned = text.replace(/\r\n?/g, "\n").trim();
+  if (!cleaned || cleaned.includes("\0") || cleaned.startsWith("{") || cleaned.startsWith("```")) return null;
+  const paragraphs = cleaned.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+  if (!paragraphs.length) return null;
+  const merged: string[] = [];
+  for (const para of paragraphs) {
+    if (merged.length < maxSegments) {
+      merged.push(para);
+    } else {
+      merged[merged.length - 1] = `${merged[merged.length - 1]}\n\n${para}`;
+    }
+  }
+  if (merged.some(segment => [...segment].length > maxChars)) return null;
+  return Object.freeze(merged);
 }
 
 function diagnosticStage(prompt: RoomPrompt): RoomModelDiagnostic["stage"] {
@@ -77,13 +110,34 @@ function diagnosticStage(prompt: RoomPrompt): RoomModelDiagnostic["stage"] {
   } catch { return "reply"; }
 }
 
-/** Stateless low-level tools-free model invocation; reuses one ModelRuntime per configuration. */
-function roomModelRequest<T>(config: ModelConfig, roomDataDir: string,
-  run: RoomModelRun<T>,
-  onFailure: (code: RoomModelFailure, diagnostic: RoomModelDiagnostic) => void) {
-  const thinkingDisableRequested = config.modelId === "deepseek-flash" || config.modelId === "deepseek-v4-pro";
+function resolveThinkingPayload(config: ModelConfig, deep: boolean): {
+  payload: Record<string, unknown>;
+  disableRequested: boolean;
+} {
+  const isDeepSeekToggle = config.modelId === "deepseek-flash" || config.modelId === "deepseek-v4-pro";
+  const mode = config.thinkingMode ?? "auto";
+  if (mode === "disabled") {
+    return {
+      payload: isDeepSeekToggle ? { thinking: { type: "disabled" } } : {},
+      disableRequested: isDeepSeekToggle,
+    };
+  }
+  if (mode === "enabled") {
+    return {
+      payload: isDeepSeekToggle ? { thinking: { type: "enabled" } } : {},
+      disableRequested: false,
+    };
+  }
+  // auto: keep fast non-thinking for casual/voice, allow native reasoning on deep analysis
+  if (!deep && isDeepSeekToggle) {
+    return { payload: { thinking: { type: "disabled" } }, disableRequested: true };
+  }
+  return { payload: {}, disableRequested: false };
+}
+
+function createRuntimeAccessor(config: ModelConfig, roomDataDir: string, registeredMaxTokens: number) {
   let runtimePromise: Promise<ModelRuntime> | undefined;
-  const getRuntime = (): Promise<ModelRuntime> => {
+  return (): Promise<ModelRuntime> => {
     if (!runtimePromise) {
       runtimePromise = (async () => {
         const runtime = await ModelRuntime.create({
@@ -94,7 +148,7 @@ function roomModelRequest<T>(config: ModelConfig, roomDataDir: string,
           baseUrl: config.baseUrl, api: "openai-completions", models: [{
             id: config.modelId, name: config.modelId, reasoning: false, input: ["text"],
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: config.contextWindow, maxTokens: run.maxTokens,
+            contextWindow: config.contextWindow, maxTokens: registeredMaxTokens,
             compat: { supportsDeveloperRole: false, supportsStore: false, maxTokensField: "max_tokens" },
           }],
         });
@@ -107,113 +161,260 @@ function roomModelRequest<T>(config: ModelConfig, roomDataDir: string,
     }
     return runtimePromise;
   };
+}
 
-  const generate = async (prompt: RoomPrompt, signal: AbortSignal,
-    diagnostic: RoomModelDiagnostics): Promise<T> => {
-    signal.throwIfAborted();
-    const inputBudget = config.contextWindow - run.maxTokens - 1024;
-    if (inputBudget < 1 || estimateTokens(prompt.systemPrompt
-      + prompt.messages.map(message => message.content).join("\n")) > inputBudget) {
-      throw new RoomModelError("context-budget");
+function buildWebTools(web: RoomWebToolkit): Tool[] {
+  const tools: Tool[] = [{
+    name: "web_fetch",
+    description: "Fetch and read a public web page or GitHub repository/issue/PR/file as clean text or Markdown.",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "The public http/https URL to read." },
+      },
+      required: ["url"],
+      additionalProperties: false,
+    } as unknown as Tool["parameters"],
+  }];
+  if (web.hasSearch) {
+    tools.unshift({
+      name: "web_search",
+      description: "Search the public web for up-to-date facts, articles, documentation, or technical references.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Concise search query." },
+        },
+        required: ["query"],
+        additionalProperties: false,
+      } as unknown as Tool["parameters"],
+    });
+  }
+  return tools;
+}
+
+function estimateTranscriptTokens(systemPrompt: string, messages: readonly Message[]): number {
+  let total = estimateTokens(systemPrompt);
+  for (const message of messages) {
+    if (typeof message.content === "string") {
+      total += estimateTokens(message.content);
+    } else if (Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (block.type === "text") total += estimateTokens(block.text);
+        else if (block.type === "toolCall") total += estimateTokens(block.name + JSON.stringify(block.arguments));
+      }
     }
-    const runtime = await getRuntime();
-    signal.throwIfAborted();
-    const model = runtime.getModel("room-provider", config.modelId)!;
-    const messages: Message[] = prompt.messages.map(message => ({
-      role: "user" as const, content: message.content, timestamp: Date.now(),
-    }));
-    let result: AssistantMessage;
+  }
+  return total;
+}
+
+async function executeWebToolCall(call: ToolCall, web: RoomWebToolkit, remainingTokens: number,
+  signal: AbortSignal): Promise<ToolResultMessage> {
+  const startedAt = Date.now();
+  const makeResult = (payload: unknown, isError = false): ToolResultMessage => ({
+    role: "toolResult",
+    toolCallId: call.id,
+    toolName: call.name,
+    content: [{ type: "text", text: JSON.stringify(payload) }],
+    isError,
+    timestamp: Date.now(),
+    durationMs: Math.max(0, Date.now() - startedAt),
+  });
+  try {
+    if (call.name === "web_search" && web.hasSearch) {
+      const query = typeof call.arguments?.query === "string" ? call.arguments.query : "";
+      if (!query.trim()) return makeResult({ error: "empty_query" }, true);
+      const hits = await web.search(query, signal);
+      return makeResult({ query, results: hits });
+    }
+    if (call.name === "web_fetch") {
+      const url = typeof call.arguments?.url === "string" ? call.arguments.url : "";
+      if (!url.trim()) return makeResult({ error: "empty_url" }, true);
+      const pageTokens = dynamicPageTokenBudget(Math.max(1000, remainingTokens), 1);
+      const item = await web.fetchUrl(url, { maxChars: WEB_HARD_CHAR_CEILING, maxTokens: pageTokens }, signal);
+      if (!item) return makeResult({ url, error: "fetch_failed_or_blocked" }, true);
+      return makeResult(item);
+    }
+    return makeResult({ error: "unsupported_tool" }, true);
+  } catch {
+    return makeResult({ error: "tool_execution_failed" }, true);
+  }
+}
+
+export function roomWorkerVoiceTranslator(config: ModelConfig, roomDataDir: string,
+  onFailure: (code: RoomModelFailure, diagnostic: RoomModelDiagnostic) => void = () => {}) {
+  const maxTokens = 2048;
+  const thinking = resolveThinkingPayload(config, false);
+  const getRuntime = createRuntimeAccessor(config, roomDataDir, maxTokens);
+  return async (prompt: RoomPrompt, signal: AbortSignal): Promise<string> => {
+    const diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, thinking.disableRequested);
     try {
-      result = await runtime.complete(model, {
-        systemPrompt: prompt.systemPrompt,
-        tools: [],
-        messages,
-      }, {
-        signal,
-        timeoutMs: ROOM_MODEL_ROUND_TIMEOUT_MS,
-        maxTokens: run.maxTokens,
-        maxRetries: 0,
-        onResponse: response => {
-          try { diagnostic.response(response.status, response.headers); }
-          catch { diagnostic.incomplete(); }
-        },
-        onProviderStreamEvent: event => {
-          try { diagnostic.event(event); }
-          catch { diagnostic.incomplete(); }
-        },
-        onPayload: payload => {
-          if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-            throw new Error("room-model-payload");
-          }
-          const thinking = thinkingDisableRequested ? { thinking: { type: "disabled" } } : {};
-          return { ...payload, ...thinking, response_format: { type: "json_object" } };
-        },
-      });
+      signal.throwIfAborted();
+      const inputBudget = config.contextWindow - maxTokens - 1024;
+      if (inputBudget < 1 || estimateTokens(prompt.systemPrompt
+        + prompt.messages.map(message => message.content).join("\n")) > inputBudget) {
+        throw new RoomModelError("context-budget");
+      }
+      const runtime = await getRuntime();
+      signal.throwIfAborted();
+      const model = runtime.getModel("room-provider", config.modelId)!;
+      const messages: Message[] = prompt.messages.map(message => ({
+        role: "user" as const, content: message.content, timestamp: Date.now(),
+      }));
+      let result: AssistantMessage;
+      try {
+        result = await runtime.complete(model, { systemPrompt: prompt.systemPrompt, tools: [], messages }, {
+          signal, timeoutMs: ROOM_MODEL_ROUND_TIMEOUT_MS, maxTokens, maxRetries: 0,
+          onResponse: response => { try { diagnostic.response(response.status, response.headers); } catch { diagnostic.incomplete(); } },
+          onProviderStreamEvent: event => { try { diagnostic.event(event); } catch { diagnostic.incomplete(); } },
+          onPayload: payload => {
+            if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("room-model-payload");
+            return { ...payload, ...thinking.payload, response_format: { type: "json_object" } };
+          },
+        });
+      } catch (error) {
+        if (signal.aborted) throw new RoomModelError("cancelled");
+        throw error;
+      }
+      try { diagnostic.result(result); } catch { diagnostic.incomplete(); }
+      signal.throwIfAborted();
+      if (result.stopReason === "aborted") throw new RoomModelError("cancelled");
+      if (diagnostic.snapshot().provider.finishReason === "content_filter") throw new RoomModelError("incomplete");
+      if (result.stopReason === "error") throw new RoomModelError("request");
+      const parsed = parseRoomAnswer(result.stopReason, result.content);
+      if (parsed.kind !== "reply") throw new RoomModelError("invalid-schema");
+      return parsed.text;
     } catch (error) {
-      if (signal.aborted) throw new RoomModelError("cancelled");
-      throw error;
-    }
-    try { diagnostic.result(result); } catch { diagnostic.incomplete(); }
-    signal.throwIfAborted();
-    if (result.stopReason === "aborted") throw new RoomModelError("cancelled");
-    if (diagnostic.snapshot().provider.finishReason === "content_filter") {
-      throw new RoomModelError("incomplete");
-    }
-    if (result.stopReason === "error") throw new RoomModelError("request");
-    return run.parse(result);
-  };
-
-  return async (prompt: RoomPrompt, signal: AbortSignal): Promise<T> => {
-    const diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), run.maxTokens, thinkingDisableRequested);
-    try { return await generate(prompt, signal, diagnostic); }
-    catch (error) {
       const code = signal.aborted ? "cancelled" : error instanceof RoomModelError ? error.code : "request";
-      try { onFailure(code, diagnostic.snapshot(signal.aborted)); }
-      catch { /* Metadata observers cannot change delivery. */ }
+      try { onFailure(code, diagnostic.snapshot(signal.aborted)); } catch { /* Observer only. */ }
       if (code === "cancelled") throw new RoomModelError("cancelled");
       throw error;
     }
   };
 }
 
-export function roomWorkerVoiceTranslator(config: ModelConfig, roomDataDir: string,
-  onFailure: (code: RoomModelFailure, diagnostic: RoomModelDiagnostic) => void = () => {}) {
-  const generate = roomModelRequest(config, roomDataDir, {
-    maxTokens: 2048,
-    parse: result => parseRoomAnswer(result.stopReason, result.content),
-  }, onFailure);
-  return async (prompt: RoomPrompt, signal: AbortSignal): Promise<string> => {
-    const result = await generate(prompt, signal);
-    if (result.kind !== "reply") throw new RoomModelError("invalid-schema");
-    return result.text;
-  };
-}
-
-/** Tools-free lifecycle reply generator. */
+/**
+ * Lifecycle reply generator supporting both fast casual replies (tools-free, 1..2 segments)
+ * and deep analysis / URL-summary replies (up to 6 structured paragraphs, smart thinking,
+ * and optional bounded read-only web_search / web_fetch tool calling).
+ */
 export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
   onFailure: (code: RoomModelFailure, diagnostic: RoomModelDiagnostic) => void = () => {}):
-  (prompt: RoomPrompt, signal: AbortSignal, maxChars: number) => Promise<RoomLifecycleAnswer> {
-  const maxTokens = Math.max(1, Math.min(config.maxTokens, ROOM_LIFECYCLE_MAX_TOKENS));
-  const request = roomModelRequest(config, roomDataDir, {
-    maxTokens,
-    parse: result => parseRoomLifecycleAnswer(result.stopReason, result.content),
-  }, onFailure);
-  return async (prompt, signal, maxChars) => {
-    if (!Number.isSafeInteger(maxChars) || maxChars < 1) throw new Error("room-lifecycle-model-request-invalid");
-    const systemPrompt = `${prompt.systemPrompt}
+  (prompt: RoomPrompt, signal: AbortSignal, maxChars: number, options?: RoomLifecycleGenerateOptions) => Promise<RoomLifecycleAnswer> {
+  const registeredMaxTokens = Math.max(config.maxTokens, ROOM_LIFECYCLE_DEEP_MAX_TOKENS);
+  const getRuntime = createRuntimeAccessor(config, roomDataDir, registeredMaxTokens);
 
-Lifecycle output protocol (overrides every earlier instruction):
+  return async (prompt, signal, maxChars, options = {}) => {
+    if (!Number.isSafeInteger(maxChars) || maxChars < 1) throw new Error("room-lifecycle-model-request-invalid");
+    const deep = Boolean(options.deep);
+    const maxSegments = options.maxSegments ?? (deep ? ROOM_LIFECYCLE_DEEP_MAX_SEGMENTS : 2);
+    const targetMaxTokens = deep
+      ? Math.max(1, Math.min(Math.max(config.maxTokens, 4096), ROOM_LIFECYCLE_DEEP_MAX_TOKENS))
+      : Math.max(1, Math.min(config.maxTokens, ROOM_LIFECYCLE_MAX_TOKENS));
+    const maxTokens = Math.max(256, Math.min(targetMaxTokens, Math.max(256, config.contextWindow - 2048)));
+    const thinking = resolveThinkingPayload(config, deep);
+    const diagnostic = new RoomModelDiagnostics(diagnosticStage(prompt), maxTokens, thinking.disableRequested);
+    const web = deep ? options.web : undefined;
+    const tools: Tool[] = web ? buildWebTools(web) : [];
+
+    const protocolSuffix = deep
+      ? `\n\nLifecycle output protocol (overrides every earlier instruction):
+- ${tools.length ? "If you need fresher external facts or to read an unfetched link, call web_search or web_fetch first (at most 3 rounds). Otherwise answer directly." : "This request is tools-free. Never emit a tool call."}
+- For the final answer, return ONLY one JSON object with no extra prose outside the JSON.
+- A skip is encoded as {"kind":"skip"}.
+- A reply is encoded as {"kind":"reply","segments":[string,...]} with 1 to ${maxSegments} well-structured, logical paragraphs.
+- Each paragraph must be non-empty and at most ${maxChars} Unicode characters.`
+      : `\n\nLifecycle output protocol (overrides every earlier instruction):
 - This request is tools-free. Never emit a tool call.
 - Return exactly one JSON object with no markdown.
 - A skip is encoded as {"kind":"skip"}.
 - A reply is encoded as {"kind":"reply","segments":[string,...]} with one or two non-empty segments.
 - Each segment must be at most ${maxChars} Unicode characters.
 - Do not return more than two segments and never pad a one-segment reply.`;
-    const lifecyclePrompt: RoomPrompt = Object.freeze({
-      ...prompt,
-      systemPrompt,
-      tools: Object.freeze([]) as readonly [],
-    });
-    return request(lifecyclePrompt, signal);
+
+    const systemPrompt = `${prompt.systemPrompt}${protocolSuffix}`;
+
+    try {
+      signal.throwIfAborted();
+      const inputBudget = config.contextWindow - maxTokens - 1024;
+      const messages: Message[] = prompt.messages.map(message => ({
+        role: "user" as const, content: message.content, timestamp: Date.now(),
+      }));
+      if (inputBudget < 1 || estimateTranscriptTokens(systemPrompt, messages) > inputBudget) {
+        throw new RoomModelError("context-budget");
+      }
+      const runtime = await getRuntime();
+      signal.throwIfAborted();
+      const model = runtime.getModel("room-provider", config.modelId)!;
+
+      const totalRounds = tools.length > 0 ? ROOM_MAX_TOOL_ROUNDS + 1 : 1;
+      for (let round = 0; round < totalRounds; round++) {
+        signal.throwIfAborted();
+        const allowToolsThisRound = tools.length > 0 && round < ROOM_MAX_TOOL_ROUNDS;
+        const usedTokens = estimateTranscriptTokens(systemPrompt, messages);
+        if (usedTokens > inputBudget) throw new RoomModelError("context-budget");
+
+        let result: AssistantMessage;
+        try {
+          result = await runtime.complete(model, {
+            systemPrompt,
+            tools: allowToolsThisRound ? tools : [],
+            messages,
+          }, {
+            signal,
+            timeoutMs: ROOM_MODEL_ROUND_TIMEOUT_MS,
+            maxTokens,
+            maxRetries: 0,
+            onResponse: response => { try { diagnostic.response(response.status, response.headers); } catch { diagnostic.incomplete(); } },
+            onProviderStreamEvent: event => { try { diagnostic.event(event); } catch { diagnostic.incomplete(); } },
+            onPayload: payload => {
+              if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("room-model-payload");
+              return allowToolsThisRound
+                ? { ...payload, ...thinking.payload }
+                : { ...payload, ...thinking.payload, response_format: { type: "json_object" } };
+            },
+          });
+        } catch (error) {
+          if (signal.aborted) throw new RoomModelError("cancelled");
+          throw error;
+        }
+        try { diagnostic.result(result); } catch { diagnostic.incomplete(); }
+        signal.throwIfAborted();
+        if (result.stopReason === "aborted") throw new RoomModelError("cancelled");
+        if (diagnostic.snapshot().provider.finishReason === "content_filter") throw new RoomModelError("incomplete");
+        if (result.stopReason === "error") throw new RoomModelError("request");
+
+        const toolCalls = allowToolsThisRound
+          ? result.content.filter((item): item is ToolCall => item.type === "toolCall").slice(0, ROOM_MAX_TOOL_CALLS_PER_ROUND)
+          : [];
+
+        if (toolCalls.length > 0 && web) {
+          messages.push(result);
+          const remainingAfterAssistant = Math.max(0, inputBudget - estimateTranscriptTokens(systemPrompt, messages));
+          const perCallTokens = Math.max(800, Math.floor(remainingAfterAssistant / Math.max(1, toolCalls.length)));
+          const toolResults = await Promise.all(
+            toolCalls.map(call => executeWebToolCall(call, web, perCallTokens, signal)),
+          );
+          messages.push(...toolResults);
+          continue;
+        }
+
+        try {
+          return parseRoomLifecycleAnswer(result.stopReason, result.content, maxSegments);
+        } catch (parseError) {
+          if (deep && allowToolsThisRound && result.stopReason === "stop") {
+            const fallback = proseToSegments(extractAssistantText(result.content), maxSegments, maxChars);
+            if (fallback) return Object.freeze({ kind: "reply", segments: fallback });
+          }
+          throw parseError;
+        }
+      }
+      throw new RoomModelError("incomplete");
+    } catch (error) {
+      const code = signal.aborted ? "cancelled" : error instanceof RoomModelError ? error.code : "request";
+      try { onFailure(code, diagnostic.snapshot(signal.aborted)); } catch { /* Metadata observers cannot change delivery. */ }
+      if (code === "cancelled") throw new RoomModelError("cancelled");
+      throw error;
+    }
   };
 }

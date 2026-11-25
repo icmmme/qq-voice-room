@@ -10,6 +10,7 @@ import type { RoomQqSettings } from "./qq-config.js";
 import { checkedWorkerQueue, RoomWorkerDeliveryError, workerDeliveryModes } from "./qq-config.js";
 import { VoiceRoom, type RoomLifecycleModelPort } from "./runtime.js";
 import type { RoomAmbientPlanner } from "./participation-planner.js";
+import type { RoomWebToolkit } from "./web.js";
 import { RoomSendError, type RoomControlAction, type RoomDependencies, type RoomInput,
   type RoomParticipationMode, type RoomPrompt } from "./types.js";
 import { roomRecord } from "./fish.js";
@@ -41,7 +42,7 @@ const equal = (a: string, b: string) => {
 export async function startRoomQq(settings: RoomQqSettings,
   deps: Pick<RoomDependencies, "persona" | "permitsText" | "permitsPrompt" | "now" | "onContextCompacted">
     & Partial<Pick<RoomDependencies, "generate" | "translateVoice">>
-    & { lifecycleModel?: RoomLifecycleModelPort },
+    & { lifecycleModel?: RoomLifecycleModelPort; web?: RoomWebToolkit },
   onNotice: (notice: RoomQqNotice) => void = () => {},
   voice?: { synthesize: RoomDependencies["synthesize"] }) {
   const workerSelected = settings.execution === "worker";
@@ -203,18 +204,45 @@ export async function startRoomQq(settings: RoomQqSettings,
       if (workerSelected && !workerStarted && peers.size === config.characters.length) {
         workerStarted = true;
         void room.startLifecycleProductionWorker({ model: deps.lifecycleModel!, ambientPlanner,
+          ...(deps.web ? { web: deps.web } : {}),
           apiTimeoutMs: settings.apiTimeoutMs,
           closePolicy, dispatch: async request => {
             if (closing || request.signal.aborted) throw new RoomSendError("rejected");
             const peer = peers.get(request.attempt.accountKey);
             if (!peer?.open) throw new RoomSendError("rejected");
             if (request.medium === "audio" && !request.bytes) throw new RoomSendError("rejected");
+            const attemptOptions = {
+              attemptId: request.attempt.attemptId, beforeSend: request.beforeSend, observe: request.observe,
+              released: request.released, physicalSettled: request.physicalSettled, notSent: request.notSent,
+              capacity: closePolicy.perAccountCapacity,
+            };
+            const forwardNodes = request.medium === "text"
+              ? (request.forwardNodes?.length
+                ? request.forwardNodes
+                : request.item.segment.deliveryMode === "text" && [...request.item.segment.text].length > 200
+                  ? request.item.segment.text.split(/\n{2,}/).map(part => part.trim()).filter(Boolean)
+                  : undefined)
+              : undefined;
+            if (forwardNodes && forwardNodes.length > 0) {
+              const messages = forwardNodes.map(nodeText => ({
+                type: "node",
+                data: {
+                  uin: request.item.character.selfId,
+                  name: request.item.character.name,
+                  content: [{ type: "text", data: { text: nodeText } }],
+                },
+              }));
+              try {
+                return await peer.requestAttempt("send_group_forward_msg",
+                  { group_id: Number(config.groupId), messages }, attemptOptions);
+              } catch (error) {
+                throw new RoomSendError(error instanceof QqApiError && error.code === "api-rejected" ? "rejected" : "uncertain");
+              }
+            }
             const message = request.medium === "audio" ? [roomRecord(request.bytes!)]
               : [{ type: "text", data: { text: request.item.segment.text } }];
             try { return await peer.requestAttempt("send_group_msg", { group_id: Number(config.groupId), message, auto_escape: true },
-              { attemptId: request.attempt.attemptId, beforeSend: request.beforeSend, observe: request.observe,
-                released: request.released, physicalSettled: request.physicalSettled, notSent: request.notSent,
-                capacity: closePolicy.perAccountCapacity }); }
+              attemptOptions); }
             catch (error) { throw new RoomSendError(error instanceof QqApiError && error.code === "api-rejected" ? "rejected" : "uncertain"); }
           }, beginClose: until => { for (const p of peers.values()) p.beginObservationClose(until); },
           sealObservations: () => Promise.all([...peers.values()].map(p => p.sealObservations())).then(() => {}),

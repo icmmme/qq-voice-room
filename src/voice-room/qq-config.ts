@@ -93,10 +93,12 @@ export function readRoomQqSettings(file: string, env: NodeJS.ProcessEnv = proces
 }
 
 export function readRoomModelConfig(env: NodeJS.ProcessEnv = process.env): ModelConfig {
-  // Deliberately allowlist model fields and the Voice Room-only public search setting.
-  return readModelConfig(Object.fromEntries(["PA_BASE_URL", "PA_MODEL", "PA_API_KEY", "PA_CONTEXT_WINDOW", "PA_MAX_TOKENS",
-    "PA_CONTEXT_WINDOW_VERIFIED", "PA_REQUEST_TIMEOUT_MS", "TAVILY_API_KEY", "PA_WEB_TIMEOUT_MS"]
-    .map(key => [key, env[key]])));
+  // Deliberately allowlist model fields and the Voice Room-only public web/search settings.
+  return readModelConfig(Object.fromEntries([
+    "PA_BASE_URL", "PA_MODEL", "PA_API_KEY", "PA_CONTEXT_WINDOW", "PA_MAX_TOKENS",
+    "PA_CONTEXT_WINDOW_VERIFIED", "PA_REQUEST_TIMEOUT_MS", "PA_THINKING",
+    "TAVILY_API_KEY", "BOCHA_API_KEY", "EXA_API_KEY", "JINA_API_KEY", "GITHUB_TOKEN", "PA_WEB_TIMEOUT_MS",
+  ].map(key => [key, env[key]])));
 }
 
 export function checkPublicPersonas(settings: RoomQqSettings): void {

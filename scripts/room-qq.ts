@@ -2,8 +2,9 @@ import { resolve } from "node:path";
 import { checkRoomConfig } from "../src/voice-room/config.js";
 import { checkPublicPersonas, readRoomModelConfig, readRoomQqSettings, RoomWorkerDeliveryError,
   workerDeliveryModes } from "../src/voice-room/qq-config.js";
-import { roomLifecycleGenerator, roomWorkerVoiceTranslator, ROOM_LIFECYCLE_MAX_TOKENS,
+import { roomLifecycleGenerator, roomWorkerVoiceTranslator, ROOM_LIFECYCLE_DEEP_MAX_TOKENS,
   ROOM_MODEL_ROUND_TIMEOUT_MS } from "../src/voice-room/model.js";
+import { createRoomWebToolkit } from "../src/voice-room/web.js";
 import { startRoomQq } from "../src/voice-room/qq-server.js";
 import { roomPublicPolicy } from "../src/voice-room/public-policy.js";
 import { readFishConfig, fishSynthesizer, FishTtsError } from "../src/voice-room/fish.js";
@@ -32,9 +33,18 @@ async function main() {
     modelWindowSource: model.contextWindowSource ?? "default",
     modelWindowVerified: model.contextWindowVerified === true,
   });
+  const web = createRoomWebToolkit({
+    tavilyApiKey: model.tavilyApiKey,
+    bochaApiKey: model.bochaApiKey,
+    exaApiKey: model.exaApiKey,
+    jinaApiKey: model.jinaApiKey,
+    githubToken: model.githubToken,
+    timeoutMs: model.webTimeoutMs,
+    sanitizeText: policy.sanitizeWebText,
+  });
   const room = checkRoomConfig({ ...settings.room, limits: { ...settings.room.limits,
     contextTokens: contextWindow.effectiveWindow,
-    outputTokens: Math.min(model.maxTokens, ROOM_LIFECYCLE_MAX_TOKENS),
+    outputTokens: Math.min(model.maxTokens, ROOM_LIFECYCLE_DEEP_MAX_TOKENS),
     requestTimeoutMs: Math.min(settings.room.limits.requestTimeoutMs, model.requestTimeoutMs),
   } });
   const budget = calculateContextBudget(room.limits.contextTokens, room.limits.outputTokens);
@@ -50,13 +60,14 @@ async function main() {
     outputReserve: budget.outputReserve,
     safetyMargin: budget.safetyMargin,
     inputBudget: budget.inputBudget,
+    thinkingMode: model.thinkingMode ?? "auto",
     replyDeadlineSource: settings.replyDeadlineSource ?? "default",
     replyDeadlineMs: room.limits.replyDeadlineMs,
     nonReplyTimeoutMs: room.limits.requestTimeoutMs,
     nonReplyTimeoutSource: "default",
     modelRoundTimeoutMs: ROOM_MODEL_ROUND_TIMEOUT_MS,
     modelRoundTimeoutSource: "default",
-    tools: "none",
+    tools: web.hasSearch ? "web_search,web_fetch" : "web_fetch",
     providerRetry: "none",
   };
   const proxy = discoverRoomProxy();
@@ -79,6 +90,7 @@ async function main() {
   try {
     bridge = await startRoomQq({ ...settings, room }, {
       ...policy,
+      web,
       lifecycleModel: { generate: roomLifecycleGenerator({ ...model, contextWindow: room.limits.contextTokens },
         settings.dataDir, (code, diagnostic) => console.log(JSON.stringify({ type: "model-error", code, diagnostic }))) },
       translateVoice: roomWorkerVoiceTranslator(model, settings.dataDir),
@@ -93,7 +105,7 @@ async function main() {
   const entryMode = deliveryModes.effectiveDeliveryMode === "both" ? "文字＋语音"
     : deliveryModes.effectiveDeliveryMode === "text" ? "文字" : "";
   console.log(`房间${entryMode}入口已启动，端口 ${settings.port}；等待两个 NapCat Universal 反向连接。`);
-  console.log("lifecycle Worker 两账号就绪后进入 mention_only；仅支持 text/both，仅配置 ownerId 可切换模式；工具调用关闭。Ctrl+C 关闭并归账。");
+  console.log(`lifecycle Worker 两账号就绪后进入 mention_only；仅支持 text/both，仅配置 ownerId 可切换模式；联网工具：${web.hasSearch ? "web_search+web_fetch" : "web_fetch"}。Ctrl+C 关闭并归账。`);
   let stopping = false;
   const stop = () => {
     if (stopping) return; stopping = true;

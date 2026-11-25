@@ -3,9 +3,9 @@ import { defaultCharacterLanguage } from "./language.js";
 import type { RoomContextWindowSource } from "../prompting/context-budget.js";
 
 export const ROOM_LIMITS: Readonly<RoomLimits> = Object.freeze({
-  maxTextChars: 100, maxHistory: 80, historyPageRows: 200, contextTokens: 8192, outputTokens: 256,
-  turnsPerMinute: 12, modelAttemptsPerHour: 20, ttsAttemptsPerHour: 20,
-  requestTimeoutMs: 30000, replyDeadlineMs: 120000, ambientMessages: 3, ambientPeople: 2,
+  maxTextChars: 200, maxHistory: 80, historyPageRows: 200, contextTokens: 32768, outputTokens: 4096,
+  turnsPerMinute: 12, modelAttemptsPerHour: null, ttsAttemptsPerHour: null,
+  requestTimeoutMs: 60000, replyDeadlineMs: 180000, ambientMessages: 3, ambientPeople: 2,
   ambientQuietMs: 2000, ambientCooldownMs: 30000,
 });
 export const ROOM_HISTORY_PAGE_LIMIT = 500;
@@ -69,7 +69,7 @@ export function checkRoomConfig(config: RoomConfig): CheckedRoomConfig {
     || limits.ambientMessages > ROOM_HISTORY_PAGE_LIMIT || limits.maxHistory > ROOM_HISTORY_PAGE_LIMIT
     || !Number.isSafeInteger(limits.historyPageRows) || limits.historyPageRows <= 0
     || limits.historyPageRows > ROOM_HISTORY_PAGE_LIMIT
-    || limits.maxTextChars > 1000) {
+    || limits.maxTextChars > 4000) {
     throw new Error("room-limit-invalid");
   }
   for (const c of config.characters) {

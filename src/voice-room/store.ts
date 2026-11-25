@@ -2270,8 +2270,11 @@ export class RoomStore {
       if (this.stopAmbientLifecycleGeneration(turnId, request, now)) return false;
       for (let index = 0; index < segments.length; index++) {
         const segment = segments[index]!;
+        const maxStoredChars = mode === "text"
+          ? Math.max(this.config.limits.maxTextChars, 12000)
+          : this.config.limits.maxTextChars;
         if (!segment || typeof segment.text !== "string" || !segment.text.trim() || segment.text.includes("\0")
-          || [...segment.text.trim()].length > this.config.limits.maxTextChars
+          || [...segment.text.trim()].length > maxStoredChars
           || (segment.voiceText !== undefined && (typeof segment.voiceText !== "string" || !segment.voiceText.trim()
             || segment.voiceText.includes("\0") || [...segment.voiceText].length > 1000))
           || (mode === "text" && segment.voiceText !== undefined)
