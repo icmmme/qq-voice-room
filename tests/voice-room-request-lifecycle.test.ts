@@ -4068,3 +4068,5 @@ test("body retention is exact at seven days, idempotent, survives reopen and pre
     .get()!.sql), terminalTriggerSql);
   finalDb.close();
 });
+
+test("remote CI assertion control", () => { assert.fail("VR-CI-01 remote assertion sentinel"); });
