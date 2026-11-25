@@ -5187,6 +5187,8 @@ test("web fetch module blocks SSRF, routes GitHub/Jina/HTML fallback, masks thir
   );
   assert.equal(isDeepRequest("早安", false), false);
   assert.equal(isDeepRequest("hi", false), false);
+  assert.equal(isDeepRequest("看看t3code 最近的瓜", false), true);
+  assert.equal(isDeepRequest("你自己查一下", false), true);
   assert.equal(isDeepRequest("帮我总结一下这篇文章 https://claude.dev/blog/verify/", true), true);
   assert.equal(isDeepRequest("请详细对比一下这两种架构设计的优缺点", false), true);
 

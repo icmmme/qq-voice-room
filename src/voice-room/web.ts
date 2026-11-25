@@ -133,7 +133,7 @@ export function isDeepRequest(text: string, hasUrls: boolean): boolean {
   if (!trimmed) return false;
   const chars = [...trimmed].length;
   if (chars >= 60) return true;
-  if (/(查一下|查查|查一查|搜一下|搜搜|搜一搜|联网查|联网搜|帮我查|帮我搜|search for|look up|check online)/i.test(trimmed)) {
+  if (/(查一下|查查|查一查|搜一下|搜搜|搜一搜|联网|上网查|帮我查|帮我搜|最近的|近况|热搜|吃瓜|什么瓜|的瓜|什么事|出了什么|发生了什么|search|look up|check online)/i.test(trimmed)) {
     return true;
   }
   if (/(总结|概括|解读|分析|评测|对比|比较|区别|原理|机制|架构|设计|详细|深入|展开|科普|优缺点|利弊|源码|论文|报告|攻略|教程|怎么评价|怎么看待|介绍一下|讲讲|聊聊这个|explain|analyze|compare|summarize|summary|architecture|benchmark|tradeoff|verification|deep dive)/i.test(trimmed)) {
