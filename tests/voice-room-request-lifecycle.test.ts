@@ -5120,3 +5120,27 @@ test("owner /room stop cancels in-flight lifecycle work without changing mode an
   await waitFor(() => h.room.store.lifecycleRequests().find(r => r.input.messageId === "7103")?.status === "completed", "second-completed");
   assert.deepEqual(h.dispatches.map(d => d.text), ["乙正常回复"]);
 });
+
+test("lifecyclePrompt leaves room for 1024-token output and generator protocol suffix when history fills the context window", async t => {
+  const { estimateTokens } = await import("../src/prompting/token-estimate.js");
+  const { ROOM_LIFECYCLE_MAX_TOKENS } = await import("../src/voice-room/model.js");
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ limits: { contextTokens: 8192, outputTokens: 256 } }),
+    model: { generate: async () => ({ kind: "reply", segments: ["满历史也能正常生成"] }) },
+  });
+  const filler = "这是一段用于填满群聊上下文历史窗口的长消息内容。".repeat(20);
+  for (let i = 1; i <= 40; i++) {
+    assert.equal(h.receive(String(7200 + i), `${filler} #${i}`), "observed");
+  }
+  assert.equal(h.receive("7300", "现在请甲回答", ["10002"]), "scheduled");
+  await waitFor(() => h.room.store.lifecycleRequests()[0]?.status === "completed", "full-history-completed");
+  assert.equal(h.prompts.length, 1);
+  const prompt = h.prompts[0]!;
+  const withGeneratorSuffix = `${prompt.systemPrompt}\n\nLifecycle output protocol (overrides every earlier tool or single-reply instruction):\n- This request is tools-free. Never emit a tool call.\n- Return exactly one JSON object with no markdown.\n- A skip is encoded as {"kind":"skip"}.\n- A reply is encoded as {"kind":"reply","segments":[string,...]} with one or two non-empty segments.\n- Each segment must be at most 100 Unicode characters.\n- Do not return more than two segments and never pad a one-segment reply.`;
+  const used = estimateTokens(withGeneratorSuffix + prompt.messages[0].content);
+  assert.ok(used + ROOM_LIFECYCLE_MAX_TOKENS + 1024 <= 8192,
+    `expected prompt (${used}) + ${ROOM_LIFECYCLE_MAX_TOKENS} + 1024 <= 8192`);
+  const payload = JSON.parse(prompt.messages[0].content) as { targetId: number; visibleHistory: Array<{ id: number }> };
+  assert.ok(payload.visibleHistory.some(row => row.id === payload.targetId), "target message must remain in visibleHistory");
+  assert.deepEqual(h.dispatches.map(d => d.text), ["满历史也能正常生成"]);
+});

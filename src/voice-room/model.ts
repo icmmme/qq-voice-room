@@ -25,6 +25,8 @@ import { RoomModelDiagnostics, type RoomModelDiagnostic } from "./model-diagnost
 export const ROOM_MODEL_ROUND_LIMIT = 8;
 export const ROOM_TOOL_ATTEMPT_LIMIT = 12;
 export const ROOM_MODEL_ROUND_TIMEOUT_MS = 60000;
+export const ROOM_LIFECYCLE_MAX_TOKENS = 1024;
+export const ROOM_LIFECYCLE_PROTOCOL_RESERVE_TOKENS = 256;
 
 export type RoomModelFailure = "incomplete" | "empty" | "invalid-json" | "invalid-schema"
   | "request" | "cancelled" | "deadline" | "budget" | "context-budget" | "tool-protocol";
@@ -672,7 +674,7 @@ export function roomWorkerVoiceTranslator(config: ModelConfig, roomDataDir: stri
 export function roomLifecycleGenerator(config: ModelConfig, roomDataDir: string,
   onFailure: (code: RoomModelFailure, diagnostic: RoomModelDiagnostic) => void = () => {}):
   (prompt: RoomPrompt, signal: AbortSignal, maxChars: number) => Promise<RoomLifecycleAnswer> {
-  const maxTokens = Math.max(1, Math.min(config.maxTokens, 1024));
+  const maxTokens = Math.max(1, Math.min(config.maxTokens, ROOM_LIFECYCLE_MAX_TOKENS));
   return async (prompt, signal, maxChars) => {
     if (!Number.isSafeInteger(maxChars) || maxChars < 1) throw new Error("room-lifecycle-model-request-invalid");
     const systemPrompt = `${prompt.systemPrompt}

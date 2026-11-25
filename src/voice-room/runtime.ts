@@ -19,7 +19,9 @@ import { RoomSendError, type RoomCharacter, type RoomConfig, type RoomControlAct
   type RoomDelivery, type RoomParticipationMode, type RoomPrompt, type Trigger } from "./types.js";
 import { roomToolSession } from "./tools.js";
 import { MonotonicDeadline } from "../web-task.js";
-import { RoomModelError, type RoomLifecycleAnswer } from "./model.js";
+import { estimateTokens } from "../prompting/token-estimate.js";
+import { ROOM_LIFECYCLE_MAX_TOKENS, ROOM_LIFECYCLE_PROTOCOL_RESERVE_TOKENS, RoomModelError,
+  type RoomLifecycleAnswer } from "./model.js";
 import {
   AMBIENT_HISTORY_LIMIT,
   ambientPlannerCharacters,
@@ -1206,9 +1208,13 @@ export class VoiceRoom {
     if (!target) throw new Error("room-lifecycle-target-missing");
     const persona = this.deps.persona(character);
     if (!this.permits(persona)) throw new Error("lifecycle_persona_privacy_rejected");
+    const lifecycleOutputReserve = Math.min(
+      Math.max(this.config.limits.outputTokens, ROOM_LIFECYCLE_MAX_TOKENS),
+      Math.max(this.config.limits.outputTokens, this.config.limits.contextTokens - 1025),
+    );
     const base = buildRoomPromptFromPages(character, persona, target,
       (limit, beforeId) => this.store.historyPage(limit, beforeId === undefined ? {} : { beforeId }),
-      this.config.limits);
+      { ...this.config.limits, outputTokens: lifecycleOutputReserve });
     const payload = JSON.parse(base.messages[0].content) as Record<string, unknown>;
     delete payload.search;
     delete payload.github;
@@ -1231,8 +1237,21 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
     : "真实明确 @ 必须形成回应义务；不能 skip，也不能用空回答吞掉该义务。没有合适内容时给出一句诚实、简短的说明。"}
 每条回复必须是${maxSegments === 1 ? "一段" : "一到两段"}自然中文台词，${maxSegments === 1 ? "" : "不为凑数补第二段；"}不得输出动作旁白、角色名前缀、他人台词或成人内容。
 只返回 JSON：{"kind":"skip"} 或 {"kind":"reply","segments":["台词"]}。`;
+    const maxInputTokens = this.config.limits.contextTokens - lifecycleOutputReserve - 1024
+      - ROOM_LIFECYCLE_PROTOCOL_RESERVE_TOKENS;
+    const history = Array.isArray(payload.visibleHistory)
+      ? [...(payload.visibleHistory as Array<{ id?: unknown }>)] : [];
+    let content = JSON.stringify(payload);
+    while (maxInputTokens > 0 && history.length > 1
+      && estimateTokens(systemPrompt + "\n" + content) > maxInputTokens) {
+      const trimIndex = history.findIndex(item => item.id !== target.id);
+      if (trimIndex < 0) break;
+      history.splice(trimIndex, 1);
+      payload.visibleHistory = history;
+      content = JSON.stringify(payload);
+    }
     return Object.freeze({ ...base, systemPrompt,
-      messages: Object.freeze([{ role: "user" as const, content: JSON.stringify(payload) }]) as RoomPrompt["messages"],
+      messages: Object.freeze([{ role: "user" as const, content }]) as RoomPrompt["messages"],
       tools: Object.freeze([]) as readonly [] });
   }
   private checkedLifecycleSegments(value: unknown, maxSegments = 2,

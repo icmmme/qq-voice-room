@@ -2,7 +2,8 @@ import { resolve } from "node:path";
 import { checkRoomConfig } from "../src/voice-room/config.js";
 import { checkPublicPersonas, readRoomModelConfig, readRoomQqSettings, RoomWorkerDeliveryError,
   workerDeliveryModes } from "../src/voice-room/qq-config.js";
-import { roomLifecycleGenerator, roomWorkerVoiceTranslator, ROOM_MODEL_ROUND_TIMEOUT_MS } from "../src/voice-room/model.js";
+import { roomLifecycleGenerator, roomWorkerVoiceTranslator, ROOM_LIFECYCLE_MAX_TOKENS,
+  ROOM_MODEL_ROUND_TIMEOUT_MS } from "../src/voice-room/model.js";
 import { startRoomQq } from "../src/voice-room/qq-server.js";
 import { roomPublicPolicy } from "../src/voice-room/public-policy.js";
 import { readFishConfig, fishSynthesizer, FishTtsError } from "../src/voice-room/fish.js";
@@ -33,7 +34,7 @@ async function main() {
   });
   const room = checkRoomConfig({ ...settings.room, limits: { ...settings.room.limits,
     contextTokens: contextWindow.effectiveWindow,
-    outputTokens: Math.min(settings.room.limits.outputTokens, model.maxTokens, 256),
+    outputTokens: Math.min(model.maxTokens, ROOM_LIFECYCLE_MAX_TOKENS),
     requestTimeoutMs: Math.min(settings.room.limits.requestTimeoutMs, model.requestTimeoutMs),
   } });
   const budget = calculateContextBudget(room.limits.contextTokens, room.limits.outputTokens);
