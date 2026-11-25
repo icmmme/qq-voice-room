@@ -100,7 +100,7 @@ export function readModelConfig(env: NodeJS.ProcessEnv = process.env): ModelConf
     ? validateApiBaseUrl(visionBaseUrlRaw, "PA_VISION_BASE_URL", "PA_VISION_API_KEY")
     : undefined;
   const visionApiKey = optionalSecret(env.PA_VISION_API_KEY, "PA_VISION_API_KEY");
-  const modelSupportsVision = booleanSetting(env.PA_MODEL_SUPPORTS_VISION, false, "PA_MODEL_SUPPORTS_VISION");
+  const modelSupportsVision = booleanSetting(env.PA_MODEL_SUPPORTS_VISION, true, "PA_MODEL_SUPPORTS_VISION");
   const tavilyApiKey = optionalSecret(env.TAVILY_API_KEY, "TAVILY_API_KEY");
   const bochaApiKey = optionalSecret(env.BOCHA_API_KEY, "BOCHA_API_KEY");
   const exaApiKey = optionalSecret(env.EXA_API_KEY, "EXA_API_KEY");

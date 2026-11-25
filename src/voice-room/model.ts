@@ -41,7 +41,7 @@ export interface RoomLifecycleGenerateOptions {
 }
 
 export function hasVisionModel(config: ModelConfig): boolean {
-  return Boolean(config.visionModelId || config.modelSupportsVision);
+  return Boolean(config.visionModelId) || config.modelSupportsVision !== false;
 }
 
 function stripJsonFence(raw: string): string {
@@ -248,7 +248,7 @@ function createRuntimeAccessor(config: ModelConfig, roomDataDir: string, registe
         runtime.registerProvider("room-provider", {
           baseUrl: config.baseUrl, api: "openai-completions", models: [{
             id: config.modelId, name: config.modelId, reasoning: false,
-            input: config.modelSupportsVision ? ["text", "image"] : ["text"],
+            input: config.modelSupportsVision !== false ? ["text", "image"] : ["text"],
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
             contextWindow: config.contextWindow, maxTokens: registeredMaxTokens,
             compat: { supportsDeveloperRole: false, supportsStore: false, maxTokensField: "max_tokens" },

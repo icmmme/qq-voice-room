@@ -69,7 +69,7 @@ async function main() {
     modelRoundTimeoutMs: ROOM_MODEL_ROUND_TIMEOUT_MS,
     modelRoundTimeoutSource: "default",
     tools: web.hasSearch ? "web_search,web_fetch" : "web_fetch",
-    visionMode: model.visionModelId ? "dedicated" : model.modelSupportsVision ? "primary" : "disabled",
+    visionMode: model.visionModelId ? "dedicated" : model.modelSupportsVision !== false ? "primary" : "disabled",
     providerRetry: "none",
   };
   const proxy = discoverRoomProxy();

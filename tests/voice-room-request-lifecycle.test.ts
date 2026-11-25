@@ -6215,10 +6215,25 @@ test("fetchPublicImage and fetchRoomImages enforce magic bytes, SSRF redirects, 
 test("readModelConfig, readRoomModelConfig, and roomPublicPolicy support and protect vision settings", async () => {
   const { readModelConfig } = await import("../src/config.js");
   const { readRoomModelConfig } = await import("../src/voice-room/qq-config.js");
-  const env = {
+  const { hasVisionModel } = await import("../src/voice-room/model.js");
+  const defaultEnv = {
     PA_BASE_URL: "https://api.model.invalid/v1",
     PA_MODEL: "deepseek-flash",
     PA_API_KEY: "sk-primary-secret-123456",
+  };
+  const defaultCfg = readModelConfig(defaultEnv);
+  assert.equal(defaultCfg.modelSupportsVision, true);
+  assert.equal(hasVisionModel(defaultCfg), true);
+
+  const disabledCfg = readModelConfig({
+    ...defaultEnv,
+    PA_MODEL_SUPPORTS_VISION: "false",
+  });
+  assert.equal(disabledCfg.modelSupportsVision, false);
+  assert.equal(hasVisionModel(disabledCfg), false);
+
+  const env = {
+    ...defaultEnv,
     PA_VISION_MODEL: "qwen-vl-max",
     PA_VISION_BASE_URL: "https://vision.model.invalid/v1/",
     PA_VISION_API_KEY: "sk-vision-secret-654321",
