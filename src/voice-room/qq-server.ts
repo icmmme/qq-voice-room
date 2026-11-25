@@ -196,10 +196,21 @@ export async function startRoomQq(settings: RoomQqSettings,
           const receipt = workerSelected ? room.receiveLifecycle(input, workerQueue!) : room.receive(input);
           notice("received", receipt);
           if (workerSelected && receipt === "control") {
+            const trimmed = input.text.trim();
             const lifecycle = room.store.lifecycleControlState();
-            const text = /^\/room\s+mode$/.test(input.text.trim())
-              ? `房间模式：${lifecycle.mode === "ambient" ? "ambient" : "mention_only"}`
-              : `房间模式已切换为 ${lifecycle.mode === "ambient" ? "ambient" : "mention_only"}。`;
+            let text: string;
+            if (/^\/room\s+status$/.test(trimmed)) {
+              const st = workerStatus();
+              text = st
+                ? `房间状态：模式 ${lifecycle.mode}｜投递 ${st.effectiveDeliveryMode}｜在线 ${st.connectedAccountCount}/${config.characters.length}｜${st.textCanProgress ? "文字正常" : "文字未就绪"}｜${st.audioBlockReason ? `语音受阻(${st.audioBlockReason})` : "语音正常"}${st.faultReason ? `｜故障(${st.faultReason})` : ""}`
+                : `房间模式：${lifecycle.mode}`;
+            } else if (/^\/room\s+stop$/.test(trimmed)) {
+              text = "已停止当前回复队列。";
+            } else if (/^\/room\s+mode$/.test(trimmed)) {
+              text = `房间模式：${lifecycle.mode === "ambient" ? "ambient" : "mention_only"}`;
+            } else {
+              text = `房间模式已切换为 ${lifecycle.mode === "ambient" ? "ambient" : "mention_only"}。`;
+            }
             void acknowledge(account.accountKey, text);
           } else if (!workerSelected && (receipt === "control" || (receipt === "scheduled" && input.text.startsWith("/room start")))) {
             const status = room.status();

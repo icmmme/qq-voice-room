@@ -2,7 +2,7 @@ import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { roomInputId, type CheckedRoomConfig } from "./config.js";
+import { ROOM_HISTORY_PAGE_LIMIT, roomInputId, type CheckedRoomConfig } from "./config.js";
 import { validResponsePlan } from "./response-planner.js";
 import { checkedRoomControlResult } from "./types.js";
 import { qqMessageId } from "../qq-message.js";
@@ -70,6 +70,7 @@ export type LifecycleTurnStatus = "pending" | "generating" | "ready" | "deliveri
 export type LifecycleDeliveryMode = "text" | "both";
 export type LifecycleSegmentState = "pending" | "text_sending" | "text_sent" | "audio_sending"
   | "audio_sent" | "completed" | "failed" | "unknown" | "cancelled" | "blocked" | "skipped";
+export type LifecycleAdmissionReason = "explicit_direct" | "quoted_direct" | "ambient_group_question";
 const LIFECYCLE_REQUEST_ACTIVE = new Set<LifecycleRequestStatus>(["queued", "generating", "delivering"]);
 const LIFECYCLE_REQUEST_TERMINAL = new Set<LifecycleRequestStatus>(["completed", "failed", "cancelled", "restart_not_resumed"]);
 const LIFECYCLE_TURN_ACTIVE = new Set<LifecycleTurnStatus>(["pending", "generating", "ready", "delivering"]);
@@ -85,6 +86,7 @@ export interface LifecycleRequest {
   readonly status: LifecycleRequestStatus;
   readonly outcomeReason: string | null;
   readonly source: Trigger;
+  readonly admissionReason: LifecycleAdmissionReason | null;
   readonly executionEpoch: number;
   readonly executionRevision: number;
   readonly expiresAt: number;
@@ -154,6 +156,7 @@ export interface LifecycleAuditRow {
   readonly requestStatus: LifecycleRequestStatus;
   readonly requestReason: string | null;
   readonly source: Trigger;
+  readonly admissionReason: LifecycleAdmissionReason | null;
   readonly turnId: string;
   readonly characterId: string;
   readonly mentionIndex: number;
@@ -185,6 +188,8 @@ export interface LifecycleAcceptOptions {
   expectedEpoch: number;
   ownerToken: string;
   source: Trigger;
+  characterIds: readonly string[];
+  admissionReason?: LifecycleAdmissionReason | null;
   policy: RoomQueuePolicy;
   enqueue: boolean;
   deliveryMode: LifecycleDeliveryMode;
@@ -196,6 +201,7 @@ export interface AmbientAcceptOptions {
   policy: RoomQueuePolicy;
   deliveryMode: LifecycleDeliveryMode;
   eventKey: string;
+  admissionReason?: LifecycleAdmissionReason | null;
 }
 type AcceptOptions = { now: number; expectedEpoch: number; source: Trigger } & (
   | { mode: "enqueue"; policy: RoomQueuePolicy }
@@ -219,8 +225,27 @@ const burstStateSql = (expression: string) => "CASE " + expression + Object.entr
   .map(([work, burst]) => " WHEN '" + work + "' THEN '" + burst + "'").join("") + " ELSE '' END";
 const timestamp = (n: number) => Number.isSafeInteger(n) && n >= 0;
 const code = (s: string) => typeof s === "string" && /^[a-z][a-z0-9_-]{0,79}$/.test(s);
+const lifecycleAdmissionReasons = new Set<LifecycleAdmissionReason>(
+  ["explicit_direct", "quoted_direct", "ambient_group_question"]);
 const ROOM_HISTORY_RETENTION_MS = 7 * 86400000;
 const RETENTION_BODY_REDACTED = "[redacted:retention]";
+type LifecycleSeenMarker =
+  | Readonly<{ kind: "lifecycle_direct_attempt"; memberKey: string }>
+  | Readonly<{ kind: "lifecycle_ambient_observation"; blocked: boolean }>;
+const parseLifecycleSeenMarker = (value: unknown): LifecycleSeenMarker | null => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  if (Object.keys(row).sort().join(",") === "kind,memberKey"
+    && row.kind === "lifecycle_direct_attempt"
+    && typeof row.memberKey === "string" && /^member-[0-9a-f]{16}$/.test(row.memberKey)) {
+    return Object.freeze({ kind: row.kind, memberKey: row.memberKey });
+  }
+  if (Object.keys(row).sort().join(",") === "blocked,kind"
+    && row.kind === "lifecycle_ambient_observation" && typeof row.blocked === "boolean") {
+    return Object.freeze({ kind: row.kind, blocked: row.blocked });
+  }
+  return null;
+};
 const ROOM_BODY_INVENTORY_ITEMS = [
   { table: "room_messages", column: "text", timeColumn: "created_at", meaning: "message_body" },
   { table: "room_deliveries", column: "semantic_text", timeColumn: "created_at", meaning: "generated_text" },
@@ -1400,7 +1425,8 @@ export class RoomStore {
       const memberKey = this.actor(input.senderId);
       if (options.mode === "enqueue") {
         const p = options.policy;
-        const attempts = this.db.prepare("SELECT count(*) AS n FROM room_work_items WHERE member_key=? AND admission_attempt=1 AND created_at>? AND created_at<=?")
+        const attempts = this.db.prepare(`SELECT count(*) AS n FROM room_work_items
+          WHERE member_key=? AND source='direct' AND admission_attempt=1 AND created_at>? AND created_at<=?`)
           .get(memberKey, options.now - p.memberWindowMs, options.now) as { n: number };
         const pending = this.db.prepare("SELECT count(*) AS n FROM room_work_items WHERE status='queued'").get() as { n: number };
         if (p.memberLimit !== null && attempts.n >= p.memberLimit) { status = "rejected"; reason = "member_rate_limited"; }
@@ -1526,8 +1552,36 @@ export class RoomStore {
     if (typeof eventKey !== "string" || !/^[0-9a-f]{64}$/.test(eventKey)) throw new Error("room-control-invalid");
     const row = this.db.prepare("SELECT control_result FROM room_seen WHERE id=?").get(eventKey);
     if (!row || row.control_result === null) return undefined;
-    try { return checkedRoomControlResult(JSON.parse(String(row.control_result))); }
+    try {
+      const parsed: unknown = JSON.parse(String(row.control_result));
+      if (parseLifecycleSeenMarker(parsed)) return undefined;
+      return checkedRoomControlResult(parsed);
+    }
     catch { throw new Error("room-control-result-invalid"); }
+  }
+  private lifecycleSeenMarker(eventKey: string): LifecycleSeenMarker | null {
+    const row = this.db.prepare("SELECT control_result FROM room_seen WHERE id=?").get(eventKey);
+    if (!row || row.control_result === null) return null;
+    try {
+      const parsed: unknown = JSON.parse(String(row.control_result));
+      const marker = parseLifecycleSeenMarker(parsed);
+      if (!marker) throw new Error();
+      return marker;
+    } catch { throw new Error("room-lifecycle-seen-invalid"); }
+  }
+  private markLifecycleSeen(eventKey: string, marker: LifecycleSeenMarker): void {
+    const value = JSON.stringify(marker);
+    if (this.db.prepare("UPDATE room_seen SET control_result=? WHERE id=? AND control_result IS NULL")
+      .run(value, eventKey).changes === 1) return;
+    const existing = this.lifecycleSeenMarker(eventKey);
+    if (!existing || JSON.stringify(existing) !== value) throw new Error("room-lifecycle-seen-conflict");
+  }
+  private directAttemptCount(memberKey: string, since: number, now: number, currentEventKey: string): number {
+    return Number(this.db.prepare(`SELECT count(*) AS n FROM room_seen
+      WHERE created_at>? AND created_at<=? AND id<>?
+        AND json_extract(control_result,'$.kind')='lifecycle_direct_attempt'
+        AND json_extract(control_result,'$.memberKey')=?`)
+      .get(since, now, currentEventKey, memberKey)!.n);
   }
   /** New process profile: mention_only, not paused, no old Session; a new revision fences old gates. */
   initializeWorkerControl(expectedEpoch: number, now: number): RoomControlState {
@@ -1661,6 +1715,7 @@ export class RoomStore {
   }
   private retainedLifecyclePayload(row: Record<string, unknown>): {
     payload: Record<string, unknown>; characterIds: string[]; messageRowId: number; senderKey: string;
+    admissionReason: LifecycleAdmissionReason | null;
   } {
     const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
     if (!payload || typeof payload !== "object" || Array.isArray(payload)
@@ -1671,16 +1726,20 @@ export class RoomStore {
       || !Number.isSafeInteger(payload.messageRowId) || Number(payload.messageRowId) <= 0) {
       throw new Error("room-lifecycle-payload-invalid");
     }
+    const admissionReason = payload.admissionReason === undefined ? null : payload.admissionReason;
+    if (admissionReason !== null && !lifecycleAdmissionReasons.has(admissionReason as LifecycleAdmissionReason)) {
+      throw new Error("room-lifecycle-payload-invalid");
+    }
     return { payload, characterIds: payload.characterIds as string[], messageRowId: Number(payload.messageRowId),
-      senderKey: payload.senderKey };
+      senderKey: payload.senderKey, admissionReason: admissionReason as LifecycleAdmissionReason | null };
   }
   private lifecycleRequest(row: Record<string, unknown>): LifecycleRequest {
-    const { payload, characterIds, messageRowId, senderKey } = this.retainedLifecyclePayload(row);
+    const { payload, characterIds, messageRowId, senderKey, admissionReason } = this.retainedLifecyclePayload(row);
     if (!["text", "both"].includes(String(row.delivery_mode))) throw new Error("room-lifecycle-payload-invalid");
     return Object.freeze({ requestId: String(row.request_id), eventKey: String(row.event_key),
       acceptSeq: Number(row.accept_seq), status: String(row.status) as LifecycleRequestStatus,
       outcomeReason: row.outcome_reason === null ? null : String(row.outcome_reason),
-      source: String(row.source) as Trigger, executionEpoch: Number(row.execution_epoch),
+      source: String(row.source) as Trigger, admissionReason, executionEpoch: Number(row.execution_epoch),
       executionRevision: Number(row.execution_revision), expiresAt: Number(row.expires_at),
       messageRowId: Number(row.message_row_id), characterIds: Object.freeze([...characterIds]),
       deliveryMode: String(row.delivery_mode) as LifecycleDeliveryMode,
@@ -1803,6 +1862,34 @@ export class RoomStore {
     const latest = this.db.prepare(`SELECT id FROM room_messages
       WHERE speaker_type='user' ORDER BY id DESC LIMIT 1`).get();
     return Number(latest?.id) === anchorRowId;
+  }
+  /**
+   * Return the contiguous unblocked human run ending at the anchor. The run is
+   * bounded by the quiet window and by the nearest bot/direct/blocked message.
+   * Lifecycle metadata lives in the existing dedup ledger, so this adds no
+   * queue or schema object and survives a Worker restart.
+   */
+  ambientHumanBatch(anchorRowId: number, since: number, limit: number): readonly RoomMessage[] {
+    if (!Number.isSafeInteger(anchorRowId) || anchorRowId <= 0
+      || !timestamp(since) || !Number.isSafeInteger(limit) || limit <= 0 || limit > ROOM_HISTORY_PAGE_LIMIT) {
+      throw new Error("room-ambient-batch-invalid");
+    }
+    const rows = this.db.prepare(`SELECT id,speaker_type AS speakerType,speaker_id AS speakerId,
+      account_key AS accountKey,target_id AS targetId,text,platform_id AS platformId,
+      created_at AS createdAt,medium FROM room_messages
+      WHERE id<=? AND created_at>=? ORDER BY id DESC LIMIT ?`)
+      .all(anchorRowId, since, limit) as unknown as RoomMessage[];
+    const batch: RoomMessage[] = [];
+    for (const row of rows) {
+      if (row.speakerType !== "user" || row.targetId !== null || row.createdAt === undefined) break;
+      const character = this.config.characters.find(item => item.accountKey === row.accountKey);
+      if (!character) break;
+      const marker = this.lifecycleSeenMarker(this.eventKey({ accountKey: row.accountKey,
+        selfId: character.selfId, groupId: this.config.groupId, messageId: row.platformId }));
+      if (!marker || marker.kind !== "lifecycle_ambient_observation" || marker.blocked) break;
+      batch.push(row);
+    }
+    return Object.freeze(batch.reverse());
   }
   private ambientLifecycleStopReason(request: LifecycleRequest, now: number, skipping = false):
     "ttl_expired" | "stale_anchor" | null {
@@ -1940,6 +2027,12 @@ export class RoomStore {
     if (!timestamp(options.now) || !timestamp(options.expectedEpoch)
       || !["direct","manual","ambient"].includes(options.source)
       || !["text","both"].includes(options.deliveryMode)
+      || !Array.isArray(options.characterIds) || options.characterIds.length > 2
+      || new Set(options.characterIds).size !== options.characterIds.length
+      || options.characterIds.some(id => typeof id !== "string"
+        || !this.config.characters.some(character => character.id === id))
+      || (options.admissionReason !== undefined && options.admissionReason !== null
+        && !lifecycleAdmissionReasons.has(options.admissionReason))
       || !Number.isSafeInteger(options.policy.capacity) || options.policy.capacity <= 0
       || !Number.isSafeInteger(options.policy.ttlMs) || options.policy.ttlMs <= 0
       || !timestamp(options.now + options.policy.ttlMs)) throw new Error("room-lifecycle-options-invalid");
@@ -1954,12 +2047,14 @@ export class RoomStore {
       if (this.seenEvent(eventKey)) return { kind: "duplicate", request: null, reason: "legacy_seen" } as const;
       this.assertEpoch(options.expectedEpoch);
       if (!this.rememberInput(input, options.now)) throw new Error("room-lifecycle-dedup-conflict");
-      const characterIds = [...new Set((input.mentions ?? []).flatMap(id => {
-        const c = this.config.characters.find(c => c.selfId === id); return c ? [c.id] : [];
-      }))];
+      const characterIds = [...options.characterIds];
+      const blockedObservation = Boolean(input.mentions?.length || input.replyToMessageId !== undefined
+        || options.source !== "ambient");
       if (!options.enqueue || !characterIds.length) {
         const reply = input.replyToMessageId === undefined ? undefined : this.replyTarget(input.accountKey, input.replyToMessageId);
         const messageRowId = this.appendUser(input, options.now, reply?.id ?? null);
+        this.markLifecycleSeen(eventKey, Object.freeze({ kind: "lifecycle_ambient_observation",
+          blocked: blockedObservation }));
         return { kind: options.enqueue ? "reject" : "record_only", request: null,
           reason: options.enqueue ? "no_real_mention" : "record_only", messageRowId } as const;
       }
@@ -1968,17 +2063,17 @@ export class RoomStore {
       // Record the admission attempt before capacity/member rejection so a
       // caller cannot bypass the abuse window by retrying a denied request.
       const messageRowId = this.appendUser(input, options.now, reply?.id ?? null);
+      const memberKey = this.actor(input.senderId);
+      this.markLifecycleSeen(eventKey, Object.freeze({ kind: "lifecycle_direct_attempt", memberKey }));
       const active = this.db.prepare("SELECT count(*) AS n FROM room_lifecycle_requests WHERE status IN ('queued','generating','delivering')").get() as { n: number };
       if (Number(active.n) >= options.policy.capacity) {
         return { kind: "reject", request: null, reason: "queue_full", messageRowId } as const;
       }
       // Member limits are abuse controls, never a participation quota. The
-      // attempt is recorded even when it is rejected.
+      // distinct direct event is recorded even when a later admission gate rejects it.
       if (options.policy.memberLimit !== null) {
-        const memberKey = this.actor(input.senderId);
-        const recent = Number(this.db.prepare(`SELECT count(*) AS n FROM room_messages
-          WHERE speaker_type='user' AND speaker_id=? AND created_at>?`)
-          .get(memberKey, options.now - options.policy.memberWindowMs)!.n);
+        const recent = this.directAttemptCount(memberKey, options.now - options.policy.memberWindowMs,
+          options.now, eventKey);
         if (recent >= options.policy.memberLimit) {
           return { kind: "reject", request: null, reason: "member_rate_limited", messageRowId } as const;
         }
@@ -1989,7 +2084,7 @@ export class RoomStore {
       const requestId = randomUUID();
       const { senderId: _senderId, unsupported: _unsupported, ...message } = input;
       const payload = JSON.stringify({ input: message, characterIds, messageRowId,
-        senderKey: this.actor(input.senderId) });
+        senderKey: this.actor(input.senderId), admissionReason: options.admissionReason ?? null });
       this.db.prepare(`INSERT INTO room_lifecycle_requests
         (request_id,event_key,accept_seq,status,outcome_reason,source,execution_epoch,execution_revision,expires_at,message_row_id,delivery_mode,payload_json,created_at,updated_at)
         VALUES (?,?,?,'queued',NULL,?,?,?,?,?,?,?,?,?)`).run(requestId, eventKey, sequence + 1, options.source,
@@ -2001,7 +2096,8 @@ export class RoomStore {
         if (!characterId) throw new Error("room-lifecycle-input-invalid");
         this.db.prepare(`INSERT INTO room_lifecycle_turns
           (turn_id,request_id,character_id,mention_index,status,reason,created_at,updated_at)
-          VALUES (?,?,?,?,'pending',NULL,?,?)`).run(randomUUID(), requestId, characterId, index, options.now, options.now);
+          VALUES (?,?,?,?,'pending',NULL,?,?)`).run(randomUUID(), requestId, characterId, index,
+          options.now, options.now);
       }
       return { kind: "enqueue", request: this.lifecycleRequestById(requestId), reason: null, messageRowId } as const;
     });
@@ -2022,6 +2118,8 @@ export class RoomStore {
       || typeof options.ownerToken !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(options.ownerToken)
       || !["text", "both"].includes(options.deliveryMode)
       || typeof options.eventKey !== "string" || !/^[0-9a-f]{64}$/.test(options.eventKey)
+      || (options.admissionReason !== undefined && options.admissionReason !== null
+        && !lifecycleAdmissionReasons.has(options.admissionReason))
       || !Number.isSafeInteger(options.policy.capacity) || options.policy.capacity <= 0
       || !Number.isSafeInteger(options.policy.ttlMs) || options.policy.ttlMs <= 0
       || !timestamp(options.now + options.policy.ttlMs)) {
@@ -2083,7 +2181,8 @@ export class RoomStore {
         text: anchor.text,
         mentions: [],
       };
-      const payload = JSON.stringify({ input, characterIds, messageRowId: anchorRowId, senderKey: anchor.speakerId });
+      const payload = JSON.stringify({ input, characterIds, messageRowId: anchorRowId, senderKey: anchor.speakerId,
+        admissionReason: options.admissionReason ?? null });
       const requestId = randomUUID();
       this.db.prepare(`INSERT INTO room_lifecycle_requests
         (request_id,event_key,accept_seq,status,outcome_reason,source,execution_epoch,execution_revision,expires_at,message_row_id,delivery_mode,payload_json,created_at,updated_at)
@@ -2292,18 +2391,19 @@ export class RoomStore {
   }
   lifecycleAudit(limit = 500): readonly LifecycleAuditRow[] {
     if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 5000) throw new Error("room-lifecycle-audit-invalid");
-    const requests = this.db.prepare(`SELECT request_id,accept_seq,status,outcome_reason,source
+    const requests = this.db.prepare(`SELECT *
       FROM room_lifecycle_requests ORDER BY accept_seq DESC LIMIT ?`).all(limit);
     const rows: LifecycleAuditRow[] = [];
-    for (const request of requests) {
-      const requestId = String(request.request_id);
+    for (const requestRow of requests) {
+      const request = this.lifecycleRequest(requestRow as Record<string, unknown>);
+      const requestId = request.requestId;
       for (const turn of this.lifecycleTurns(requestId)) {
         const segments = this.lifecycleSegments(turn.turnId);
         if (!segments.length) {
-          rows.push(Object.freeze({ requestId, acceptSeq: Number(request.accept_seq),
-            requestStatus: String(request.status) as LifecycleRequestStatus,
-            requestReason: request.outcome_reason === null ? null : String(request.outcome_reason),
-            source: String(request.source) as Trigger, turnId: turn.turnId, characterId: turn.characterId,
+          rows.push(Object.freeze({ requestId, acceptSeq: request.acceptSeq,
+            requestStatus: request.status, requestReason: request.outcomeReason,
+            source: request.source, admissionReason: request.admissionReason,
+            turnId: turn.turnId, characterId: turn.characterId,
             mentionIndex: turn.mentionIndex, turnStatus: turn.status, turnReason: turn.reason,
             segmentId: null, segmentIndex: null, segmentStatus: null, segmentReason: null,
             attemptId: null, medium: null, startedAt: null, receipts: Object.freeze([]) }));
@@ -2313,10 +2413,10 @@ export class RoomStore {
           const attempts = this.db.prepare(`SELECT attempt_id,medium,started_at
             FROM room_lifecycle_attempts WHERE segment_id=? ORDER BY intent_at,rowid`).all(segment.segmentId);
           if (!attempts.length) {
-            rows.push(Object.freeze({ requestId, acceptSeq: Number(request.accept_seq),
-              requestStatus: String(request.status) as LifecycleRequestStatus,
-              requestReason: request.outcome_reason === null ? null : String(request.outcome_reason),
-              source: String(request.source) as Trigger, turnId: turn.turnId, characterId: turn.characterId,
+            rows.push(Object.freeze({ requestId, acceptSeq: request.acceptSeq,
+              requestStatus: request.status, requestReason: request.outcomeReason,
+              source: request.source, admissionReason: request.admissionReason,
+              turnId: turn.turnId, characterId: turn.characterId,
               mentionIndex: turn.mentionIndex, turnStatus: turn.status, turnReason: turn.reason,
               segmentId: segment.segmentId, segmentIndex: segment.segmentIndex, segmentStatus: segment.state,
               segmentReason: segment.reason, attemptId: null, medium: null, startedAt: null,
@@ -2325,10 +2425,10 @@ export class RoomStore {
           }
           for (const attempt of attempts) {
             const attemptId = String(attempt.attempt_id);
-            rows.push(Object.freeze({ requestId, acceptSeq: Number(request.accept_seq),
-              requestStatus: String(request.status) as LifecycleRequestStatus,
-              requestReason: request.outcome_reason === null ? null : String(request.outcome_reason),
-              source: String(request.source) as Trigger, turnId: turn.turnId, characterId: turn.characterId,
+            rows.push(Object.freeze({ requestId, acceptSeq: request.acceptSeq,
+              requestStatus: request.status, requestReason: request.outcomeReason,
+              source: request.source, admissionReason: request.admissionReason,
+              turnId: turn.turnId, characterId: turn.characterId,
               mentionIndex: turn.mentionIndex, turnStatus: turn.status, turnReason: turn.reason,
               segmentId: segment.segmentId, segmentIndex: segment.segmentIndex, segmentStatus: segment.state,
               segmentReason: segment.reason, attemptId, medium: String(attempt.medium) as "text" | "audio",
@@ -2473,6 +2573,35 @@ export class RoomStore {
         .run(revision, ownerToken).changes !== 1) throw new Error("room-lifecycle-owner-lost");
       const after = this.lifecycleControlState();
       const result = { kind: "applied" as const, action: "set_mode" as const, reason: null, ...after,
+        cancelledQueued, cancelledActive: cancelledQueued > 0 };
+      this.db.prepare("INSERT INTO room_seen(id,created_at,control_result) VALUES (?,?,?)").run(eventKey, now, JSON.stringify(result));
+      return result;
+    });
+  }
+  stopLifecycleByControl(eventKey: string, expectedEpoch: number, ownerToken: string, now: number): RoomControlResult {
+    if (typeof eventKey !== "string" || !/^[0-9a-f]{64}$/.test(eventKey) || !timestamp(now)) {
+      throw new Error("room-lifecycle-stop-invalid");
+    }
+    return this.transaction(() => {
+      this.assertLifecycleOwner(ownerToken, now);
+      this.assertEpoch(expectedEpoch);
+      const existing = this.controlResultForEvent(eventKey);
+      if (existing) {
+        return checkedRoomControlResult({
+          kind: "duplicate", action: "stop", reason: "duplicate_control",
+          ...this.lifecycleControlState(), cancelledQueued: 0, cancelledActive: false,
+        });
+      }
+      const before = this.lifecycleControlState();
+      const cancelledQueued = Number(this.db.prepare(`SELECT count(*) AS n FROM room_lifecycle_requests
+        WHERE status IN ('queued','generating','delivering')`).get()!.n);
+      this.cancelLifecycleRequests("all", "control_stop", now);
+      const revision = before.executionRevision + 1;
+      this.db.prepare("UPDATE room_state SET execution_revision=? WHERE id=1").run(revision);
+      if (this.db.prepare("UPDATE room_lifecycle_owner SET execution_revision=? WHERE id=1 AND owner_token=?")
+        .run(revision, ownerToken).changes !== 1) throw new Error("room-lifecycle-owner-lost");
+      const after = this.lifecycleControlState();
+      const result = { kind: "applied" as const, action: "stop" as const, reason: null, ...after,
         cancelledQueued, cancelledActive: cancelledQueued > 0 };
       this.db.prepare("INSERT INTO room_seen(id,created_at,control_result) VALUES (?,?,?)").run(eventKey, now, JSON.stringify(result));
       return result;
@@ -3146,7 +3275,9 @@ export class RoomStore {
   }
   /** Finite newest page, returned chronologically. No caller may omit the page limit. */
   historyPage(limit: number, options: { beforeId?: number; since?: number } = {}): RoomMessage[] {
-    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 500) throw new Error("room-history-page-invalid");
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > ROOM_HISTORY_PAGE_LIMIT) {
+      throw new Error("room-history-page-invalid");
+    }
     if (options.beforeId !== undefined && (!Number.isSafeInteger(options.beforeId) || options.beforeId <= 0)) {
       throw new Error("room-history-page-invalid");
     }
@@ -3179,6 +3310,49 @@ export class RoomStore {
       WHERE m.account_key=? AND (m.platform_id=? OR (d.audio_id=? AND d.state='delivered')) LIMIT 2`)
       .all(accountKey, platformId, platformId) as unknown as RoomMessage[];
     return rows.length === 1 ? rows[0] : undefined;
+  }
+  /**
+   * Resolve a quoted bot from this room across both configured accounts. The
+   * delivery receipt must point at the stored row, and the bot ancestry must
+   * terminate at its original human row without a cycle.
+   */
+  trustedLifecycleReplyTarget(platformId: string): RoomMessage | undefined {
+    if (!roomInputId(platformId)) return undefined;
+    const rows = this.db.prepare(`SELECT DISTINCT m.id,m.speaker_type AS speakerType,
+      m.speaker_id AS speakerId,m.account_key AS accountKey,m.target_id AS targetId,m.text,
+      m.platform_id AS platformId,m.created_at AS createdAt,m.medium
+      FROM room_messages m
+      WHERE m.speaker_type='bot' AND m.platform_id=?
+        AND (
+          EXISTS (
+            SELECT 1 FROM room_lifecycle_attempts a
+            JOIN room_lifecycle_turns t ON t.turn_id=a.turn_id
+            JOIN room_lifecycle_receipts r ON r.attempt_id=a.attempt_id
+            WHERE a.committed_row_id=m.id AND t.character_id=m.speaker_id
+              AND r.kind='ack' AND r.message_id=m.platform_id
+          )
+          OR EXISTS (
+            SELECT 1 FROM room_deliveries d
+            WHERE d.character_id=m.speaker_id AND d.account_key=m.account_key
+              AND (d.text_id=m.platform_id OR (d.audio_id=m.platform_id AND d.state='delivered'))
+          )
+        )
+      LIMIT 2`).all(platformId) as unknown as RoomMessage[];
+    if (rows.length !== 1) return undefined;
+    const quoted = rows[0]!;
+    const character = this.config.characters.find(item =>
+      item.id === quoted.speakerId && item.accountKey === quoted.accountKey);
+    if (!character) return undefined;
+    let parentId = quoted.targetId;
+    const visited = new Set<number>([quoted.id]);
+    for (;;) {
+      if (parentId === null || !Number.isSafeInteger(parentId) || parentId <= 0) return undefined;
+      const parent = this.historyMessage(parentId);
+      if (!parent || visited.has(parent.id)) return undefined;
+      if (parent.speakerType === "user") return quoted;
+      visited.add(parent.id);
+      parentId = parent.targetId;
+    }
   }
   begin(trigger: Trigger, targetId: number, now: number): { id: string; epoch: number } {
     return this.transaction(() => {
@@ -3216,18 +3390,21 @@ export class RoomStore {
     if (!timestamp(now)) throw new Error("room-ambient-attempt-invalid");
     this.db.prepare("UPDATE room_state SET ambient_at=? WHERE id=1").run(now);
   }
-  canSpend(kind: "model" | "tts" | "send", now: number): boolean {
+  canSpend(kind: "model" | "tts" | "send", now: number, reserve = 0): boolean {
+    if (!Number.isSafeInteger(reserve) || reserve < 0 || (kind !== "model" && reserve !== 0)) {
+      throw new Error("room-budget-invalid");
+    }
     const window = kind === "send" ? 60000 : 3600000;
     const limit = kind === "model" ? this.config.limits.modelAttemptsPerHour : kind === "tts"
       ? this.config.limits.ttsAttemptsPerHour : this.config.limits.turnsPerMinute;
     if (limit === null) return true;
     const count = this.db.prepare("SELECT count(*) AS n FROM room_budget WHERE kind=? AND created_at>?")
       .get(kind, now - window) as { n: number };
-    return count.n < limit;
+    return count.n + reserve < limit;
   }
-  spend(kind: "model" | "tts" | "send", now: number): boolean {
+  spend(kind: "model" | "tts" | "send", now: number, reserve = 0): boolean {
     return this.transaction(() => {
-      if (!this.canSpend(kind, now)) return false;
+      if (!this.canSpend(kind, now, reserve)) return false;
       this.db.prepare("INSERT INTO room_budget(kind,created_at) VALUES (?,?)").run(kind, now);
       return true;
     });

@@ -4,10 +4,11 @@ import type { RoomContextWindowSource } from "../prompting/context-budget.js";
 
 export const ROOM_LIMITS: Readonly<RoomLimits> = Object.freeze({
   maxTextChars: 100, maxHistory: 80, historyPageRows: 200, contextTokens: 8192, outputTokens: 256,
-  turnsPerMinute: 6, modelAttemptsPerHour: 20, ttsAttemptsPerHour: 20,
+  turnsPerMinute: 12, modelAttemptsPerHour: 20, ttsAttemptsPerHour: 20,
   requestTimeoutMs: 30000, replyDeadlineMs: 120000, ambientMessages: 3, ambientPeople: 2,
   ambientQuietMs: 2000, ambientCooldownMs: 30000,
 });
+export const ROOM_HISTORY_PAGE_LIMIT = 500;
 export const WORKER_RESPONSE_BUDGETS: ResponseBudgets = Object.freeze({
   daily: Object.freeze({ maxTextChars: 100, outputTokens: 512 }),
   formal: Object.freeze({ maxTextChars: 800, outputTokens: 2048 }),
@@ -65,8 +66,9 @@ export function checkRoomConfig(config: RoomConfig): CheckedRoomConfig {
     }
   }
   if (limits.contextTokens < limits.outputTokens + 1024 || limits.ambientPeople > limits.ambientMessages
-    || limits.maxHistory > 500
-    || !Number.isSafeInteger(limits.historyPageRows) || limits.historyPageRows <= 0 || limits.historyPageRows > 500
+    || limits.ambientMessages > ROOM_HISTORY_PAGE_LIMIT || limits.maxHistory > ROOM_HISTORY_PAGE_LIMIT
+    || !Number.isSafeInteger(limits.historyPageRows) || limits.historyPageRows <= 0
+    || limits.historyPageRows > ROOM_HISTORY_PAGE_LIMIT
     || limits.maxTextChars > 1000) {
     throw new Error("room-limit-invalid");
   }

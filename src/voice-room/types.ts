@@ -287,7 +287,8 @@ export interface RoomDelivery extends PreparedReply {
   text: string;
 }
 export interface RoomAmbientParticipationNotice {
-  readonly code: `ambient_rule_${ParticipationReason}` | "ambient_planner_skip" | "ambient_stale_anchor";
+  readonly code: `ambient_rule_${ParticipationReason}` | "ambient_planner_skip" | "ambient_stale_anchor"
+    | "ambient_model_budget_deferred";
   readonly anchorRowId: number;
 }
 

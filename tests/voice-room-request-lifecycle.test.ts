@@ -8,7 +8,7 @@ import test, { type TestContext } from "node:test";
 import { WebSocket, WebSocketServer } from "ws";
 import { QqPeer, type QqAttemptOptions } from "../src/qq-peer.js";
 import type { ModelConfig } from "../src/config.js";
-import { checkRoomConfig } from "../src/voice-room/config.js";
+import { checkRoomConfig, ROOM_HISTORY_PAGE_LIMIT } from "../src/voice-room/config.js";
 import { parseRoomQqMessage } from "../src/voice-room/qq-message.js";
 import { readRoomQqSettings, type RoomQqSettings } from "../src/voice-room/qq-config.js";
 import { startRoomQq, type RoomQqNotice } from "../src/voice-room/qq-server.js";
@@ -32,6 +32,7 @@ import {
   type AmbientPlannerInput,
   type RoomAmbientPlanner,
 } from "../src/voice-room/participation-planner.js";
+import { isQuotedContinuation } from "../src/voice-room/participation-policy.js";
 import { deferred } from "./voice-room-fixture.js";
 
 const QUEUE: RoomQueuePolicy = { capacity: 20, memberLimit: 20, memberWindowMs: 1000, ttlMs: 10000 };
@@ -246,7 +247,14 @@ test("lifecycle control is owner-only, duplicate-safe, mention-only at startup a
   const duplicated = h.room.store.lifecycleControlState();
   assert.equal(duplicated.mode, "ambient");
   assert.equal(duplicated.executionRevision, ambient.executionRevision);
-  assert.equal(h.receive("43", "/room stop"), "rejected");
+  assert.equal(h.receive("430", "/room status", [], { senderId: "20002" }), "rejected");
+  assert.equal(h.receive("431", "/room status"), "control");
+  assert.equal(h.room.store.lifecycleControlState().executionRevision, ambient.executionRevision);
+  assert.equal(h.receive("432", "/room stop", [], { senderId: "20002" }), "rejected");
+  assert.equal(h.receive("433", "/room stop"), "control");
+  assert.equal(h.room.store.lifecycleControlState().mode, "ambient");
+  assert.equal(h.room.store.lifecycleControlState().executionRevision, ambient.executionRevision + 1);
+  assert.equal(h.receive("433", "/room stop"), "duplicate");
   assert.equal(h.receive("44", "/room pause"), "rejected");
   assert.equal(h.receive("45", "/room session"), "rejected");
 });
@@ -1488,6 +1496,582 @@ test("offline single @ acceptance path joins real parser, checked config, lifecy
   assert.equal(h.prompts.length, 1);
 });
 
+test("Fix-4 B4-01 final lifecycle prompts include only each selected public persona and remain tools-free", async t => {
+  const h = await lifecycleHarness(t, {
+    model: { generate: async prompt => ({ kind: "reply", segments: [`${prompt.characterId} reply`] }) },
+    deps: {
+      persona: character => `# ${character.name}\nPUBLIC_PERSONA_${character.id.toUpperCase()}`,
+      permitsPrompt: prompt => prompt.tools.length === 0
+        && prompt.systemPrompt.includes(`PUBLIC_PERSONA_${prompt.characterId.toUpperCase()}`)
+        && !prompt.systemPrompt.includes(prompt.characterId === "character-a"
+          ? "PUBLIC_PERSONA_CHARACTER-B" : "PUBLIC_PERSONA_CHARACTER-A"),
+    },
+  });
+
+  assert.equal(h.receive("805001", "请两位分别回答", ["10002", "10003"]), "scheduled");
+  await h.room.whenIdle();
+
+  assert.equal(h.prompts.length, 2);
+  for (const characterId of ["character-a", "character-b"]) {
+    const prompt = h.prompts.find(item => item.characterId === characterId);
+    assert.ok(prompt, `${characterId} must receive a final lifecycle prompt`);
+    assert.match(prompt.systemPrompt, new RegExp(`PUBLIC_PERSONA_${characterId.toUpperCase()}`));
+    assert.doesNotMatch(prompt.systemPrompt, new RegExp(`PUBLIC_PERSONA_${characterId === "character-a"
+      ? "CHARACTER-B" : "CHARACTER-A"}`));
+    assert.deepEqual(prompt.tools, []);
+  }
+});
+
+test("Fix-4 B4-02 trusted cross-account bot quotes continue only through a human parent and cycles fail closed", async t => {
+  let receipt = 910000;
+  const h = await lifecycleHarness(t, {
+    model: { generate: async prompt => ({ kind: "reply", segments: [`${prompt.characterId} continuation`] }) },
+    dispatch: async request => {
+      const messageId = String(++receipt);
+      request.beforeSend();
+      await request.observe({ kind: "ack", messageId });
+      request.released();
+      return messageId;
+    },
+  });
+
+  assert.equal(h.receive("810001", "先由 B 回答", ["10003"], { senderId: "20001" }), "scheduled");
+  await h.room.whenIdle();
+  const first = h.room.store.lifecycleRequests()[0]!;
+  assert.deepEqual(h.room.store.lifecycleTurns(first.requestId).map(turn => turn.characterId), ["character-b"]);
+  assert.equal(first.admissionReason, "explicit_direct");
+
+  const db = new DatabaseSync(join(h.root, "room.sqlite"));
+  const bot = db.prepare(`SELECT id,target_id AS targetId FROM room_messages
+    WHERE speaker_type='bot' AND platform_id=?`).get("910001") as { id: number; targetId: number };
+  db.prepare("UPDATE room_messages SET target_id=? WHERE id=?").run(bot.id, bot.targetId);
+  db.close();
+
+  assert.equal(h.receive("810004", "继续教育报名已经结束。", [], {
+    senderId: "20001", replyToMessageId: "910001",
+  }), "observed");
+  assert.equal(h.room.store.lifecycleRequests().length, 1);
+
+  for (const [messageId, text] of [
+    ["810005", "继续教育报名指南建议提前准备材料。"],
+    ["810006", "我喜欢草莓。"],
+    ["810007", "这个邮局上周换了门牌。"],
+    ["810008", "如何申请宿舍是迎新手册的第二章。"],
+    ["810009", "你说的那家面包店已经搬走了。"],
+    ["810010", "剧本选段：备用钥匙放在哪里？"],
+    ["810012", "请问标题：备用钥匙放在哪里？"],
+    ["810013", "请问对白内容如下：明早几点集合？"],
+    ["810014", "麻烦请问他说：备用钥匙放在哪里？"],
+    ["810018", "第 12 场：备用钥匙放在哪里？"],
+    ["810019", "今天的台词：备用钥匙放在哪里？"],
+    ["810020", "请问一下，剧本选段：备用钥匙放在哪里？"],
+    ["810021", "今天第 3 场：备用钥匙放在哪里？"],
+    ["810022", "下午第 3 场：备用钥匙放在哪里？"],
+    ["810023", "甲：备用钥匙放在哪里？"],
+    ["810024", "林：明早几点集合？"],
+    ["810025", "角色甲：备用钥匙放在哪里？"],
+    ["810031", "我有个问题，甲：备用钥匙放在哪里？"],
+    ["810032", "我想问个问题，客服 ：备用钥匙放在哪里？"],
+    ["810033", "不好意思，他：备用钥匙放在哪里？"],
+    ["810034", "打扰一下，林：明早几点集合？"],
+    ["810039", "我有个问题。甲：备用钥匙放在哪里？"],
+    ["810040", "我想问个问题；客服 ：备用钥匙放在哪里？"],
+    ["810041", "不好意思！他：备用钥匙放在哪里？"],
+    ["810042", "打扰一下。林：明早几点集合？"],
+    ["810043", "麻烦帮我确认一下，甲：备用钥匙放在哪里？"],
+    ["810044", "我这边想确认一下，客服 ：备用钥匙放在哪里？"],
+    ["810047", "我有个问题：客服；甲：备用钥匙放在哪里？"],
+    ["810048", `我有个问题：${"转述内容".repeat(20)}：备用钥匙放在哪里？`],
+    ["810049", "我有个问题：客服；甲﹕备用钥匙放在哪里？"],
+    ["810050", "我有个问题：客服；甲∶备用钥匙放在哪里？"],
+    ["810051", "客服；甲：\n备用钥匙放在哪里？"],
+    ["810052", "客服；甲：\u2029备用钥匙放在哪里？"],
+    ["810053", "客服；甲﹕\u200B\n备用钥匙放在哪里？"],
+    ["810054", "客服；甲：\u2060\n备用钥匙放在哪里？"],
+    ["810055", "客服；甲׃\u200B\r\n备用钥匙放在哪里？"],
+    ["810058", "客服；甲：\u0085备用钥匙放在哪里？"],
+    ["810061", "客服；甲︰备用钥匙放在哪里？"],
+  ] as const) {
+    assert.equal(h.receive(messageId, text, [], {
+      senderId: "20001", replyToMessageId: "910001",
+    }), "observed");
+    assert.equal(h.room.store.lifecycleRequests().length, 1);
+  }
+
+  for (const [messageId, question] of [
+    ["810011", "请问志愿者集合点在哪里？"],
+    ["810015", "顺便问一下：志愿者集合点在哪里？"],
+    ["810016", "请问一下，为什么他说：备用钥匙放在哪里？"],
+    ["810017", "麻烦请问下，为什么标题：备用钥匙放在哪里？"],
+    ["810026", "请说明：志愿者集合点在哪里？"],
+    ["810027", "我只是想知道：志愿者集合点在哪里？"],
+    ["810028", "我有个问题：志愿者集合点在哪里？"],
+    ["810029", "我想问个问题：志愿者集合点在哪里？"],
+    ["810030", "打扰一下：志愿者集合点在哪里？"],
+    ["810035", "我还有个问题：志愿者集合点在哪里？"],
+    ["810036", "我想再确认一下：当天几点集合？"],
+    ["810037", "我这边有个问题：志愿者集合点在哪里？"],
+    ["810038", "帮我确认一下：次日上午几点集合？"],
+    ["810045", "麻烦你帮我确认一下：明早几点集合？"],
+    ["810046", "能不能帮我看看：备用钥匙放在哪里？"],
+    ["810056", "  请问志愿者集合点在哪里？"],
+    ["810057", "\u00A0请问志愿者集合点在哪里？"],
+    ["810059", "客服；甲：\n\u0085请问备用钥匙放在哪里？"],
+  ] as const) {
+    const priorRequestCount = h.room.store.lifecycleRequests().length;
+    assert.equal(h.receive(messageId, [
+      "剧本选段：",
+      "旁白：展厅已经清场。",
+      "甲：备用钥匙放在哪里？",
+      "乙：明早谁负责开门？",
+      question,
+    ].join("\n"), [], {
+      senderId: "20001", replyToMessageId: "910001",
+    }), "scheduled");
+    await h.room.whenIdle();
+    assert.equal(h.room.store.lifecycleRequests().length, priorRequestCount + 1);
+    const reportContinuation = h.room.store.lifecycleRequests()[priorRequestCount]!;
+    assert.equal(reportContinuation.input.replyToMessageId, "910001");
+    assert.equal(reportContinuation.admissionReason, "quoted_direct");
+    assert.deepEqual(h.room.store.lifecycleTurns(reportContinuation.requestId)
+      .map(turn => turn.characterId), ["character-b"]);
+  }
+
+  assert.equal(h.receive("810060", "请问备用钥匙放在哪里？\u0085", [], {
+    senderId: "20002", replyToMessageId: "910001",
+  }), "scheduled");
+  await h.room.whenIdle();
+
+  assert.equal(h.receive("810002", "继续", [], {
+    senderId: "20001", replyToMessageId: "910001",
+  }), "scheduled");
+  await h.room.whenIdle();
+  assert.equal(h.room.store.lifecycleRequests().length, 21);
+  const continuation = h.room.store.lifecycleRequests()[20]!;
+  assert.equal(continuation.input.replyToMessageId, "910001");
+  assert.equal(continuation.admissionReason, "quoted_direct");
+  assert.deepEqual(h.room.store.lifecycleTurns(continuation.requestId).map(turn => turn.characterId),
+    ["character-b"]);
+
+  const cycleDb = new DatabaseSync(join(h.root, "room.sqlite"));
+  cycleDb.prepare("UPDATE room_messages SET target_id=id WHERE id=?").run(bot.id);
+  cycleDb.close();
+  assert.equal(h.receive("810003", "那继续详细说说？", [], {
+    senderId: "20001", replyToMessageId: "910001",
+  }), "observed");
+  await h.room.whenIdle();
+  assert.equal(h.room.store.lifecycleRequests().length, 21);
+});
+
+test("Fix-4 R9 quoted continuation predicate separates commands and questions from declarations", () => {
+  const longReportPrefix = "预计会在明天下午全体演员正式到场排演并完成安全检查以后";
+  const longScenePostqualifier = "（在正式演出开始之前完成全部布景和道具检查以后）";
+  const longLabelPostqualifier = `（${"长".repeat(127)}）`;
+  const priorColonPrefix = `${"长".repeat(127)}：`;
+  for (const text of [
+    "继续",
+    "接着说下去",
+    "然后呢？",
+    "请解释一下。",
+    "请解释一下这一步。",
+    "可以再解释吗？",
+    "钥匙在哪儿？！",
+    "为什么海报标题是「谁来值夜班」？",
+    "为什么仓库公告的标题引用了这句旧话：「雨天请走侧门」？",
+    "你能不能说说：这张旧票现在还能换吗？",
+    "我看了群公告，标题：展厅排班变更。\n地图和两张时间表我都收到了，明天早班志愿者的入场卡已经领齐，第一班的名单也刚贴到活动室门口。\n我想问你，明早的志愿者要在哪个门口集合？",
+    "剧本选段：\n旁白：展厅已经清场。\n甲：备用钥匙放在哪里？\n乙：明早谁负责开门？\n请问志愿者集合点在哪里？",
+    "剧本选段：\n旁白：展厅已经清场。\n顺便问一下：志愿者集合点在哪里？",
+    "剧本选段：\n旁白：展厅已经清场。\n请问一下，为什么他说：备用钥匙放在哪里？",
+    "剧本选段：\n旁白：展厅已经清场。\n麻烦请问下，为什么标题：备用钥匙放在哪里？",
+    "剧本选段：\n旁白：展厅已经清场。\n请说明：志愿者集合点在哪里？",
+    "剧本选段：\n旁白：展厅已经清场。\n麻烦告诉我：志愿者集合点在哪里？",
+    "剧本选段：\r旁白：展厅已经清场。\r请问志愿者集合点在哪里？",
+    "剧本选段：\u2028旁白：展厅已经清场。\u2028请问志愿者集合点在哪里？",
+    "剧本选段：\u2029旁白：展厅已经清场。\u2029请问志愿者集合点在哪里？",
+    `${longReportPrefix}剧本已经发下来，明天排到几点？`,
+    "第三幕排练几点开始？",
+    "第 2 景的主要演员是谁？",
+    "剧组的台词表我已经整理好了。\n请问明早几点集合？",
+    "我只是想知道：备用钥匙放在哪里？",
+    "请说一下：备用钥匙放在哪里？",
+    "说说看：备用钥匙放在哪里？",
+    "能再说说：备用钥匙放在哪里？",
+    "详细说下：备用钥匙放在哪里？",
+    "有个问题：备用钥匙放在哪里？",
+    "问你一下：备用钥匙放在哪里？",
+    "我想了解一下：备用钥匙放在哪里？",
+    "想请教：备用钥匙放在哪里？",
+    "我好奇问一句：备用钥匙放在哪里？",
+    "想确认一下：明早几点集合？",
+    "麻烦说说：备用钥匙放在哪里？",
+    "我有个问题：备用钥匙放在哪里？",
+    "我想问个问题：备用钥匙放在哪里？",
+    "打扰一下：备用钥匙放在哪里？",
+    "我还有个问题：志愿者集合点在哪里？",
+    "我想再确认一下：当天几点集合？",
+    "我这边有个问题：志愿者集合点在哪里？",
+    "帮我确认一下：次日上午几点集合？",
+    "麻烦你帮我确认一下：明早几点集合？",
+    "能不能帮我看看：备用钥匙放在哪里？",
+    "客服；甲：\n  请问备用钥匙放在哪里？",
+    "客服；甲：\n\t顺便问一下：备用钥匙放在哪里？",
+    "剧本选段：\n旁白：展厅已经清场。\n\u00A0请问志愿者集合点在哪里？",
+    "客服；甲：\n\u0085请问备用钥匙放在哪里？",
+    "请问备用钥匙放在哪里？\u0085",
+    "我有个问题︰备用钥匙放在哪里？",
+  ]) {
+    assert.equal(isQuotedContinuation(text), true, text);
+  }
+  for (const text of [
+    "继续教育报名已经结束。",
+    "继续教育报名指南建议提前准备材料。",
+    "我喜欢草莓。",
+    "这个邮局上周换了门牌。",
+    "如何申请宿舍是迎新手册的第二章。",
+    "你说的那家面包店已经搬走了。",
+    "继续，报名已经结束了。",
+    "然后呢，我去了超市。",
+    "请解释一下，这是旧海报。",
+    "继续！是海报上印的口号。",
+    "请说明！这三个字是旧模板的默认标题。",
+    "海报的标题是：钥匙在哪儿？",
+    "展板的主标题最终确定为：下周还能借到望远镜吗？",
+    "巡场时小顾问了一句：失物招领处几点关门？",
+    "值班员在群里问：\n北门今天临时关闭了。\n明天几点重新开放？",
+    "领队在收工前问：\n展厅南侧的入口今天临时关闭，原定的导览路线也临时改了，已经预约的两组访客都收到了修改通知。\n明天上午第一场导览应该改在哪里集合？",
+    "副导演读剧本：\n我是槐屿，负责保管签到表。\n明晚谁来替我值班？",
+    "剧本选段：备用钥匙放在哪里？",
+    "对白内容如下：明早几点集合？",
+    "请问标题：备用钥匙放在哪里？",
+    "请问对白内容如下：明早几点集合？",
+    "麻烦请问他说：备用钥匙放在哪里？",
+    "第 12 场：备用钥匙放在哪里？",
+    "问一下第 12 场：备用钥匙放在哪里？",
+    "今天的台词：备用钥匙放在哪里？",
+    "本页剧本：备用钥匙放在哪里？",
+    "这一段剧本内容如下：备用钥匙放在哪里？",
+    "舞台剧第一幕：备用钥匙放在哪里？",
+    "请问一下，剧本选段：备用钥匙放在哪里？",
+    "今天第 3 场：备用钥匙放在哪里？",
+    "下午第 3 场：备用钥匙放在哪里？",
+    "甲：备用钥匙放在哪里？",
+    "林：明早几点集合？",
+    "角色甲：备用钥匙放在哪里？",
+    "甲 ：备用钥匙放在哪里？",
+    "A ：明早几点集合？",
+    "甲　：备用钥匙放在哪里？",
+    "第三幕：备用钥匙放在哪里？",
+    "第 2 景：备用钥匙放在哪里？",
+    "预计会在明天下午全体演员正式到场排演以后第12场：备用钥匙放在哪里？",
+    "在正式演出开始之前所有工作人员完成安全检查以后第4幕：备用钥匙放在哪里？",
+    "今天下午导演完成最后一次彩排并确认全部布景以后第7景：备用钥匙放在哪里？",
+    `第3场${longScenePostqualifier}：备用钥匙放在哪里？`,
+    `${longReportPrefix}剧本：备用钥匙放在哪里？`,
+    `${longReportPrefix}台词：备用钥匙放在哪里？`,
+    `${longReportPrefix}对白：备用钥匙放在哪里？`,
+    `${longReportPrefix}独白：备用钥匙放在哪里？`,
+    `${longReportPrefix}场记：备用钥匙放在哪里？`,
+    `${longReportPrefix}分镜：备用钥匙放在哪里？`,
+    `${longReportPrefix}字幕：备用钥匙放在哪里？`,
+    `${longReportPrefix}舞台剧：备用钥匙放在哪里？`,
+    `${priorColonPrefix}剧本：备用钥匙放在哪里？`,
+    `标题${longLabelPostqualifier}：备用钥匙放在哪里？`,
+    `他记录了${longLabelPostqualifier}：备用钥匙放在哪里？`,
+    "场记：备用钥匙放在哪里？",
+    "角色独白：备用钥匙放在哪里？",
+    "分镜：备用钥匙放在哪里？",
+    "剧本选段：\n旁白：舞台灯全部熄灭。\n甲：备用钥匙放在哪里？\n乙：明早谁负责开门？",
+    "对白内容如下：\n林：返场前请确认耳麦。\n周：明早几点集合？\n陈：备用道具谁来收？",
+    "他说：备用钥匙放在哪里？",
+    "标题：备用钥匙放在哪里？",
+    "客服 ：备用钥匙放在哪里？",
+    "我只是想知道标题：备用钥匙放在哪里？",
+    "我有个问题：标题：备用钥匙放在哪里？",
+    "我只是想知道：他说：备用钥匙放在哪里？",
+    "我有个问题，甲：备用钥匙放在哪里？",
+    "我想问个问题，客服 ：备用钥匙放在哪里？",
+    "不好意思，他：备用钥匙放在哪里？",
+    "打扰一下，林：明早几点集合？",
+    "我有个问题。甲：备用钥匙放在哪里？",
+    "我想问个问题；客服 ：备用钥匙放在哪里？",
+    "不好意思！他：备用钥匙放在哪里？",
+    "打扰一下。林：明早几点集合？",
+    "麻烦帮我确认一下，甲：备用钥匙放在哪里？",
+    "我这边想确认一下，客服 ：备用钥匙放在哪里？",
+    "我有个问题……甲：备用钥匙放在哪里？",
+    "我有个问题：客服；甲：备用钥匙放在哪里？",
+    `我有个问题：${"转述内容".repeat(20)}：备用钥匙放在哪里？`,
+    "我有个问题：客服；甲﹕备用钥匙放在哪里？",
+    "我有个问题：客服；甲∶备用钥匙放在哪里？",
+    "我有个问题：客服；甲︓备用钥匙放在哪里？",
+    "我有个问题：客服；甲꞉备用钥匙放在哪里？",
+    "我有个问题：客服；甲׃备用钥匙放在哪里？",
+    "我有个问题：客服；甲፡备用钥匙放在哪里？",
+    "我有个问题：客服；甲፥备用钥匙放在哪里？",
+    "我有个问题：客服；甲ꘌ备用钥匙放在哪里？",
+    "我有个问题：客服；甲⁚备用钥匙放在哪里？",
+    "我有个问题：客服；甲︰备用钥匙放在哪里？",
+    "客服；甲：\n备用钥匙放在哪里？",
+    "客服；甲：\r\n备用钥匙放在哪里？",
+    "客服；甲：\r备用钥匙放在哪里？",
+    "客服；甲：\u2028备用钥匙放在哪里？",
+    "客服；甲：\u2029备用钥匙放在哪里？",
+    "客服；甲﹕\u200B\n备用钥匙放在哪里？",
+    "客服；甲：\u2060\n备用钥匙放在哪里？",
+    "客服；甲׃\u200B\r\n备用钥匙放在哪里？",
+    "客服；甲：\u0085备用钥匙放在哪里？",
+  ]) {
+    assert.equal(isQuotedContinuation(text), false, text);
+  }
+});
+
+test("Fix-4 B4-03 explicit @ wins over a quote and duplicate events do not create a second request", async t => {
+  let receipt = 920000;
+  const h = await lifecycleHarness(t, {
+    model: { generate: async prompt => ({ kind: "reply", segments: [`${prompt.characterId} reply`] }) },
+    dispatch: async request => {
+      const messageId = String(++receipt);
+      request.beforeSend();
+      await request.observe({ kind: "ack", messageId });
+      request.released();
+      return messageId;
+    },
+  });
+
+  assert.equal(h.receive("820001", "先由 B 回答", ["10003"], { senderId: "20001" }), "scheduled");
+  await h.room.whenIdle();
+  assert.equal(h.receive("820002", "收到", [], {
+    senderId: "20001", replyToMessageId: "920001",
+  }), "observed");
+  const combined = roomInput("820003", "你刚才为什么这么说？", ["10002"], {
+    senderId: "20001", replyToMessageId: "920001",
+  });
+
+  assert.equal(h.room.receiveLifecycle(combined, QUEUE), "scheduled");
+  await h.room.whenIdle();
+  const requests = h.room.store.lifecycleRequests();
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1]!.characterIds, ["character-a"]);
+  assert.equal(requests[1]!.admissionReason, "explicit_direct");
+  assert.deepEqual(h.room.store.lifecycleTurns(requests[1]!.requestId).map(turn => turn.characterId),
+    ["character-a"]);
+
+  assert.equal(h.room.receiveLifecycle(combined, QUEUE), "duplicate");
+  await h.room.whenIdle();
+  assert.equal(h.room.store.lifecycleRequests().length, 2);
+});
+
+test("Fix-4 B4-08 audit distinguishes direct provenance and ambient no-trigger without bodies or platform identities", async t => {
+  const base = Date.parse("2026-11-19T00:30:00Z");
+  let now = base;
+  let receipt = 925000;
+  const notices: Array<Record<string, unknown>> = [];
+  const h = await lifecycleHarness(t, {
+    deps: {
+      now: () => now,
+      onAmbientParticipation: notice => { notices.push(notice as unknown as Record<string, unknown>); },
+    },
+    config: roomConfig({
+      limits: { ambientMessages: 3, ambientPeople: 2, ambientQuietMs: 60000 },
+    }),
+    ambientPlanner: { plan: async () => ({ kind: "skip" }) },
+    model: { generate: async prompt => ({ kind: "reply", segments: [`${prompt.characterId} reply`] }) },
+    dispatch: async request => {
+      const messageId = String(++receipt);
+      request.beforeSend();
+      await request.observe({ kind: "ack", messageId });
+      request.released();
+      return messageId;
+    },
+  });
+
+  assert.equal(h.receive("830001", "先由 B 回答", ["10003"], { senderId: "23001" }), "scheduled");
+  await h.room.whenIdle();
+  const bot = h.room.store.historyPage(50).filter(row => row.speakerType === "bot").at(-1)!;
+  assert.equal(h.receive("830002", "继续", [], {
+    senderId: "23001", replyToMessageId: bot.platformId,
+  }), "scheduled");
+  await h.room.whenIdle();
+
+  const direct = h.room.store.lifecycleRequests();
+  assert.equal(direct.length, 2);
+  const directAudit = h.room.store.lifecycleAudit();
+  assert.equal(direct[0]!.admissionReason, "explicit_direct");
+  assert.equal(direct[1]!.admissionReason, "quoted_direct");
+  assert.equal(directAudit.find(row => row.requestId === direct[0]!.requestId)!.admissionReason, "explicit_direct");
+  assert.equal(directAudit.find(row => row.requestId === direct[1]!.requestId)!.admissionReason, "quoted_direct");
+  assert.doesNotMatch(JSON.stringify(directAudit), /830001|830002|23001|先由 B 回答/);
+
+  now = base + 180000;
+  assert.equal(h.receive("830003", "/room mode ambient", [], { senderId: "10001" }), "control");
+  assert.equal(h.receive("830004", "我先补充一点背景", [], { senderId: "23002" }), "observed");
+  assert.equal(h.receive("830005", "这里还有一个相关情况", [], { senderId: "23003" }), "observed");
+  assert.equal(h.receive("830006", "小林，你怎么看？", [], { senderId: "23004" }), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now += 60000;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+
+  assert.ok(notices.length > 0);
+  assert.deepEqual(notices.at(-1), {
+    code: "ambient_rule_other-conversation",
+    anchorRowId: anchor.id,
+  });
+  assert.equal(h.room.store.lifecycleRequests().length, 2);
+  assert.equal(h.prompts.length, 2);
+  assert.equal(h.dispatches.length, 2);
+});
+
+test("Fix-4 R3 group-question provenance survives pause and resume with one-segment limits", async t => {
+  const base = Date.parse("2026-11-19T00:45:00Z");
+  let now = base;
+  const first = deferred<RoomLifecycleAnswer>();
+  let generation = 0;
+  const maxCharsSeen: number[] = [];
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      limits: {
+        maxTextChars: 240,
+        ambientMessages: 3,
+        ambientPeople: 2,
+        ambientQuietMs: 60000,
+        ambientCooldownMs: 1,
+        modelAttemptsPerHour: null,
+      },
+    }),
+    deps: { now: () => now },
+    ambientPlanner: {
+      plan: async () => ({ kind: "join", characterIds: ["character-b", "character-a"] }),
+    },
+    model: {
+      generate: async (_prompt, _signal, maxChars) => {
+        maxCharsSeen.push(maxChars);
+        generation++;
+        return generation === 1
+          ? first.promise
+          : { kind: "reply", segments: ["resumed short answer"] };
+      },
+    },
+  });
+
+  try {
+    assert.equal(h.receive("840001", "/room mode ambient"), "control");
+    assert.equal(h.receive("840002", "先补充一个完整背景", [], { senderId: "24002" }), "observed");
+    assert.equal(h.receive("840003", "这里还有一个关键条件", [], { senderId: "24003" }), "observed");
+    assert.equal(h.receive("840004", "这个方案接下来到底怎么处理？", [], { senderId: "24004" }), "observed");
+    const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+    now += 60000;
+    await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+    await waitFor(() => h.prompts.length === 1, "first group-question prompt");
+    const request = h.room.store.lifecycleRequests().find(item => item.source === "ambient")!;
+    const turn = h.room.store.lifecycleTurns(request.requestId)[0]!;
+    assert.equal(request.admissionReason, "ambient_group_question");
+
+    h.room.store.setPaused(true);
+    await waitFor(() => h.room.store.lifecycleTurns(request.requestId)[0]!.status === "pending",
+      "paused generation returns to pending");
+    h.room.store.setPaused(false);
+    await waitFor(() => h.prompts.length === 2, "resumed group-question prompt");
+    first.resolve({ kind: "reply", segments: ["late answer", "must not expand"] });
+    await h.room.whenIdle();
+
+    assert.deepEqual(maxCharsSeen.map(value => value <= 80), [true, true]);
+    assert.equal(h.room.store.lifecycleRequestById(request.requestId)!.admissionReason,
+      "ambient_group_question");
+    assert.equal(h.room.store.lifecycleSegments(turn.turnId).length, 1);
+    assert.equal(h.dispatches.length, 1);
+    const audit = h.room.store.lifecycleAudit().find(row => row.turnId === turn.turnId)!;
+    assert.equal(audit.admissionReason, "ambient_group_question");
+  } finally {
+    first.resolve({ kind: "reply", segments: ["final cleanup"] });
+    await h.room.close();
+  }
+});
+
+test("Fix-4 R3 admission provenance remains distinct from failure and cancellation reasons", async t => {
+  let receipt = 945000;
+  let generation = 0;
+  const quotedGeneration = deferred<RoomLifecycleAnswer>();
+  const h = await lifecycleHarness(t, {
+    model: {
+      generate: async (_prompt, _signal, _maxChars) => {
+        generation++;
+        if (generation === 1) return { kind: "reply", segments: ["seed reply"] };
+        if (generation === 2) return { kind: "reply", segments: [] };
+        if (generation === 3) return { kind: "reply", segments: [] };
+        return quotedGeneration.promise;
+      },
+    },
+    dispatch: async request => {
+      const messageId = String(++receipt);
+      request.beforeSend();
+      await request.observe({ kind: "ack", messageId });
+      request.released();
+      return messageId;
+    },
+  });
+
+  assert.equal(h.receive("850001", "先请 B 回答", ["10003"], { senderId: "25001" }), "scheduled");
+  await h.room.whenIdle();
+  const seed = h.room.store.lifecycleRequests()[0]!;
+  const bot = h.room.store.historyPage(50).filter(row =>
+    row.speakerType === "bot" && row.targetId === seed.messageRowId).at(-1)!;
+
+  assert.equal(h.receive("850002", "显式失败请求", ["10003"], { senderId: "25001" }), "scheduled");
+  await h.room.whenIdle();
+  assert.equal(h.receive("850003", "继续", [], {
+    senderId: "25001", replyToMessageId: bot.platformId,
+  }), "scheduled");
+  await h.room.whenIdle();
+
+  const requests = h.room.store.lifecycleRequests();
+  const explicitFailure = requests.find(request => request.input.messageId === "850002")!;
+  const quotedFailure = requests.find(request => request.input.messageId === "850003")!;
+  assert.equal(explicitFailure.admissionReason, "explicit_direct");
+  assert.equal(quotedFailure.admissionReason, "quoted_direct");
+  const audit = h.room.store.lifecycleAudit();
+  const explicitAudit = audit.find(row => row.requestId === explicitFailure.requestId)!;
+  const quotedAudit = audit.find(row => row.requestId === quotedFailure.requestId)!;
+  assert.equal(explicitAudit.turnReason, "lifecycle_answer_invalid");
+  assert.equal(quotedAudit.turnReason, "lifecycle_answer_invalid");
+  assert.notEqual(explicitAudit.admissionReason, quotedAudit.admissionReason);
+
+  assert.equal(h.receive("850004", "继续", [], {
+    senderId: "25001", replyToMessageId: bot.platformId,
+  }), "scheduled");
+  await waitFor(() => h.prompts.length === 4, "quoted cancellation prompt");
+  const quotedCancel = h.room.store.lifecycleRequests().find(request =>
+    request.input.messageId === "850004")!;
+  assert.equal(h.receive("850005", "/room mode ambient", [], { senderId: "10001" }), "control");
+  await waitFor(() => h.room.store.lifecycleRequestById(quotedCancel.requestId)?.status === "cancelled",
+    "quoted cancellation");
+  quotedGeneration.resolve({ kind: "reply", segments: ["too late"] });
+  await h.room.whenIdle();
+
+  const cancelledAudit = h.room.store.lifecycleAudit().find(row => row.requestId === quotedCancel.requestId)!;
+  assert.equal(cancelledAudit.admissionReason, "quoted_direct");
+  assert.equal(cancelledAudit.turnReason, "mode_changed");
+  assert.equal(h.dispatches.filter(item => item.requestId === quotedCancel.requestId).length, 0);
+});
+
+test("Fix-4 R3 lifecycle payloads created before admission provenance remain readable", async t => {
+  const h = await lifecycleHarness(t, {
+    model: { generate: async () => ({ kind: "reply", segments: ["legacy payload reply"] }) },
+  });
+  assert.equal(h.receive("860001", "请 B 回答", ["10003"]), "scheduled");
+  await h.room.whenIdle();
+  const request = h.room.store.lifecycleRequests()[0]!;
+  assert.equal(request.admissionReason, "explicit_direct");
+
+  const db = new DatabaseSync(join(h.root, "room.sqlite"));
+  db.prepare("UPDATE room_lifecycle_requests SET payload_json=json_remove(payload_json,'$.admissionReason') WHERE request_id=?")
+    .run(request.requestId);
+  db.close();
+
+  assert.equal(h.room.store.lifecycleRequestById(request.requestId)!.admissionReason, null);
+  assert.equal(h.room.store.lifecycleAudit().find(row => row.requestId === request.requestId)!.admissionReason, null);
+});
+
 async function ambientCompletionFixture(t: TestContext, options: Parameters<typeof lifecycleHarness>[1]) {
   const base = Date.parse("2026-11-18T00:00:00Z");
   let now = base;
@@ -1768,7 +2352,7 @@ test("Fix-2 Ambient audio preparation failure keeps confirmed text and withholds
   assert.doesNotMatch(JSON.stringify(audit), /private_canary/i);
 });
 
-test("ambient initiation boundary is exact and planner input is public and bounded", async t => {
+test("ambient runtime never initiates a new topic and planner input is public and bounded", async t => {
   const base = Date.parse("2026-11-18T00:00:00Z");
   let now = base;
   const h = await lifecycleHarness(t, {
@@ -1777,11 +2361,9 @@ test("ambient initiation boundary is exact and planner input is public and bound
     }),
     deps: { now: () => now },
     ambientPlanner: {
-      plan: async input => input.constraints.allowInitiate
-        ? { kind: "initiate", characterIds: ["character-b", "character-a"] }
-        : { kind: "initiate", characterIds: ["character-a"] },
+      plan: async () => ({ kind: "initiate", characterIds: ["character-a"] }),
     },
-    model: { generate: async () => ({ kind: "reply", segments: ["synthetic ambient reply"] }) },
+    model: { generate: async () => ({ kind: "reply", segments: ["must not generate"] }) },
   });
 
   for (let index = 0; index < 13; index++) {
@@ -1810,19 +2392,14 @@ test("ambient initiation boundary is exact and planner input is public and bound
   now = base + AMBIENT_IDLE_THRESHOLD_MS;
   await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
   await h.room.whenIdle();
-  assert.equal(h.ambientPlannerCalls.length, 2);
-  assert.equal(h.ambientPlannerCalls[1]!.constraints.allowInitiate, true);
-  assert.equal(h.room.store.ambientCursor()?.outcome, "initiate");
-
-  const requests = h.room.store.lifecycleRequests();
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0]!.source, "ambient");
-  assert.equal(requests[0]!.messageRowId, anchor.id);
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  assert.equal(h.ambientPlannerCalls[0]!.constraints.allowInitiate, false);
+  assert.equal(h.room.store.ambientCursor()?.outcome, "technical_defer");
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
   assert.equal(h.room.store.historyMessage(anchor.id)!.text, "我今天终于跑通了离线测试，大家怎么看？");
-  assert.deepEqual(h.room.store.lifecycleTurns(requests[0]!.requestId).map(turn => turn.characterId),
-    ["character-a", "character-b"]);
   assert.equal(h.room.store.history().filter(row => row.speakerType === "user").length, 14);
-  assert.equal(h.dispatches.length, 2);
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.dispatches.length, 0);
 });
 
 test("ambient lifecycle ingress schedules the quiet opportunity through the real seam", async t => {
@@ -1894,7 +2471,7 @@ test("ambient planner charges once before call and policy or spend blocks create
   let now = base;
   const h = await lifecycleHarness(t, {
     config: roomConfig({
-      limits: { ambientQuietMs: 60000, ambientCooldownMs: 1000, modelAttemptsPerHour: 1 },
+      limits: { ambientQuietMs: 60000, ambientCooldownMs: 1000, modelAttemptsPerHour: 3 },
     }),
     deps: { now: () => now },
     ambientPlanner: { plan: async () => ({ kind: "skip" }) },
@@ -1919,10 +2496,13 @@ test("ambient planner charges once before call and policy or spend blocks create
   await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
   assert.equal(h.ambientPlannerCalls.length, 0);
   assert.equal(h.room.store.counts().model, 0);
-  assert.equal(h.room.store.ambientCursor(), null);
+  assert.equal(h.room.store.ambientCursor()?.outcome, "technical_defer");
   mutableStore.spend = originalSpend;
 
-  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  assert.equal(h.receive("302", "这个公开问题大家怎么处理？"), "observed");
+  const retryAnchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 120000;
+  await h.room.ambientOpportunityForTest(retryAnchor.id, QUEUE);
   assert.equal(h.ambientPlannerCalls.length, 1);
   assert.equal(h.room.store.counts().model, 1);
   assert.equal(h.room.store.ambientCursor()?.outcome, "skip");
@@ -1932,7 +2512,7 @@ test("ambient planner charges once before call and policy or spend blocks create
   assert.equal(h.synthesisCalls, 0);
 
   now = base + AMBIENT_IDLE_THRESHOLD_MS;
-  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  await h.room.ambientOpportunityForTest(retryAnchor.id, QUEUE);
   assert.equal(h.ambientPlannerCalls.length, 1);
   assert.equal(h.room.store.counts().model, 1);
   assert.equal(h.room.store.lifecycleRequests().length, 0);
@@ -2310,6 +2890,416 @@ test("an active direct request blocks the ambient planner without spending anoth
   direct.resolve({ kind: "reply", segments: ["direct reply"] });
   await h.room.whenIdle();
   assert.equal(h.dispatches.length, 1);
+});
+
+test("B4-04/B4-05 ambient group-question uses the real speaker batch, one character and one segment, and stale sends stay closed", async t => {
+  const base = Date.parse("2026-11-19T00:00:00Z");
+  let now = base;
+  const first = deferred<RoomLifecycleAnswer>();
+  const second = deferred<RoomLifecycleAnswer>();
+  const generations: ReturnType<typeof deferred<RoomLifecycleAnswer>>[] = [first, second];
+  let generationCall = 0;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      limits: {
+        ambientMessages: 3,
+        ambientPeople: 2,
+        ambientQuietMs: 60000,
+        ambientCooldownMs: 1,
+        modelAttemptsPerHour: null,
+      },
+    }),
+    deps: { now: () => now },
+    ambientPlanner: {
+      plan: async () => ({ kind: "join", characterIds: ["character-b", "character-a"] }),
+    },
+    model: { generate: async () => {
+      const answer = generations[generationCall++];
+      if (!answer) throw new Error("unexpected ambient generation");
+      return answer.promise;
+    } },
+  });
+
+  assert.equal(h.receive("900", "/room mode ambient"), "control");
+  assert.equal(h.receive("901", "我先补充一个背景", [], { senderId: "20001" }), "observed");
+  assert.equal(h.receive("902", "这个方向我觉得可行", [], { senderId: "20002" }), "observed");
+  assert.equal(h.receive("903", "大家怎么看？", [], { senderId: "20003" }), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 60000;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  assert.equal(h.room.workerStatusForTest().phase, "ready");
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  assert.equal(h.room.store.lifecycleRequests().length, 1);
+  const queuedRequest = h.room.store.lifecycleRequests()[0]!;
+  assert.ok(["queued", "generating"].includes(queuedRequest.status),
+    JSON.stringify({ request: queuedRequest, turns: h.room.store.lifecycleTurns(queuedRequest.requestId) }));
+  const requestSettled = () => {
+    const request = h.room.store.lifecycleRequestById(queuedRequest.requestId)!;
+    return !["queued", "generating", "delivering"].includes(request.status);
+  };
+  try {
+    await waitFor(() => h.prompts.length >= 1 || h.room.workerStatusForTest().phase !== "ready"
+      || requestSettled(), "group-question generation, settlement or Worker fault");
+  } catch (error) {
+    throw new Error(`${String(error)} ${JSON.stringify({ prompts: h.prompts.length,
+      worker: h.room.workerStatusForTest(), request: h.room.store.lifecycleRequestById(queuedRequest.requestId),
+      turns: h.room.store.lifecycleTurns(queuedRequest.requestId) })}`);
+  }
+  assert.equal(h.room.workerStatusForTest().phase, "ready", JSON.stringify(h.room.workerStatusForTest()));
+  assert.equal(h.prompts.length, 1,
+    JSON.stringify({ request: h.room.store.lifecycleRequestById(queuedRequest.requestId),
+      turns: h.room.store.lifecycleTurns(queuedRequest.requestId) }));
+
+  assert.equal(h.ambientPlannerCalls[0]!.anchor.text, "大家怎么看？");
+  const firstRequest = h.room.store.lifecycleRequests()[0]!;
+  const firstTurns = h.room.store.lifecycleTurns(firstRequest.requestId);
+  assert.equal(firstTurns.length, 1);
+  assert.equal(firstTurns[0]!.characterId, "character-a");
+  assert.equal(firstRequest.admissionReason, "ambient_group_question");
+
+  first.resolve({ kind: "reply", segments: ["这是唯一一条短回复", "第二条不能发送"] });
+  await h.room.whenIdle();
+  assert.equal(h.dispatches.length, 1);
+  assert.equal(h.dispatches[0]!.text, "这是唯一一条短回复");
+  assert.equal(h.room.store.lifecycleSegments(firstTurns[0]!.turnId).length, 1);
+  assert.equal(h.room.store.lifecycleTurns(firstRequest.requestId)[0]!.segmentCount, 1);
+  assert.equal(h.room.store.lifecycleAudit().find(row => row.turnId === firstTurns[0]!.turnId)!.admissionReason,
+    "ambient_group_question");
+
+  assert.equal(h.receive("910", "又来一个背景消息", [], { senderId: "20001" }), "observed");
+  assert.equal(h.receive("911", "这个补充也很重要", [], { senderId: "20002" }), "observed");
+  assert.equal(h.receive("912", "大家觉得应该怎么处理？", [], { senderId: "20003" }), "observed");
+  const staleAnchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now += 60000;
+  await h.room.ambientOpportunityForTest(staleAnchor.id, QUEUE);
+  await waitFor(() => h.prompts.length === 2, "stale candidate generation");
+  const staleRequest = h.room.store.lifecycleRequests()
+    .find(request => request.messageRowId === staleAnchor.id)!;
+
+  assert.equal(h.receive("913", "新的消息已经改变话题", [], { senderId: "20004" }), "observed");
+  second.resolve({ kind: "reply", segments: ["迟到回复"] });
+  await h.room.whenIdle();
+  await flush();
+  assert.equal(h.dispatches.length, 1);
+  assert.equal(h.room.store.lifecycleRequestById(staleRequest.requestId)!.status, "cancelled");
+  assert.equal(h.room.store.lifecycleRequestById(staleRequest.requestId)!.outcomeReason, "stale_anchor");
+  assert.equal(h.room.store.lifecycleRequestById(staleRequest.requestId)!.admissionReason, "ambient_group_question");
+  assert.equal(h.room.store.lifecycleSegments(h.room.store.lifecycleTurns(staleRequest.requestId)[0]!.turnId).length, 0);
+});
+
+test("B4-04 an ambient batch explicitly aimed at another group member is rejected", async t => {
+  const base = Date.parse("2026-11-19T01:00:00Z");
+  let now = base;
+  const notices: Array<Record<string, unknown>> = [];
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ limits: { ambientMessages: 3, ambientPeople: 2, ambientQuietMs: 60000 } }),
+    deps: {
+      now: () => now,
+      onAmbientParticipation: notice => { notices.push(notice as unknown as Record<string, unknown>); },
+    },
+    ambientPlanner: {
+      plan: async () => ({ kind: "join", characterIds: ["character-a"] }),
+    },
+    model: { generate: async () => ({ kind: "reply", segments: ["must not generate"] }) },
+  });
+
+  assert.equal(h.receive("920", "/room mode ambient"), "control");
+  assert.equal(h.receive("921", "我是禾，先确认一下时间。", [], { senderId: "21001" }), "observed");
+  assert.equal(h.receive("922", "我们先收集大家的时间。", [], { senderId: "21002" }), "observed");
+  assert.equal(h.receive("923", "禾，周六几点能开门？", [], { senderId: "21003" }), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 60000;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+
+  assert.equal(h.ambientPlannerCalls.length, 0);
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
+  assert.deepEqual(notices, [{ code: "ambient_rule_other-conversation", anchorRowId: anchor.id }]);
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.dispatches.length, 0);
+});
+
+test("Fix-4 R11 ambient address detects a self-introduced name after an address preamble", async t => {
+  const base = Date.parse("2026-11-19T01:15:00Z");
+  const cases = [
+    { label: "请你", text: "请你问下禾：周六几点能开门？" },
+    { label: "麻烦你", text: "麻烦你问下禾：周六几点能开门？" },
+    { label: "劳驾你", text: "劳驾你问下禾：周六几点能开门？" },
+    { label: "请帮我", text: "请帮我问下禾：周六几点能开门？" },
+    { label: "麻烦帮我", text: "麻烦帮我问下禾：周六几点能开门？" },
+    { label: "standalone 帮我", text: "帮我问下禾：周六几点能开门？" },
+    { label: "麻烦您 and 帮忙", text: "麻烦您帮忙问下禾：周六几点能开门？" },
+    { label: "zero-width characters and vertical colon", text: "请\u200B麻烦问下禾\u200B︰周六几点能开门？" },
+    {
+      label: "stacked connectors with Unicode whitespace and punctuation",
+      text: "\u0085请\u200B、你\u00A0；帮我\u2060问下禾\u200B︰周六几点能开门？",
+    },
+    { label: "name that starts with an ask word", text: "请问问问：周六几点能开门？", member: "问问" },
+    { label: "word joiner within the addressed name", text: "请帮我问下小\u2060禾：周六几点能开门？", member: "小禾" },
+    { label: "word joiner within the polite request", text: "请帮\u2060我问下小禾：周六几点能开门？", member: "小禾" },
+    { label: "word joiner within the introduced name", text: "请帮我问下小禾：周六几点能开门？", member: "小\u2060禾" },
+  ];
+  for (const { label, text, member = "禾" } of cases) {
+    await t.test(label, async subtest => {
+      let now = base;
+      const notices: Array<Record<string, unknown>> = [];
+      const h = await lifecycleHarness(subtest, {
+        config: roomConfig({ limits: { ambientMessages: 3, ambientPeople: 2, ambientQuietMs: 60000 } }),
+        deps: {
+          now: () => now,
+          onAmbientParticipation: notice => { notices.push(notice as unknown as Record<string, unknown>); },
+        },
+        ambientPlanner: { plan: async () => ({ kind: "join", characterIds: ["character-a"] }) },
+        model: { generate: async () => ({ kind: "reply", segments: ["must not generate"] }) },
+      });
+
+      assert.equal(h.receive("925", "/room mode ambient"), "control");
+      assert.equal(h.receive("926", `我叫${member}，今天第一个到场。`, [], { senderId: "21004" }), "observed");
+      assert.equal(h.receive("927", "我也在等安排。", [], { senderId: "21005" }), "observed");
+      assert.equal(h.receive("928", text, [], { senderId: "21006" }), "observed");
+      const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+      now = base + 60000;
+      await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+      await h.room.whenIdle();
+
+      assert.equal(h.ambientPlannerCalls.length, 0);
+      assert.equal(h.room.store.lifecycleRequests().length, 0);
+      assert.deepEqual(notices, [{ code: "ambient_rule_other-conversation", anchorRowId: anchor.id }]);
+      assert.equal(h.prompts.length, 0);
+      assert.equal(h.dispatches.length, 0);
+    });
+  }
+});
+
+test("Fix-4 R11 ambient time prefix remains an open group question", async t => {
+  const base = Date.parse("2026-11-19T01:20:00Z");
+  const cases = [
+    ["time prefix", "周六，几点能把展板搬进来？"],
+    ["polite time question", "请问，周六几点开门？"],
+    ["topic after a separated preamble", "麻烦\u0085问下、展板︰怎么摆更合适？"],
+  ] as const;
+  for (const [label, text] of cases) {
+    await t.test(label, async subtest => {
+      let now = base;
+      const h = await lifecycleHarness(subtest, {
+        config: roomConfig({ limits: { ambientMessages: 3, ambientPeople: 2, ambientQuietMs: 60000 } }),
+        deps: { now: () => now },
+        ambientPlanner: { plan: async () => ({ kind: "join", characterIds: ["character-a"] }) },
+        model: { generate: async () => ({ kind: "reply", segments: ["周六上午可以。"] }) },
+      });
+
+      assert.equal(h.receive("929", "/room mode ambient"), "control");
+      assert.equal(h.receive("930", "我叫禾，先确认一下流程。", [], { senderId: "21007" }), "observed");
+      assert.equal(h.receive("931", "我们也在收集信息。", [], { senderId: "21008" }), "observed");
+      assert.equal(h.receive("932", text, [], { senderId: "21009" }), "observed");
+      const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+      now = base + 60000;
+      await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+      await h.room.whenIdle();
+
+      assert.equal(h.ambientPlannerCalls.length, 1);
+      const request = h.room.store.lifecycleRequests().find(item => item.messageRowId === anchor.id)!;
+      assert.equal(request.admissionReason, "ambient_group_question");
+      assert.equal(h.dispatches.length, 1);
+    });
+  }
+});
+
+test("Fix-4 R12 reported script dialogue does not create a member identity", async t => {
+  const base = Date.parse("2026-11-19T01:25:00Z");
+  let now = base;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ limits: { ambientMessages: 3, ambientPeople: 2, ambientQuietMs: 60000 } }),
+    deps: { now: () => now },
+    ambientPlanner: { plan: async () => ({ kind: "join", characterIds: ["character-a"] }) },
+    model: { generate: async () => ({ kind: "reply", segments: ["后面还要补三项。"] }) },
+  });
+
+  assert.equal(h.receive("933", "/room mode ambient"), "control");
+  assert.equal(h.receive("934", "我叫车石，负责守夜。（第 12 场开场对白）", [],
+    { senderId: "21010" }), "observed");
+  assert.equal(h.receive("935", "展会的流程表已经确认。", [], { senderId: "21011" }), "observed");
+  assert.equal(h.receive("936", "车石，明早第一班车几点出发？", [], { senderId: "21012" }), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 60000;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  await h.room.whenIdle();
+
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  const request = h.room.store.lifecycleRequests().find(item => item.messageRowId === anchor.id)!;
+  assert.equal(request.admissionReason, "ambient_group_question");
+  assert.equal(h.dispatches.length, 1);
+});
+
+for (const [timerDelay, label] of [[0, "exact"], [1, "delayed"]] as const) {
+  test(`Fix-4 R4 ambient batch keeps earlier in-window speakers at ${label} quiet boundary`, async t => {
+    const base = Date.parse("2026-11-19T01:30:00Z");
+    let now = base;
+    const h = await lifecycleHarness(t, {
+      config: roomConfig({
+        limits: {
+          ambientMessages: 3,
+          ambientPeople: 2,
+          ambientQuietMs: 60000,
+          ambientCooldownMs: 1,
+          modelAttemptsPerHour: null,
+        },
+      }),
+      deps: { now: () => now },
+      ambientPlanner: {
+        plan: async () => ({ kind: "join", characterIds: ["character-a"] }),
+      },
+      model: { generate: async () => ({ kind: "reply", segments: ["distinct timestamp reply"] }) },
+    });
+
+    assert.equal(h.receive(`870${timerDelay}01`, "/room mode ambient"), "control");
+    now = base;
+    assert.equal(h.receive(`870${timerDelay}02`, "先补充一点背景", [], { senderId: "26001" }), "observed");
+    now = base + 1000;
+    assert.equal(h.receive(`870${timerDelay}03`, "这里还有一个相关情况", [], { senderId: "26002" }), "observed");
+    now = base + 2000;
+    assert.equal(h.receive(`870${timerDelay}04`, "这个方案接下来到底怎么处理？", [], { senderId: "26003" }), "observed");
+    const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+    now = anchor.createdAt! + 60000 + timerDelay;
+    await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+    await h.room.whenIdle();
+
+    assert.equal(h.ambientPlannerCalls.length, 1);
+    const request = h.room.store.lifecycleRequests().find(item => item.messageRowId === anchor.id)!;
+    assert.equal(request.admissionReason, "ambient_group_question");
+    assert.equal(h.room.store.lifecycleTurns(request.requestId).length, 1);
+    assert.equal(h.dispatches.length, 1);
+  });
+}
+
+test("Fix-4 R5 ambient message threshold shares the history page cap", () => {
+  assert.doesNotThrow(() => checkRoomConfig(roomConfig({
+    limits: { ambientMessages: ROOM_HISTORY_PAGE_LIMIT, ambientPeople: 2 },
+  })));
+  assert.throws(() => checkRoomConfig(roomConfig({
+    limits: { ambientMessages: ROOM_HISTORY_PAGE_LIMIT + 1, ambientPeople: 2 },
+  })), /room-limit-invalid/);
+});
+
+test("B4-06 member quota counts direct attempts only and preserves duplicate and N-boundary semantics", async t => {
+  const base = Date.parse("2026-11-19T02:00:00Z");
+  let now = base;
+  const policy: RoomQueuePolicy = { capacity: 20, memberLimit: 3, memberWindowMs: 1000, ttlMs: 10000 };
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ limits: { ambientQuietMs: 60000, modelAttemptsPerHour: null } }),
+    deps: { now: () => now },
+    model: { generate: async () => ({ kind: "reply", segments: ["direct reply"] }) },
+  });
+  const receive = (messageId: string, text: string, mentions: readonly string[] = []) =>
+    h.room.receiveLifecycle(roomInput(messageId, text, mentions, { senderId: "22001" }), policy);
+
+  assert.equal(h.receive("930", "/room mode ambient"), "control");
+  for (let index = 0; index < 7; index++) {
+    assert.equal(receive(String(931 + index), `普通群聊观察 ${index}`), "observed");
+  }
+  assert.equal(receive("940", "第一次明确请求", ["10002"]), "scheduled");
+  assert.equal(receive("941", "第二次明确请求", ["10002"]), "scheduled");
+  assert.equal(receive("940", "第一次明确请求", ["10002"]), "duplicate");
+  assert.equal(receive("942", "第三次明确请求", ["10002"]), "scheduled");
+  assert.equal(receive("944", "第四次明确请求", ["10002"]), "rejected");
+  await h.room.whenIdle();
+
+  now = base + 1000;
+  assert.equal(receive("945", "窗口边界后的直接请求", ["10002"]), "scheduled");
+  await h.room.whenIdle();
+  assert.equal(h.dispatches.length, 4);
+});
+
+test("B4-07 ambient evaluation never consumes the final model row reserved for a direct request", async t => {
+  const base = Date.parse("2026-11-19T02:30:00Z");
+  let now = base;
+  const notices: Array<Record<string, unknown>> = [];
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      limits: { ambientMessages: 3, ambientPeople: 2, ambientQuietMs: 60000, modelAttemptsPerHour: 1 },
+    }),
+    deps: {
+      now: () => now,
+      onAmbientParticipation: notice => { notices.push(notice as unknown as Record<string, unknown>); },
+    },
+    ambientPlanner: {
+      plan: async () => ({ kind: "join", characterIds: ["character-a"] }),
+    },
+    model: { generate: async () => ({ kind: "reply", segments: ["direct final row"] }) },
+  });
+
+  assert.equal(h.receive("946", "/room mode ambient"), "control");
+  assert.equal(h.receive("947", "先看一个公开背景", [], { senderId: "24001" }), "observed");
+  assert.equal(h.receive("948", "这里还有一个补充", [], { senderId: "24002" }), "observed");
+  assert.equal(h.receive("949", "大家怎么看？", [], { senderId: "24003" }), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 60000;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  await h.room.whenIdle();
+
+  assert.equal(h.ambientPlannerCalls.length, 0);
+  assert.equal(h.room.store.counts().model, 0);
+  assert.equal(h.room.store.lifecycleRequests().length, 0);
+  assert.equal(h.room.workerStatusForTest().phase, "ready");
+  assert.ok(notices.some(notice => notice.code === "ambient_rule_budget"));
+
+  assert.equal(h.receive("955", "真实明确请求", ["10002"], { senderId: "24001" }), "scheduled");
+  await waitFor(() => h.dispatches.length === 1, "direct request uses the final model row");
+  await h.room.whenIdle();
+  assert.equal(h.room.store.counts().model, 1);
+  assert.equal(h.dispatches[0]!.text, "direct final row");
+  assert.equal(h.room.workerStatusForTest().phase, "ready");
+});
+
+test("B4-07 ambient planner and generation reserve the final model row for a direct request", async t => {
+  const base = Date.parse("2026-11-19T03:00:00Z");
+  let now = base;
+  const notices: Array<Record<string, unknown>> = [];
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({
+      limits: { ambientMessages: 3, ambientPeople: 2, ambientQuietMs: 60000,
+        ambientCooldownMs: 1, modelAttemptsPerHour: 2 },
+    }),
+    deps: {
+      now: () => now,
+      onAmbientParticipation: notice => { notices.push(notice as unknown as Record<string, unknown>); },
+    },
+    ambientPlanner: {
+      plan: async () => ({ kind: "join", characterIds: ["character-a"] }),
+    },
+    model: {
+      generate: async prompt => prompt.systemPrompt.includes("主动参与的候选回复")
+        ? { kind: "reply", segments: ["ambient must not consume the reserve"] }
+        : { kind: "reply", segments: ["direct reply wins the final row"] },
+    },
+  });
+
+  assert.equal(h.receive("950", "/room mode ambient"), "control");
+  assert.equal(h.receive("951", "先看一个公开背景", [], { senderId: "23001" }), "observed");
+  assert.equal(h.receive("952", "这里还有一个补充", [], { senderId: "23002" }), "observed");
+  assert.equal(h.receive("953", "大家怎么看？", [], { senderId: "23003" }), "observed");
+  const anchor = h.room.store.historyPage(50).filter(row => row.speakerType === "user").at(-1)!;
+  now = base + 60000;
+  await h.room.ambientOpportunityForTest(anchor.id, QUEUE);
+  await h.room.whenIdle();
+
+  const ambientRequest = h.room.store.lifecycleRequests()[0]!;
+  const ambientTurn = h.room.store.lifecycleTurns(ambientRequest.requestId)[0]!;
+  assert.equal(h.ambientPlannerCalls.length, 1);
+  assert.equal(h.room.store.counts().model, 1);
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.dispatches.length, 0);
+  assert.equal(ambientTurn.status, "skipped");
+  assert.equal(ambientTurn.reason, "ambient_model_budget_deferred");
+  assert.equal(h.room.store.ambientCursor()?.outcome, "technical_defer");
+  assert.equal(h.room.workerStatusForTest().phase, "ready");
+  assert.ok(notices.some(notice => notice.code === "ambient_model_budget_deferred"));
+
+  assert.equal(h.receive("954", "真实明确请求", ["10002"], { senderId: "23001" }), "scheduled");
+  await waitFor(() => h.dispatches.length === 1, "reserved direct request delivery");
+  await h.room.whenIdle();
+  assert.equal(h.room.store.counts().model, 2);
+  assert.equal(h.dispatches[0]!.text, "direct reply wins the final row");
+  assert.equal(h.room.workerStatusForTest().phase, "ready");
 });
 
 test("Owner /room pause remains fail-closed for ordinary ingress", async t => {
@@ -4067,4 +5057,66 @@ test("body retention is exact at seven days, idempotent, survives reopen and pre
   assert.equal(String(finalDb.prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='room_work_terminal'")
     .get()!.sql), terminalTriggerSql);
   finalDb.close();
+});
+
+test("default turnsPerMinute allows a dual-mention two-segment both delivery to complete", async t => {
+  let sent = 0;
+  const h = await lifecycleHarness(t, {
+    config: roomConfig({ deliveryMode: "both" }),
+    model: {
+      generate: async prompt => ({
+        kind: "reply",
+        segments: [`${prompt.characterId} 第一段`, `${prompt.characterId} 第二段`],
+      }),
+    },
+    dispatch: async request => {
+      request.beforeSend();
+      const id = String(810000 + ++sent);
+      await request.observe({ kind: "ack", messageId: id });
+      if (request.medium === "audio") request.physicalSettled();
+      request.released();
+      return id;
+    },
+  });
+  assert.equal(h.checkedConfig.limits.turnsPerMinute, 12);
+  assert.equal(h.receive("7001", "两位都说说", ["10002", "10003"]), "scheduled");
+  await waitFor(() => h.room.store.lifecycleRequests()[0]?.status === "completed", "dual-both-default-limit");
+  assert.equal(h.dispatches.length, 8);
+  assert.equal(h.dispatches.filter(d => d.medium === "text").length, 4);
+  assert.equal(h.dispatches.filter(d => d.medium === "audio").length, 4);
+  assert.equal(h.room.store.lifecycleRequests()[0]?.outcomeReason, "all_obligations_terminal");
+});
+
+test("owner /room stop cancels in-flight lifecycle work without changing mode and ignores duplicates", async t => {
+  const first = deferred<RoomLifecycleAnswer>();
+  const second = deferred<RoomLifecycleAnswer>();
+  const signals: AbortSignal[] = [];
+  const h = await lifecycleHarness(t, {
+    model: {
+      generate: async (_prompt, signal) => {
+        signals.push(signal);
+        return signals.length === 1 ? first.promise : second.promise;
+      },
+    },
+  });
+  assert.equal(h.receive("7100", "/room mode ambient"), "control");
+  assert.equal(h.receive("7101", "先问甲", ["10002"]), "scheduled");
+  await waitFor(() => signals.length === 1, "first-generation-started");
+  assert.equal(h.receive("7102", "/room stop"), "control");
+  assert.equal(signals[0]!.aborted, true);
+  assert.equal(h.room.store.lifecycleControlState().mode, "ambient");
+  assert.equal(h.room.store.lifecycleRequests()[0]?.status, "cancelled");
+  assert.equal(h.room.store.lifecycleRequests()[0]?.outcomeReason, "control_stop");
+  first.resolve({ kind: "reply", segments: ["晚到结果不应发出"] });
+  await flush();
+  assert.equal(h.dispatches.length, 0);
+
+  // Replayed /room stop returns duplicate and must not cancel subsequent work.
+  assert.equal(h.receive("7103", "再问乙", ["10003"]), "scheduled");
+  await waitFor(() => signals.length === 2, "second-generation-started");
+  assert.equal(h.receive("7102", "/room stop"), "duplicate");
+  assert.equal(signals[1]!.aborted, false);
+  second.resolve({ kind: "reply", segments: ["乙正常回复"] });
+  await waitFor(() => h.room.store.lifecycleRequests().find(r => r.input.messageId === "7103")?.status === "completed", "second-completed");
+  assert.deepEqual(h.dispatches.map(d => d.text), ["乙正常回复"]);
 });
