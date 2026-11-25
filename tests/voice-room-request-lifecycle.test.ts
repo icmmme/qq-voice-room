@@ -5290,11 +5290,15 @@ test("web fetch module blocks SSRF, routes GitHub/Jina/HTML fallback, masks thir
   assert.ok(xItem?.content.includes("Verification loops beat giant prompts every time."));
   assert.ok(xItem?.content.includes("Deterministic hooks are key."));
 
-  const { loadRoomSkill, selectRoomSkill } = await import("../src/voice-room/skills.js");
+  const { listRoomSkills, loadRoomSkill, selectRoomSkill } = await import("../src/voice-room/skills.js");
   assert.equal(selectRoomSkill({ deep: true, hasWebEvidence: true, hasUrls: true }), "deep-link-analysis");
   assert.equal(selectRoomSkill({ deep: true, hasWebEvidence: false, hasUrls: false }), "deep-tech-qa");
   assert.equal(selectRoomSkill({ deep: false, hasWebEvidence: false, hasUrls: false }), "casual-chat");
-  assert.ok(loadRoomSkill("deep-link-analysis").includes("反流水账"));
+  const skillIndex = listRoomSkills();
+  assert.ok(skillIndex.some(item => item.name === "deep-link-analysis" && item.description.length > 10));
+  const linkSkill = loadRoomSkill("deep-link-analysis");
+  assert.ok(linkSkill.includes('<skill name="deep-link-analysis">'));
+  assert.ok(linkSkill.includes("Analytical Lens"));
 });
 
 test("deep URL summary uses webEvidence, multi-paragraph output, QQ forward card, and Strategy A (zero TTS)", async () => {
