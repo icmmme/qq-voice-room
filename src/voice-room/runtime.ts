@@ -1,24 +1,16 @@
 import { checkRoomConfig, checkClosePolicy, ROOM_CLOSE_POLICY, ROOM_HISTORY_PAGE_LIMIT,
   roomInputId, type CheckedRoomConfig, type RoomClosePolicy } from "./config.js";
-import { buildRoomPromptFromPages, buildWorkerPromptFromPages, RoomContextBudgetError } from "./context.js";
-import { checkedWorkerAnswer, completeResponsePlan, ruleResponsePlan, unresolvedFields, validAssistance } from "./response-planner.js";
-import type { SyntheticResponsePort, WorkerContext, WorkerGenerationRequest, WorkerTurnBinding, ResponsePlan } from "./types.js";
+import { buildRoomPromptFromPages } from "./context.js";
 import { RoomStore, type RoomControlMutation, type RoomControlState, type RoomQueuePolicy,
-  type RoomWorkItem, type RoomDeliveryAttempt, type RoomDeliveryObservation, type LifecycleAdmission,
-  type LifecycleAttempt, type LifecycleAuditRow, type LifecycleControlState, type LifecycleDeliveryItem,
-  type LifecycleDeliveryMode, type LifecycleGenerationClaim, type LifecycleRequest, type LifecycleRequestStatus,
-  type LifecycleTurnStatus,
-  type LifecycleSegmentState } from "./store.js";
+  type RoomDeliveryObservation, type LifecycleAdmission,
+  type LifecycleAttempt, type LifecycleControlState, type LifecycleDeliveryItem,
+  type LifecycleGenerationClaim, type LifecycleRequest } from "./store.js";
 import { createHash, randomUUID } from "node:crypto";
-import { isQuotedContinuation, ParticipationPolicy, type ParticipationNotice,
-  type ParticipationReason } from "./participation-policy.js";
-import { DeliveryPolicy, requestsVoiceOnly } from "./delivery-policy.js";
+import { isQuotedContinuation, ParticipationPolicy } from "./participation-policy.js";
 import { buildVoiceTranslationPrompt, validJapaneseVoice } from "./language.js";
 import { RoomSendError, type RoomCharacter, type RoomConfig, type RoomControlAction, type RoomControlResult,
-  type RoomAmbientParticipationNotice, type RoomContextCompactionNotice, type RoomDependencies, type RoomGatePermit, type RoomInput,
-  type RoomDelivery, type RoomParticipationMode, type RoomPrompt, type Trigger } from "./types.js";
-import { roomToolSession } from "./tools.js";
-import { MonotonicDeadline } from "../web-task.js";
+  type RoomAmbientParticipationNotice, type RoomDependencies, type RoomInput,
+  type RoomDelivery, type RoomParticipationMode, type RoomPrompt } from "./types.js";
 import { estimateTokens } from "../prompting/token-estimate.js";
 import { ROOM_LIFECYCLE_MAX_TOKENS, ROOM_LIFECYCLE_PROTOCOL_RESERVE_TOKENS, RoomModelError,
   type RoomLifecycleAnswer } from "./model.js";
@@ -33,35 +25,12 @@ import {
   type RoomAmbientPlanner,
 } from "./participation-planner.js";
 
-interface Run {
-  id: string;
-  epoch: number;
-  trigger: Trigger;
-  targetId: number;
-  first: RoomCharacter;
-  maxTurns: number;
-  voiceOnlyRequested: boolean;
-  controller: AbortController;
-}
 export type RoomReceipt = "rejected" | "duplicate" | "paused" | "observed" | "scheduled" | "control";
-/** Internal test seam only; no production transport, model, or environment switch consumes it. */
-export interface SyntheticWorkerPort {
-  execute(item: RoomWorkItem, signal: AbortSignal, gate?: RoomGatePermit): Promise<{ status: "completed" | "failed"; reason: string }>;
-}
 type WorkerPhase = "starting" | "ready" | "faulted" | "closing" | "closed";
 export const WORKER_EXPLICIT_NO_ANSWER_FALLBACK = Object.freeze({
   text: "这次没能生成回答。",
   reason: "explicit_no_answer_fallback",
 } as const);
-export interface RoomProductionWorker {
-  model: Pick<SyntheticResponsePort, "plan" | "generate">;
-  apiTimeoutMs: number;
-  closePolicy?: Partial<RoomClosePolicy>;
-  dispatch(request: { attempt: Readonly<RoomDeliveryAttempt>; delivery: Readonly<RoomDelivery>; bytes?: Uint8Array;
-    beforeSend(): void; observe(value: RoomDeliveryObservation): Promise<void>; released(): void }): Promise<string>;
-  beginClose(observeUntil: number): void;
-  sealObservations(): void | Promise<void>;
-}
 export interface RoomLifecycleModelPort {
   generate: (prompt: RoomPrompt, signal: AbortSignal, maxChars: number) => Promise<RoomLifecycleAnswer>;
 }
@@ -90,6 +59,7 @@ export type RoomLifecycleReceipt = "rejected" | "duplicate" | "observed" | "sche
 const SESSION_MAX_MS = 30 * 60 * 1000;
 const LIFECYCLE_GENERATION_LIMIT = 4;
 const LIFECYCLE_OWNER_LEASE_MS = 5 * 60 * 1000;
+const LIFECYCLE_RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const AMBIENT_GROUP_QUESTION_MAX_CHARS = 80;
 
 /**
@@ -107,40 +77,23 @@ class RoomLifecycleVoiceError extends Error {}
 
 interface LifecycleTranslationPrompt { readonly requestId: string; readonly prompt: RoomPrompt }
 
-/** One Room lifecycle and consumer; adapters supply model, voice and transport operations. */
+/** One Room lifecycle runtime; adapters supply model, voice and transport operations. */
 export class VoiceRoom {
   readonly config: CheckedRoomConfig;
   readonly store: RoomStore;
   private readonly now: () => number;
   private readonly online = new Set<string>();
-  private readonly controllers = new Set<AbortController>();
-  private current?: Run;
-  private tail: Promise<void> = Promise.resolve();
-  private pending: Array<{ id: number; blocked: boolean }> = [];
-  private observedAt = 0;
   private closed = false;
   private lastError: string | null = null;
-  private autoStopped = false;
-  private consumer: "legacy" | "worker-test" | "worker" | "lifecycle" = "legacy";
-  private production?: RoomProductionWorker;
-  private readonly receiptJobs = new Set<Promise<void>>();
-  private readonly knownAcks = new Set<string>();
-  private receiptFault?: "sent_unrecorded" | "storage_fault";
-  private readonly observationSlots = new Map<string, string>();
+  private readonly consumer = "lifecycle" as const;
   private readonly physicalCalls = new Set<Promise<unknown>>();
-  private receiptWritesOpen = true;
   private receiptDrainDeadline = Infinity;
   private closePolicy: Readonly<RoomClosePolicy> = ROOM_CLOSE_POLICY;
-  private legacyUsed = false;
   private startupPromise?: Promise<void>;
   private startupFence?: object;
-  private pumpPromise?: Promise<void>;
   private closePromise?: Promise<void>;
-  private wakeRequested = false;
-  private workerPhase?: WorkerPhase;
+  private workerPhase: WorkerPhase = "starting";
   private readyEpoch?: number;
-  private workerPort?: SyntheticWorkerPort;
-  private workerRun?: { item: RoomWorkItem; controller: AbortController; gate: RoomGatePermit; cancelReason?: string; faultReason?: string };
   private lifecycleWorker?: RoomLifecycleWorker;
   private lifecycleOwnerToken?: string;
   private readonly lifecycleGenerations = new Map<string, { claim: LifecycleGenerationClaim; controller: AbortController }>();
@@ -151,6 +104,7 @@ export class VoiceRoom {
   private lifecycleDeliveryWakeRequested = false;
   private readonly lifecycleAudioObservations = new Set<string>();
   private lifecycleLeaseTimer?: ReturnType<typeof setInterval>;
+  private lifecycleRetentionTimer?: ReturnType<typeof setInterval>;
   /**
    * The semantic prompt is only reusable by later Japanese voice segments of
    * the same turn. Text-only and final-segment work never needs an entry.
@@ -160,18 +114,11 @@ export class VoiceRoom {
   private readonly ambientTimers = new Set<ReturnType<typeof setTimeout>>();
   private ambientPlan?: { readonly controller: AbortController; readonly promise: Promise<void> };
   private executionRevision = 0;
-  private gateCounter = 0;
-  private lastGate?: { gateId: string; revision: number; cancelled: boolean; returned: boolean };
   private readonly participationPolicy: ParticipationPolicy;
-  private readonly deliveryPolicy = new DeliveryPolicy();
-  private readonly participationCounts = { evaluated: 0, scheduled: 0, silent: 0,
-    reasons: {} as Partial<Record<ParticipationReason, number>> };
 
   constructor(file: string, config: RoomConfig, private readonly deps: RoomDependencies,
-    selection: { execution?: "legacy" | "worker" | "lifecycle" } = {}) {
-    if (selection.execution !== undefined && !["legacy", "worker", "lifecycle"].includes(selection.execution)) throw new Error("room-consumer-invalid");
-    if (selection.execution === "worker") { this.consumer = "worker"; this.workerPhase = "starting"; }
-    if (selection.execution === "lifecycle") { this.consumer = "lifecycle"; this.workerPhase = "starting"; }
+    selection: { execution?: "lifecycle" } = {}) {
+    if (selection.execution !== undefined && selection.execution !== "lifecycle") throw new Error("room-consumer-invalid");
     this.config = checkRoomConfig(config);
     this.participationPolicy = new ParticipationPolicy(this.config);
     this.now = deps.now ?? Date.now;
@@ -185,27 +132,19 @@ export class VoiceRoom {
     if (!this.config.characters.some(c => c.accountKey === accountKey)) throw new Error("room-account-unknown");
     if (value) {
       this.online.add(accountKey);
-      if (this.consumer === "lifecycle" && this.config.characters.every(character => this.online.has(character.accountKey))) {
+      if (this.config.characters.every(character => this.online.has(character.accountKey))) {
         this.wakeLifecycleGenerations();
         this.wakeLifecycleDelivery();
       }
-    }
-    else {
+    } else {
       this.online.delete(accountKey);
-      if (this.consumer === "lifecycle") {
-        this.cancelLifecycleConnectionWork();
-        return;
-      }
-      if (this.consumer !== "legacy") { this.faultWorker("room-worker-availability-changed"); return; }
-      this.stop();
-      if (accountKey === this.config.ingressAccountKey) this.store.setPaused(true);
+      this.cancelLifecycleConnectionWork();
     }
   }
-  /** Read-only readiness gate: Legacy is ready immediately; a worker only after Recovery/control init. */
+  /** Read-only readiness gate: ready only after recovery/control init and all accounts online. */
   get ready(): boolean {
-    return !this.closed && (this.consumer === "legacy"
-      || (this.workerPhase === "ready" && (this.consumer !== "lifecycle"
-        || this.config.characters.every(character => this.online.has(character.accountKey)))));
+    return !this.closed && this.workerPhase === "ready"
+      && this.config.characters.every(character => this.online.has(character.accountKey));
   }
   private controlResult(kind: RoomControlResult["kind"], action: RoomControlAction, reason: string | null,
     state: RoomControlState, cancelledQueued = 0, cancelledActive = false): RoomControlResult {
@@ -213,25 +152,15 @@ export class VoiceRoom {
       executionRevision: state.executionRevision, sessionExpiresAt: state.sessionExpiresAt,
       cancelledQueued, cancelledActive });
   }
-  private abortWorkerRun(reason: string): boolean {
-    if (!this.workerRun) return false;
-    this.workerRun.cancelReason = reason;
-    this.workerRun.controller.abort();
-    return true;
-  }
-  /**
-   * Local deterministic control result for the worker-test path. It never parses command text and
-   * never waits for a network ACK. The selected transport routes directly to its consumer.
-   */
+  /** Local deterministic control seam used by tests and owner runtime pause/resume. */
   handleControl(action: RoomControlAction, input: RoomInput, mode?: RoomParticipationMode): RoomControlResult {
-    return this.production ? this.store.deliveryWrite(() => this.applyRuntimeControl(action, input, mode))
-      : this.applyRuntimeControl(action, input, mode);
+    return this.applyRuntimeControl(action, input, mode);
   }
   private applyRuntimeControl(action: RoomControlAction, input: RoomInput, mode?: RoomParticipationMode): RoomControlResult {
     let fallback: RoomControlState;
     try { fallback = this.store.controlState(); }
     catch { fallback = { mode: "mention_only", paused: true, epoch: 0, executionRevision: 0, sessionExpiresAt: null }; }
-    if (this.consumer === "legacy" || this.workerPhase !== "ready" || this.closed) {
+    if (this.workerPhase !== "ready" || this.closed) {
       return this.controlResult("rejected", action, "room-not-ready", fallback);
     }
     const account = this.config.characters.find(c => c.accountKey === input.accountKey);
@@ -243,19 +172,13 @@ export class VoiceRoom {
       return this.controlResult("rejected", action, "control_forbidden", fallback);
     }
     const eventKey = this.store.eventKey(input);
-    // Authorization and terminal fence precede replay; replay precedes even Session expiry.
     try {
       const original = this.store.controlResultForEvent(eventKey);
       if (original) return original;
       if (this.store.seenEvent(eventKey)) return this.controlResult("duplicate", action, "duplicate_control", fallback);
     } catch { return this.controlResult("rejected", action, "control_storage_failed", fallback); }
-    const emergencyCancelled = Boolean(this.production && (action === "stop" || action === "pause")
-      && this.abortWorkerRun(action === "stop" ? "control_stop" : "control_pause"));
     try { this.store.expireSession(this.now()); }
-    catch {
-      if (this.production) this.faultWorker("control_storage_failed");
-      return this.controlResult("rejected", action, "control_storage_failed", fallback);
-    }
+    catch { return this.controlResult("rejected", action, "control_storage_failed", fallback); }
     const before = this.store.controlState();
     if (action === "status") return this.controlResult("observed", action, null, before);
     const now = this.now();
@@ -273,8 +196,7 @@ export class VoiceRoom {
     switch (action) {
       case "stop": {
         const queued = this.store.inspectQueue().queuedCount;
-        const shouldBump = Boolean(this.workerRun) || before.mode !== "mention_only"
-          || before.sessionExpiresAt !== null || queued > 0;
+        const shouldBump = before.mode !== "mention_only" || before.sessionExpiresAt !== null || queued > 0;
         if (!shouldBump) return recordOutcome("ignored", "already_stopped");
         mutation = { eventKey, now, expectedEpoch: this.readyEpoch!, expectedRevision: before.executionRevision,
           mode: "mention_only", sessionExpiresAt: null, bumpRevision: true, cancelQueuedReason: "control_stop" };
@@ -318,24 +240,15 @@ export class VoiceRoom {
     }
     let result;
     try { result = this.store.applyControl({ ...mutation, outcome: { action, kind: "applied", reason: null,
-      cancelledActive: (action === "stop" || action === "pause" || mutation.bumpRevision) && Boolean(this.workerRun) } }); }
-    catch {
-      if (this.production) this.faultWorker("control_storage_failed");
-      return this.controlResult("rejected", action, "control_storage_failed", before);
-    }
+      cancelledActive: false } }); }
+    catch { return this.controlResult("rejected", action, "control_storage_failed", before); }
     if (result.kind === "duplicate") return result.localResult
       ?? this.controlResult("duplicate", action, "duplicate_control", result.state);
     if (result.kind === "stale") return this.controlResult("rejected", action, "control_revision_conflict", result.state);
-    const revisionChanged = this.executionRevision !== result.state.executionRevision;
     this.executionRevision = result.state.executionRevision;
-    const cancelledActive = emergencyCancelled || ((action === "stop" || action === "pause" || revisionChanged)
-      ? this.abortWorkerRun(action === "stop" ? "control_stop" : action === "pause" ? "control_pause" : "control_revision_changed") : false);
-    if (action === "resume") {
-      this.wakeWorker();
-      if (this.consumer === "lifecycle") this.onLifecyclePauseChange(false);
-    }
-    if (action === "pause" && this.consumer === "lifecycle") this.onLifecyclePauseChange(true);
-    return this.controlResult("applied", action, null, result.state, result.cancelledQueued, cancelledActive);
+    if (action === "resume") this.onLifecyclePauseChange(false);
+    if (action === "pause") this.onLifecyclePauseChange(true);
+    return this.controlResult("applied", action, null, result.state, result.cancelledQueued, false);
   }
   private permits(text: string): boolean {
     try { return this.deps.permitsText(text) === true; } catch { return false; }
@@ -343,35 +256,6 @@ export class VoiceRoom {
   private permitsPrompt(prompt: Parameters<NonNullable<RoomDependencies["permitsPrompt"]>>[0]): boolean {
     try { return this.deps.permitsPrompt ? this.deps.permitsPrompt(prompt) === true
       : this.permits(prompt.systemPrompt) && this.permits(prompt.messages[0].content); } catch { return false; }
-  }
-  /** Production Worker ingress; never enters Legacy receive()/schedule(). Control notices stay local. */
-  receiveWorker(input: RoomInput, policy: RoomQueuePolicy): RoomReceipt {
-    if (this.consumer !== "worker" || !this.ready || this.closed || !this.permits(input.text)) return "rejected";
-    const text = input.text.trim();
-    const command = /^\/room (stop|pause|resume|status|text|voice|voice-only|both|auto|session|extend)$/.exec(text)?.[1];
-    if (text.startsWith("/room") && !command) return "rejected";
-    if (command) {
-      if (input.accountKey !== this.config.ingressAccountKey && command !== "stop") return "rejected";
-      const action = command === "session" ? "start_session" : command === "extend" ? "extend_session" : command;
-      if (["stop", "pause", "resume", "status", "start_session", "extend_session"].includes(action)) {
-        const result = this.handleControl(action as RoomControlAction, input);
-        return result.kind === "rejected" ? "rejected" : result.kind === "duplicate" ? "duplicate" : "control";
-      }
-      const authorized = this.handleControl("status", input);
-      if (authorized.kind === "rejected" || input.senderId !== this.config.ownerId || this.store.deliveryHold()
-        || (command !== "text" && this.deps.voiceAvailable === false)) return "rejected";
-      return this.store.transaction(() => {
-        if (!this.store.rememberInput(input, this.now())) return "duplicate";
-        this.store.setDeliveryMode(command === "text" ? "text" : command === "voice-only" ? "voice" : command === "auto" ? "auto" : "both");
-        return "control";
-      });
-    }
-    // VR2-061: ordinary group messages have one authoritative account view; Stop above
-    // remains the explicit secondary-account control exception.
-    if (input.accountKey !== this.config.ingressAccountKey) return "rejected";
-    const admitted = this.acceptWork(input, policy);
-    return admitted.kind === "duplicate" ? "duplicate" : admitted.kind === "enqueue" ? "scheduled"
-      : admitted.kind === "record_only" ? "observed" : "rejected";
   }
   /** Worker-only lifecycle ingress. Old Session/Stop/Pause/Resume commands are unreachable. */
   receiveLifecycle(input: RoomInput, policy: RoomQueuePolicy): RoomReceipt {
@@ -458,305 +342,6 @@ export class VoiceRoom {
       return "rejected";
     }
   }
-  receive(input: RoomInput): RoomReceipt {
-    if (this.closed) return "rejected";
-    if (this.consumer !== "legacy") return "rejected";
-    if (this.store.deliveryHold()) return "rejected";
-    this.legacyUsed = true;
-    const account = this.config.characters.find(c => c.accountKey === input.accountKey);
-    if (!account || !this.online.has(account.accountKey) || account.selfId !== input.selfId
-      || input.groupId !== this.config.groupId || !/^[1-9]\d{0,15}$/.test(input.senderId)
-      || !Number.isSafeInteger(Number(input.senderId)) || this.config.characters.some(c => c.selfId === input.senderId)
-      || !roomInputId(input.messageId) || (input.replyToMessageId !== undefined && !roomInputId(input.replyToMessageId))
-      || input.unsupported || typeof input.text !== "string"
-      || !input.text.trim() || input.text.length > 8000 || input.text.includes("\0")
-      || (input.mentions !== undefined && (!Array.isArray(input.mentions)
-        || input.mentions.some(id => typeof id !== "string" || !/^[1-9]\d{0,15}$/.test(id)
-          || !Number.isSafeInteger(Number(id)))))) return "rejected";
-    const text = input.text.trim();
-    const command = /^\/room (stop|pause|resume|status|text|voice-only|voice|both|auto|start)(?:\s+([\s\S]+))?$/.exec(text);
-    if (command && command[1] !== "start" && command[2]) return "rejected";
-    if (text.startsWith("/room") && !command) return "rejected";
-    if (account.accountKey !== this.config.ingressAccountKey && command?.[1] !== "stop") return "rejected";
-    if (command && !["stop", "status"].includes(command[1]!) && input.senderId !== this.config.ownerId) return "rejected";
-    if (command && ["voice", "voice-only", "both", "auto"].includes(command[1]!) && this.deps.voiceAvailable === false) return "rejected";
-    if (!this.permits(text)) return "rejected";
-    if (this.store.state().paused && !command) return "paused";
-    const reply = !command && input.replyToMessageId !== undefined
-      ? this.store.replyTarget(input.accountKey, input.replyToMessageId) : undefined;
-
-    let messageId: number | undefined;
-    const fresh = this.store.transaction(() => {
-      if (!this.store.rememberInput(input, this.now())) return false;
-      if (!command || command[1] === "start") messageId = this.store.appendUser({ ...input, text }, this.now(), reply?.id ?? null);
-      return true;
-    });
-    if (!fresh) return "duplicate";
-    if (command) {
-      switch (command[1]) {
-        case "stop": this.stop(); this.autoStopped = true; break;
-        case "pause": this.stop(); this.store.setPaused(true); break;
-        case "resume": this.autoStopped = false; this.store.setPaused(false); break;
-        case "text": this.store.setVoice(false); break;
-        case "voice": this.store.setVoice(true); break;
-        case "both": this.store.setDeliveryMode("both"); break;
-        case "voice-only": this.store.setDeliveryMode("voice"); break;
-        case "auto": this.store.setDeliveryMode("auto"); break;
-        case "start":
-          this.stop();
-          this.autoStopped = false;
-          this.store.setPaused(false);
-          this.schedule("manual", messageId!, this.store.nextCharacter());
-          return "scheduled";
-      }
-      return "control";
-    }
-    this.observedAt = this.now();
-    const explicit = this.config.characters.find(c => input.mentions?.includes(c.selfId));
-    const mentioned = explicit
-      ?? (reply?.speakerType === "bot" ? this.config.characters.find(c => c.id === reply.speakerId) : undefined);
-    if (mentioned) {
-      this.stop();
-      this.schedule("direct", messageId!, mentioned, 2);
-      return "scheduled";
-    }
-    if (this.current?.trigger === "ambient") this.stop();
-    // Direct/manual speech is not interrupted by each ambient group line.
-    if (this.current) return "observed";
-    const blocked = Boolean(input.mentions?.length || (input.replyToMessageId !== undefined && reply?.speakerType !== "bot"));
-    if (blocked) this.pending = [];
-    this.pending.push({ id: messageId!, blocked });
-    this.pending = this.pending.slice(-this.config.limits.maxHistory);
-    return "observed";
-  }
-  tick(): boolean {
-    if (this.consumer !== "legacy" || this.store.deliveryHold()) return false;
-    this.legacyUsed = true;
-    if (this.closed || !this.pending.length) return false;
-    const state = this.store.state(), now = this.now(), latest = this.pending.at(-1)!;
-    const decision = this.participationPolicy.decide({
-      history: this.store.historyPage(Math.min(ROOM_HISTORY_PAGE_LIMIT, Math.max(this.config.limits.historyPageRows,
-        this.config.limits.ambientMessages + 2))),
-      pendingIds: this.pending.filter(p => !p.blocked).map(p => p.id), now, observedAt: this.observedAt,
-      lastAttemptAt: state.ambient_at, online: this.online, paused: Boolean(state.paused), stopped: this.autoStopped,
-      busy: Boolean(this.current), blockedTarget: latest.blocked,
-      hasBudget: this.store.canSpend("model", now, 1) && this.store.canSpend("send", now) });
-    if (decision.reason === "quiet" || decision.reason === "busy") return false;
-    this.pending = [];
-    this.participationCounts.evaluated++;
-    this.participationCounts[decision.shouldReply ? "scheduled" : "silent"]++;
-    this.participationCounts.reasons[decision.reason] = (this.participationCounts.reasons[decision.reason] ?? 0) + 1;
-    const notice: ParticipationNotice = { shouldReply: decision.shouldReply, reason: decision.reason, maxTurns: decision.maxTurns };
-    try { this.deps.onParticipation?.(notice); } catch { /* Diagnostics cannot change scheduling. */ }
-    if (!decision.shouldReply || decision.maxTurns === 0) return false;
-    const first = this.config.characters.find(c => c.id === decision.firstSpeaker)!;
-    this.store.ambientAttempt(now);
-    this.schedule("ambient", latest.id, first, decision.maxTurns);
-    return true;
-  }
-  private schedule(trigger: Trigger, targetId: number, first: RoomCharacter,
-    maxTurns = trigger === "manual" ? 10 : trigger === "direct" ? 2 : 1): void {
-    if (this.consumer !== "legacy") throw new Error("room-consumer-conflict");
-    this.pending = [];
-    const run: Run = { ...this.store.begin(trigger, targetId, this.now()), trigger, targetId, first, maxTurns,
-      voiceOnlyRequested: requestsVoiceOnly(this.store.historyMessage(targetId)?.text ?? ""),
-      controller: new AbortController() };
-    this.current = run;
-    this.controllers.add(run.controller);
-    this.tail = this.tail.then(() => this.run(run)).catch(() => {
-      this.lastError = "room-storage-or-runtime-failed";
-      this.stop();
-      try { this.store.setPaused(true); } catch { /* Already unavailable: no further delivery. */ }
-    }).finally(() => {
-      this.controllers.delete(run.controller);
-      if (this.current === run) this.current = undefined;
-    });
-  }
-  private valid(run: Run, accountKey: string): boolean {
-    if (this.closed || run.controller.signal.aborted || !this.online.has(accountKey)
-      || !this.online.has(this.config.ingressAccountKey)) return false;
-    const state = this.store.state();
-    return !state.paused && state.epoch === run.epoch;
-  }
-  private replyDeadline(): MonotonicDeadline {
-    return MonotonicDeadline.after(this.config.limits.replyDeadlineMs,
-      this.deps.monotonicNow ?? (() => performance.now()));
-  }
-  private contextCompacted(notice: RoomContextCompactionNotice): void {
-    try { this.deps.onContextCompacted?.(notice); } catch { /* Observers cannot alter a live reply. */ }
-  }
-  private async operation<T>(run: Run, operation: (signal: AbortSignal) => Promise<T>,
-    timeoutMs = this.config.limits.requestTimeoutMs): Promise<T> {
-    const child = new AbortController();
-    const signal = AbortSignal.any([run.controller.signal, child.signal]);
-    signal.throwIfAborted();
-    let rejectAbort: () => void;
-    const aborted = new Promise<never>((_, reject) => {
-      rejectAbort = () => reject(new Error("room-operation-cancelled"));
-      signal.addEventListener("abort", rejectAbort, { once: true });
-    });
-    const timer = setTimeout(() => child.abort(), Math.max(1, timeoutMs));
-    try { return await Promise.race([operation(signal), aborted]); }
-    finally {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", rejectAbort!);
-    }
-  }
-  private async prepareVoice(run: Run, delivery: RoomDelivery, prompt: RoomPrompt): Promise<RoomDelivery | undefined> {
-    const language = this.config.characterLanguages[delivery.characterId]!;
-    if (!language.translateForVoice) return Object.freeze({ ...delivery, voiceText: delivery.text, voiceLanguage: language.voiceLanguage });
-    const started = Date.now();
-    const notice = (code: Parameters<NonNullable<RoomDependencies["onVoicePreparation"]>>[0]["code"]) => {
-      try { this.deps.onVoicePreparation?.({ code, elapsedMs: Math.max(0, Date.now() - started) }); } catch { /* Metadata only. */ }
-    };
-    if (!this.deps.translateVoice) { notice("unavailable"); return; }
-    try {
-      const translation = buildVoiceTranslationPrompt(prompt, delivery.text, this.config.limits);
-      if (!this.permitsPrompt(translation)) throw new Error("room-translation-privacy");
-      if (!this.store.spend("model", this.now(), run.trigger === "ambient" ? 1 : 0)) {
-        notice("budget"); return;
-      }
-      this.store.setTurn(delivery.turnId, "translating");
-      const text = await this.operation(run, signal => this.deps.translateVoice!(translation, signal));
-      if (!validJapaneseVoice(text, delivery.text) || !this.permits(text)) throw new Error("room-translation-invalid");
-      notice("translated");
-      return Object.freeze({ ...delivery, voiceText: text.trim(), voiceLanguage: "ja" });
-    } catch { notice(run.controller.signal.aborted ? "cancelled" : "failed"); return; }
-  }
-  /** Exactly one text attempt, also used for voice preparation/synthesis fallback. */
-  private async confirmedText(run: Run, character: RoomCharacter, delivery: RoomDelivery, target: number): Promise<number | "sent_unrecorded" | undefined> {
-    if (!this.valid(run, character.accountKey)) return undefined;
-    this.store.setTurn(delivery.turnId, "text_sending");
-    let textId: string;
-    try {
-      textId = await this.operation(run, signal => this.deps.sendText(delivery, signal));
-      if (typeof textId !== "string" || !textId) throw new RoomSendError("uncertain");
-    } catch (error) {
-      this.store.setTurn(delivery.turnId, error instanceof RoomSendError && error.outcome === "rejected" ? "text_failed" : "text_uncertain");
-      return undefined;
-    }
-    if (!this.valid(run, character.accountKey)) return undefined;
-    try { return this.store.textSent(delivery.turnId, character, target, delivery.text, textId, this.now()); }
-    catch { this.sentUnrecorded(delivery.turnId); return "sent_unrecorded"; }
-  }
-  private sentUnrecorded(turnId: string): void {
-    try { this.store.setTurn(turnId, "sent_unrecorded"); this.store.holdDelivery("sent_unrecorded"); } catch { /* Recover persisted sending as interrupted. */ }
-    this.lastError = "sent_unrecorded";
-    this.store.setPaused(true);
-  }
-  private async run(run: Run): Promise<void> {
-    const maximum = run.maxTurns;
-    let target = run.targetId, character = run.first;
-    let outcome = "completed";
-    const replyDeadline = this.replyDeadline();
-    const tools = roomToolSession({
-      webProvider: this.deps.webProvider,
-      githubRead: this.deps.githubRead,
-      permitsText: text => this.permits(text),
-      clock: this.deps.monotonicNow,
-    });
-    for (let turn = 0; turn < maximum; turn++) {
-      if (!this.valid(run, character.accountKey)) { outcome = "stopped"; break; }
-      const turnId = this.store.turn(run.id, character, this.now());
-      if (!this.store.canSpend("send", this.now())) { this.store.setTurn(turnId, "rate_limited"); outcome = "rate_limited"; break; }
-      let answer, prompt: RoomPrompt;
-      try {
-        const targetMessage = this.store.historyMessage(target);
-        if (!targetMessage) throw new Error("room-target-missing");
-        prompt = buildRoomPromptFromPages(character, this.deps.persona(character), targetMessage,
-          (limit, beforeId) => this.store.historyPage(limit, beforeId === undefined ? {} : { beforeId }),
-          this.config.limits);
-        if (!this.permitsPrompt(prompt)) throw new Error("room-privacy");
-        if (!this.store.spend("model", this.now(), run.trigger === "ambient" ? 1 : 0)) {
-          this.store.setTurn(turnId, "budget"); outcome = "budget"; break;
-        }
-        const remaining = Math.floor(replyDeadline.remainingMs());
-        if (remaining <= 0) throw new RoomModelError("deadline");
-        answer = await this.operation(run, signal => this.deps.generate(prompt, signal, {
-          tools,
-          turnDeadline: replyDeadline,
-          authorizeModelRound: () => this.valid(run, character.accountKey)
-            && this.store.spend("model", this.now(), run.trigger === "ambient" ? 1 : 0),
-          onContextCompacted: notice => this.contextCompacted(notice),
-        }), remaining);
-      } catch (error) {
-        const budgetFailure = error instanceof RoomContextBudgetError
-          || error instanceof RoomModelError && ["budget", "context-budget"].includes(error.code);
-        this.store.setTurn(turnId, run.controller.signal.aborted ? "stopped"
-          : budgetFailure ? "budget" : "generation_failed");
-        outcome = budgetFailure ? "budget" : "generation_failed"; break;
-      }
-      if (!this.valid(run, character.accountKey)) { this.store.setTurn(turnId, "stopped"); break; }
-      if (answer?.kind === "skip") { this.store.setTurn(turnId, "skipped"); outcome = "skipped"; break; }
-      if (answer?.kind !== "reply" || typeof answer.text !== "string" || !answer.text.trim()
-        || [...answer.text.trim()].length > this.config.limits.maxTextChars || answer.text.includes("\0")
-        || !this.permits(answer.text)) { this.store.setTurn(turnId, "generation_failed"); outcome = "generation_failed"; break; }
-      const mode = this.deliveryPolicy.decide(this.store.deliveryMode(), this.deps.voiceAvailable !== false,
-        answer.text.trim(), run.voiceOnlyRequested);
-      const language = this.config.characterLanguages[character.id]!;
-      const delivery: RoomDelivery = Object.freeze({ accountKey: character.accountKey, characterId: character.id,
-        voiceKey: character.voiceKey, turnId, text: answer.text.trim(),
-        ...(mode !== "text" && !language.translateForVoice ? { voiceText: answer.text.trim(), voiceLanguage: language.voiceLanguage } : {}) });
-      if (!this.store.spend("send", this.now())) { this.store.setTurn(turnId, "rate_limited"); outcome = "rate_limited"; break; }
-      this.store.prepared(delivery, mode);
-      if (mode !== "voice") {
-        const sent = await this.confirmedText(run, character, delivery, target);
-        if (typeof sent !== "number") { outcome = sent ?? "send_failed"; break; }
-        target = sent;
-      }
-      if (mode === "text") this.store.setTurn(turnId, "text_only");
-      else {
-        // Check TTS budget before spending a model call on Japanese translation.
-        const voice = this.store.canSpend("tts", this.now()) ? await this.prepareVoice(run, delivery, prompt!) : undefined;
-        if (!this.valid(run, character.accountKey)) break;
-        let audio: Uint8Array | undefined;
-        if (voice && this.store.spend("tts", this.now())) {
-          this.store.prepared(voice, mode);
-          this.store.setTurn(turnId, "synthesizing");
-          try {
-            if (!this.permits(voice.text) || !this.permits(voice.voiceText!)) throw new Error("room-privacy");
-            audio = await this.operation(run, signal => this.deps.synthesize(voice, signal));
-            if (!(audio instanceof Uint8Array) || audio.byteLength === 0 || audio.byteLength > 10 * 1024 * 1024) audio = undefined;
-          } catch { /* Translation/TTS failure falls back to the Chinese semantic text. */ }
-        }
-        if (!this.valid(run, character.accountKey)) break;
-        if (!audio) {
-          if (mode === "voice") {
-            const sent = await this.confirmedText(run, character, delivery, target);
-            if (typeof sent !== "number") { outcome = sent ?? "send_failed"; break; }
-            target = sent;
-          }
-          this.store.setTurn(turnId, "text_only");
-        }
-        else {
-          this.store.setTurn(turnId, "audio_sending");
-          let audioId: string;
-          try {
-            audioId = await this.operation(run, signal => this.deps.sendAudio(voice!, audio!, signal));
-            if (typeof audioId !== "string" || !audioId) throw new RoomSendError("uncertain");
-          } catch (error) {
-            this.store.setTurn(turnId, error instanceof RoomSendError && error.outcome === "rejected" ? "audio_failed" : "audio_uncertain");
-            outcome = "send_failed"; break;
-          }
-          if (!this.valid(run, character.accountKey)) break;
-          try {
-            if (mode === "voice") target = this.store.audioOnlySent(turnId, character, target, delivery.text, audioId, this.now());
-            else this.store.audioSent(turnId, audioId);
-          } catch { this.sentUnrecorded(turnId); outcome = "sent_unrecorded"; break; }
-        }
-      }
-      character = this.config.characters.find(c => c.id !== character.id)!;
-    }
-    this.store.finishBurst(run.id, outcome);
-  }
-  stop(): void {
-    if (this.consumer !== "legacy") { this.faultWorker("room-worker-control-unavailable"); return; }
-    const active = Boolean(this.current);
-    for (const controller of this.controllers) controller.abort();
-    this.current = undefined;
-    this.pending = [];
-    if (active) this.store.invalidate();
-  }
   lifecycleStatus() {
     const phase = this.workerPhase;
     let paused: boolean | null = null;
@@ -784,98 +369,23 @@ export class VoiceRoom {
     return { execution: this.consumer, ready: this.ready, deliveryHold: this.store.deliveryHold(),
       paused: control.paused, epoch: state.epoch, voice: Boolean(state.voice),
       mode: control.mode, executionRevision: control.executionRevision, sessionExpiresAt: control.sessionExpiresAt,
-      busy: Boolean(this.current || this.workerRun), observedPending: this.pending.length, lastError: this.lastError,
+      busy: this.lifecycleGenerations.size > 0 || Boolean(this.lifecycleDelivery),
+      observedPending: 0, lastError: this.lastError,
       characters: this.config.characters.map(c => c.name), counts: this.store.counts(),
-      automaticStopped: this.autoStopped,
-      deliveryMode: this.store.deliveryMode(),
-      participation: { ...this.participationCounts, reasons: { ...this.participationCounts.reasons } } };
-  }
-  /** Selects this Room's only consumer before Recovery; never reverts after failure. */
-  startWorkerForTest(port: SyntheticWorkerPort): Promise<void> {
-    if (this.consumer === "worker") return Promise.reject(new Error("room-consumer-conflict"));
-    return this.startWorker(port, "worker-test");
-  }
-  private startWorker(port: SyntheticWorkerPort, consumer: "worker-test" | "worker"): Promise<void> {
-    if (this.startupPromise) return this.startupPromise;
-    if (this.closed || this.legacyUsed || this.current || this.pending.length) return Promise.reject(new Error("room-consumer-conflict"));
-    this.consumer = consumer;
-    this.workerPhase = "starting";
-    this.workerPort = port;
-    const fence = {};
-    this.startupFence = fence;
-    const isStarting = () => !this.closed && this.consumer !== "legacy"
-      && this.workerPhase === "starting" && this.startupFence === fence;
-    this.startupPromise = Promise.resolve().then(() => {
-      if (!isStarting()) return;
-      if (!port || typeof port.execute !== "function") throw new Error("room-worker-port-invalid");
-      const expectedEpoch = this.store.state().epoch;
-      if (!isStarting()) return;
-      const now = this.now();
-      if (!isStarting()) return; // Argument evaluation must not cross a stop/offline fence either.
-      const result = this.store.recoverWorkItems({ expectedEpoch, now });
-      if (!isStarting()) return; // A committed Recovery is a fact, never permission to clear a fault.
-      const view = this.store.inspectQueue();
-      if (!isStarting()) return;
-      if (result.previousEpoch !== expectedEpoch || result.epoch !== expectedEpoch + 1
-        || view.epoch !== result.epoch || view.queuedCount || view.claimedCount || view.runningBurstCount || view.futureCount) {
-        throw new Error("room-worker-recovery-invalid");
-      }
-      if (!isStarting()) return;
-      const control = this.store.initializeWorkerControl(result.epoch, this.now());
-      if (!isStarting()) return;
-      this.executionRevision = control.executionRevision;
-      this.readyEpoch = result.epoch;
-      if (this.production && this.store.deliveryHold()) throw new Error("room-delivery-hold");
-      this.startupFence = undefined;
-      this.workerPhase = "ready";
-      this.wakeWorker();
-    }).catch(error => {
-      this.faultWorker("room-worker-startup-failed");
-      throw error;
-    });
-    return this.startupPromise;
-  }
-  /** Approved A-03.3 profile. Still the same FIFO pump; never selects production dependencies. */
-  startPlannedWorkerForTest(port: SyntheticResponsePort): Promise<void> {
-    if (this.consumer === "worker") return Promise.reject(new Error("room-consumer-conflict"));
-    if (this.startupPromise) return this.startupPromise;
-    if (!port || typeof port.generate !== "function" || typeof port.text !== "function"
-      || (port.plan !== undefined && typeof port.plan !== "function")) return Promise.reject(new Error("room-worker-port-invalid"));
-    return this.startWorkerForTest({ execute: (item, signal, gate) => {
-      if (!gate) throw new Error("room-worker-grant-stale");
-      return this.runPlannedWork(item, signal, gate, port);
-    } });
-  }
-  /** Explicit whole-Room selection; adapters must supply the real attempt-aware gateway. */
-  startProductionWorker(options: RoomProductionWorker): Promise<void> {
-    if (this.startupPromise || this.consumer === "worker-test" || this.legacyUsed || this.closed)
-      return Promise.reject(new Error("room-consumer-conflict"));
-    if (!options || typeof options.dispatch !== "function" || typeof options.model?.generate !== "function"
-      || typeof options.beginClose !== "function" || typeof options.sealObservations !== "function"
-      || !Number.isInteger(options.apiTimeoutMs) || options.apiTimeoutMs < 100 || options.apiTimeoutMs > 60000)
-      return Promise.reject(new Error("room-worker-port-invalid"));
-    this.closePolicy = checkClosePolicy(options.closePolicy);
-    this.production = options;
-    this.store.beginDeliveryExecution();
-    const port: SyntheticResponsePort = { ...options.model, text: async () => { throw new Error("room-production-synthetic-port-forbidden"); } };
-    return this.startWorker({ execute: (item, signal, gate) => {
-      if (!gate) throw new Error("room-worker-grant-stale");
-      return this.runPlannedWork(item, signal, gate, port);
-    } }, "worker");
+      automaticStopped: false,
+      deliveryMode: this.store.deliveryMode() };
   }
   /**
-   * Worker-only lifecycle selection. The same process, QQ adapter and SQLite
-   * store remain authoritative; no Legacy fallback or second scheduler exists.
+   * Worker-only lifecycle startup. The same process, QQ adapter and SQLite
+   * store remain authoritative.
    */
   startLifecycleProductionWorker(options: RoomLifecycleWorker): Promise<void> {
-    if (this.startupPromise || this.consumer === "worker-test" || this.consumer === "worker"
-      || this.legacyUsed || this.closed) return Promise.reject(new Error("room-consumer-conflict"));
+    if (this.startupPromise || this.closed) return Promise.reject(new Error("room-consumer-conflict"));
     if (!options || typeof options.dispatch !== "function" || typeof options.model?.generate !== "function"
       || typeof options.beginClose !== "function" || typeof options.sealObservations !== "function"
       || (options.ambientPlanner !== undefined && typeof options.ambientPlanner.plan !== "function")
       || !Number.isInteger(options.apiTimeoutMs) || options.apiTimeoutMs < 100
       || options.apiTimeoutMs > 60000) return Promise.reject(new Error("room-worker-port-invalid"));
-    this.consumer = "lifecycle";
     this.workerPhase = "starting";
     this.closePolicy = checkClosePolicy(options.closePolicy);
     this.lifecycleWorker = options;
@@ -883,8 +393,7 @@ export class VoiceRoom {
     this.store.beginDeliveryExecution();
     const fence = {};
     this.startupFence = fence;
-    const isStarting = () => !this.closed && this.consumer === "lifecycle"
-      && this.workerPhase === "starting" && this.startupFence === fence;
+    const isStarting = () => !this.closed && this.workerPhase === "starting" && this.startupFence === fence;
     this.startupPromise = Promise.resolve().then(() => {
       if (!isStarting()) return;
       const now = this.now();
@@ -902,6 +411,7 @@ export class VoiceRoom {
       this.startupFence = undefined;
       this.workerPhase = "ready";
       this.startLifecycleLease();
+      this.startLifecycleRetention();
       this.wakeLifecycleGenerations();
       this.wakeLifecycleDelivery();
     }).catch(error => {
@@ -909,6 +419,20 @@ export class VoiceRoom {
       throw error;
     });
     return this.startupPromise;
+  }
+  private startLifecycleRetention(): void {
+    this.stopLifecycleRetention();
+    const timer = setInterval(() => {
+      if (this.workerPhase !== "ready" || this.closed) return;
+      try { this.store.cleanupBodyRetention(this.now()); }
+      catch { /* Retention cleanup is best-effort and never faults live delivery. */ }
+    }, LIFECYCLE_RETENTION_INTERVAL_MS);
+    timer.unref();
+    this.lifecycleRetentionTimer = timer;
+  }
+  private stopLifecycleRetention(): void {
+    if (this.lifecycleRetentionTimer !== undefined) clearInterval(this.lifecycleRetentionTimer);
+    this.lifecycleRetentionTimer = undefined;
   }
   private startLifecycleLease(): void {
     this.stopLifecycleLease();
@@ -1098,7 +622,7 @@ export class VoiceRoom {
         lastAttemptAt: this.store.state().ambient_at,
         online: this.online,
         paused: control.paused,
-        stopped: this.autoStopped,
+        stopped: false,
         busy: this.lifecycleGenerations.size > 0 || Boolean(this.store.lifecycleHeadRequest()),
         blockedTarget: blocked,
         hasBudget: this.store.canSpend("model", now, 1) && this.store.canSpend("send", now),
@@ -1908,506 +1432,36 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
       child.removeEventListener("abort", onAbort);
     }
   }
-  private plannedLive(signal: AbortSignal, gate: RoomGatePermit, accountKey?: string): boolean {
-    return !signal.aborted && this.gateValid(gate) && this.online.has(this.config.ingressAccountKey)
-      && (accountKey === undefined || this.online.has(accountKey));
-  }
-  private plannedNow(signal: AbortSignal, gate: RoomGatePermit, accountKey: string): number {
-    const now = this.now();
-    // Injected clocks and policy/persona callbacks may close the Room synchronously.
-    if (!this.plannedLive(signal, gate, accountKey)) throw new Error("room-worker-plan-cancelled");
-    return now;
-  }
-  /** Abort observation is installed before callback evaluation; ignored-abort late results are inert. */
-  private async plannedCall<T>(signal: AbortSignal, gate: RoomGatePermit, accountKey: string,
-    timeoutMs: number, operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
-    const child = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined;
-    let onAbort!: () => void;
-    const interrupted = new Promise<never>((_, reject) => {
-      onAbort = () => { child.abort(); reject(new Error("room-worker-plan-cancelled")); };
-      signal.addEventListener("abort", onAbort, { once: true });
-      timer = setTimeout(() => { child.abort(); reject(new Error("room-worker-plan-timeout")); }, timeoutMs);
-    });
-    void interrupted.catch(() => {});
-    try {
-      if (!this.plannedLive(signal, gate, accountKey)) throw new Error("room-worker-plan-cancelled");
-      const pending = Promise.resolve().then(async () => {
-        // Cancellation ends the local await, not an adapter's physical operation. A late
-        // ignored-abort call keeps its resource until it actually settles; no overlap or retry.
-        if (this.production && this.physicalCalls.size) await Promise.allSettled([...this.physicalCalls]);
-        child.signal.throwIfAborted();
-        if (!this.plannedLive(signal, gate, accountKey)) throw new Error("room-worker-plan-cancelled");
-        const call = Promise.resolve().then(() => {
-          child.signal.throwIfAborted(); this.plannedNow(signal, gate, accountKey);
-          return operation(child.signal);
-        });
-        if (this.production) {
-          this.physicalCalls.add(call);
-          const release = () => { this.physicalCalls.delete(call); this.wakeWorker(); };
-          void call.then(release, release);
-        }
-        return call;
-      });
-      const result = await Promise.race([pending, interrupted]);
-      if (!this.plannedLive(signal, gate, accountKey)) throw new Error("room-worker-plan-cancelled");
-      return result;
-    } finally { clearTimeout(timer); signal.removeEventListener("abort", onAbort); }
-  }
-  private async runPlannedWork(item: RoomWorkItem, signal: AbortSignal, gate: RoomGatePermit, port: SyntheticResponsePort): Promise<{ status: "completed" | "failed"; reason: string }> {
-    if (!this.plannedLive(signal, gate)) throw new Error("room-worker-grant-stale");
-    const obligations = this.store.beginWorkerBurst(item.workItemId, gate);
-    const requestedMode = this.store.deliveryMode();
-    let resolvedMode: "text" | "both" | "voice" | undefined;
-    if (this.production && requestedMode === "voice" && this.deps.voiceAvailable !== false && obligations.length > 1) {
-      this.store.failWorkerObligation(item.workItemId, 0, "unsupported_voice_dual_target");
-      return { status: "failed", reason: "unsupported_voice_dual_target" };
-    }
-    let primary: WorkerContext["primaryText"] = null;
-    const target = Object.freeze({ messageRowId: item.payload!.messageRowId, messageId: item.payload!.input.messageId,
-      senderKey: item.payload!.input.senderKey, text: item.payload!.input.text, characterIds: item.payload!.characterIds });
-    const replyDeadline = this.replyDeadline();
-    const tools = roomToolSession({
-      webProvider: this.deps.webProvider,
-      githubRead: this.deps.githubRead,
-      permitsText: text => this.permits(text),
-      clock: this.deps.monotonicNow,
-    });
-    for (let index = 0; index < obligations.length; index++) {
-      if (!this.plannedLive(signal, gate)) return { status: "failed", reason: "control_revision_changed" };
-      const character = this.config.characters.find(c => c.id === obligations[index]!.characterId)!;
-      const fail = (reason: string, unavailable = false, contextBudgetDiagnostic?: unknown) => {
-        // Policy/persona callbacks can synchronously close or cancel before returning.
-        // Never overwrite an already established cancellation with a privacy/context failure.
-        if (!this.plannedLive(signal, gate) || this.store.workItem(item.workItemId)?.status !== "claimed")
-          throw new Error("room-worker-plan-cancelled");
-        this.store.failWorkerObligation(item.workItemId, index, reason,
-          unavailable ? "unavailable" : "failed", contextBudgetDiagnostic);
-        return { status: "failed" as const, reason };
-      };
-      if (!this.online.has(character.accountKey)) return fail("required_character_offline", true);
-      const rules = ruleResponsePlan(target.text, this.config.workerResponseBudgets, randomUUID());
-      // Build a finite, token-bounded context before planning. The rule tier's output
-      // reserve is provisional; the final prepared context below uses the returned plan.
-      let persona: string;
-      let prepared;
-      try {
-        persona = this.deps.persona(character);
-        prepared = buildWorkerPromptFromPages(character, persona, target, primary, rules,
-          this.config.limits,
-          (limit, beforeId) => this.store.historyPage(limit, beforeId === undefined ? {} : { beforeId }));
-      } catch (error) {
-        return fail("worker_context_invalid", false,
-          error instanceof RoomContextBudgetError ? error.diagnostic : undefined);
-      }
-      let context = prepared.context;
-      if (!this.permits(context.target.text) || context.history.some(m => !this.permits(m.text))
-        || (primary && !this.permits(primary.text))) return fail("worker_privacy_rejected");
-      if (!this.plannedLive(signal, gate, character.accountKey)) return { status: "failed", reason: "control_revision_changed" };
-      let plan: ResponsePlan = rules;
-      const unresolved = unresolvedFields(rules);
-      if (unresolved.length && port.plan) {
-        if (!this.store.spend("model", this.plannedNow(signal, gate, character.accountKey))) return fail("model_budget_exhausted");
-        try {
-          const remaining = Math.floor(replyDeadline.remainingMs());
-          if (remaining <= 0) return fail("worker_generation_failed");
-          const planTimeoutMs = Math.max(1, Math.min(1000,
-            Math.floor(this.config.limits.requestTimeoutMs / 3), remaining));
-          const assistance = await this.plannedCall(signal, gate, character.accountKey,
-            planTimeoutMs,
-            s => port.plan!(Object.freeze({ context, rulePlan: rules, unresolved }), s));
-          plan = completeResponsePlan(rules, this.config.workerResponseBudgets,
-            validAssistance(assistance, unresolved) ? "used" : "invalid", assistance);
-        } catch (error) {
-          if (!this.plannedLive(signal, gate, character.accountKey)) return { status: "failed", reason: "control_revision_changed" };
-          plan = completeResponsePlan(rules, this.config.workerResponseBudgets,
-            error instanceof Error && error.message === "room-worker-plan-timeout" ? "timeout" : "error");
-        }
-      }
-      if (!this.plannedLive(signal, gate, character.accountKey)) return { status: "failed", reason: "control_revision_changed" };
-      let prompt: RoomPrompt;
-      try {
-        prepared = buildWorkerPromptFromPages(character, persona!, target, primary, plan,
-          this.config.limits,
-          (limit, beforeId) => this.store.historyPage(limit, beforeId === undefined ? {} : { beforeId }));
-        context = prepared.context;
-        prompt = prepared.prompt;
-        if (!this.permitsPrompt(prompt)) return fail("worker_privacy_rejected");
-      } catch (error) {
-        return fail("worker_context_invalid", false,
-          error instanceof RoomContextBudgetError ? error.diagnostic : undefined);
-      }
-      if (!this.permits(context.target.text) || context.history.some(m => !this.permits(m.text))
-        || (primary && !this.permits(primary.text))) return fail("worker_privacy_rejected");
-      if (!this.plannedLive(signal, gate, character.accountKey)) return { status: "failed", reason: "control_revision_changed" };
-      const binding: WorkerTurnBinding = Object.freeze({ workItemId: item.workItemId, burstId: item.burstId!, eventKey: item.eventKey,
-        targetId: target.messageRowId, targetHash: this.store.workerTargetHash(item), turnId: randomUUID(), turnIndex: index,
-        characterId: character.id, contextRevision: context.contextRevision, plan,
-        decision: Object.freeze({ decisionId: randomUUID(), decisionRevision: 1, kind: index === 0 ? "primary" : "supplement", characterId: character.id }),
-        gate, grantId: randomUUID(), slotConsumed: true, slotReturned: false });
-      if (!this.store.authorizeWorkerTurn(binding, this.plannedNow(signal, gate, character.accountKey))) return fail("model_budget_exhausted");
-      const request: WorkerGenerationRequest = Object.freeze({ binding, context, prompt, budget: plan.budget });
-      let answer;
-      try {
-        const remaining = Math.floor(replyDeadline.remainingMs());
-        if (remaining <= 0) return fail("worker_generation_failed");
-        const raw = await this.plannedCall(signal, gate, character.accountKey,
-          Math.max(1, remaining),
-          s => port.generate(request, s, {
-            tools,
-            turnDeadline: replyDeadline,
-            authorizeModelRound: () => this.plannedLive(signal, gate, character.accountKey)
-              && this.store.spend("model", this.plannedNow(signal, gate, character.accountKey)),
-            onContextCompacted: notice => this.contextCompacted(notice),
-          }));
-        answer = checkedWorkerAnswer(raw, plan.budget.maxTextChars);
-      } catch (error) {
-        if (!this.plannedLive(signal, gate, character.accountKey)) return { status: "failed", reason: "control_revision_changed" };
-        if (error instanceof RoomModelError && error.code === "context-budget") return fail("worker_context_invalid");
-        if (error instanceof RoomModelError && error.code === "budget") return fail("model_budget_exhausted");
-        return fail("worker_generation_failed");
-      }
-      if (!answer) return fail("worker_answer_invalid");
-      const fallback = answer.kind === "skip";
-      const replyText = answer.kind === "skip" ? WORKER_EXPLICIT_NO_ANSWER_FALLBACK.text : answer.text;
-      if ([...replyText].length > plan.budget.maxTextChars) return fail("explicit_no_answer");
-      if (!this.permits(replyText)) return fail("worker_privacy_rejected");
-      if (!this.plannedLive(signal, gate, character.accountKey)) return { status: "failed", reason: "control_revision_changed" };
-      if (this.production) {
-        // Freeze the Burst's resolved DeliveryPlan before its first external delivery (§13.3.1).
-        // A fallback explanation is text-only, but it must still freeze the Burst decision so T2
-        // cannot re-resolve auto after T1 has spoken.
-        const frozenMode = resolvedMode ??= this.deliveryPolicy.decide(requestedMode, this.deps.voiceAvailable !== false,
-          replyText, requestsVoiceOnly(target.text));
-        if (frozenMode === "voice" && obligations.length > 1) return fail("unsupported_voice_dual_target");
-        const mode: "text" | "both" | "voice" = fallback ? "text" : frozenMode;
-        try {
-          const messageRowId = await this.runPlatformTurn(binding, replyText, prompt, mode, signal,
-            fallback ? WORKER_EXPLICIT_NO_ANSWER_FALLBACK.reason : "platform_delivery_committed");
-          primary = Object.freeze({ turnId: binding.turnId, messageRowId, text: replyText });
-        } catch (error) {
-          if (!this.plannedLive(signal, gate, character.accountKey)) throw new Error("room-worker-plan-cancelled");
-          if (this.store.deliveryHold()) { this.faultWorker("delivery_unknown"); throw error; }
-          return fail(error instanceof Error && /^[a-z][a-z0-9_-]{0,79}$/.test(error.message) ? error.message : "platform_delivery_failed");
-        }
-        continue;
-      }
-      if (!this.store.spend("send", this.plannedNow(signal, gate, character.accountKey))) return fail("send_budget_exhausted");
-      let fact: unknown;
-      try { fact = await this.plannedCall(signal, gate, character.accountKey, this.config.limits.requestTimeoutMs,
-        s => port.text(Object.freeze({ binding, text: replyText }), s)); }
-      catch {
-        if (!this.plannedLive(signal, gate, character.accountKey)) return { status: "failed", reason: "control_revision_changed" };
-        return fail("synthetic_text_failed");
-      }
-      if (!fact || typeof fact !== "object" || Array.isArray(fact) || Object.keys(fact).sort().join(",") !== "kind,receiptId"
-        || (fact as { kind?: unknown }).kind !== "confirmed" || typeof (fact as { receiptId?: unknown }).receiptId !== "string"
-        || !/^synthetic-[a-zA-Z0-9_-]{1,100}$/.test((fact as { receiptId: string }).receiptId)) return fail("synthetic_text_unconfirmed");
-      if (!this.plannedLive(signal, gate, character.accountKey)) return { status: "failed", reason: "control_revision_changed" };
-      // Storage failure faults the Worker and must never be converted into a successful text fact.
-      const messageRowId = this.store.commitWorkerText(binding, replyText, (fact as { receiptId: string }).receiptId,
-        this.plannedNow(signal, gate, character.accountKey),
-        fallback ? WORKER_EXPLICIT_NO_ANSWER_FALLBACK.reason : "synthetic_text_committed");
-      primary = Object.freeze({ turnId: binding.turnId, messageRowId, text: replyText });
-    }
-    return { status: "completed", reason: this.production ? "platform_required_targets_completed" : "synthetic_required_targets_completed" };
-  }
-  private async receiptWrite(write: () => void): Promise<void> {
-    const deadline = Math.min(Date.now() + this.closePolicy.writeWaitMs, this.receiptDrainDeadline);
-    for (;;) {
-      if (!this.receiptWritesOpen) throw new Error("room-receipt-observation-closed");
-      try { this.store.deliveryWrite(write); return; }
-      catch (error) {
-        const busy = (error as { errcode?: number }).errcode === 5 || /database is locked|SQLITE_BUSY/.test(error instanceof Error ? error.message : "");
-        if (!busy || Date.now() >= deadline) throw error;
-        await new Promise<void>(resolve => setTimeout(resolve, Math.min(5, Math.max(1, deadline - Date.now()))));
-      }
-    }
-  }
-  private observePlatform(attemptId: string, observation: RoomDeliveryObservation): Promise<void> {
-    if (!this.receiptWritesOpen) return Promise.resolve();
-    if (observation.kind === "ack") this.knownAcks.add(attemptId);
-    const observedAt = this.now();
-    const job = this.receiptWrite(() => { this.store.recordDeliveryObservation(attemptId, observation, observedAt, this.receiptFault); });
-    this.receiptJobs.add(job);
-    void job.then(() => this.receiptJobs.delete(job), () => {
-      this.receiptJobs.delete(job); this.receiptFault = observation.kind === "ack" ? "sent_unrecorded" : "storage_fault";
-      this.lastError = this.receiptFault;
-      // A known ACK must never be relabelled as network uncertainty. A durable started fact
-      // remains the conservative restart fence if storage also rejects this fault marker.
-      try { this.store.deliveryWrite(() => {
-        this.store.holdDelivery(this.receiptFault!);
-        const attempt = this.store.deliveryAttempt(attemptId);
-        if (observation.kind === "ack" && attempt) this.store.setTurn(attempt.turnId, "sent_unrecorded");
-      }); } catch { /* started survives. */ }
-      this.faultWorker(this.lastError);
-    });
-    return job;
-  }
-  private async platformSend(binding: WorkerTurnBinding, delivery: RoomDelivery, medium: "text" | "audio",
-    signal: AbortSignal, bytes?: Uint8Array): Promise<void> {
-    const account = delivery.accountKey;
-    if (this.observationSlots.size >= this.closePolicy.observationCapacity
-      || [...this.observationSlots.values()].filter(a => a === account).length >= this.closePolicy.perAccountCapacity) {
-      this.store.setTurn(binding.turnId, medium === "text" ? "text_failed" : "audio_failed");
-      throw new Error("delivery_observation_capacity");
-    }
-    this.plannedNow(signal, binding.gate, account);
-    const attempt = this.store.recordDeliveryIntent(binding, medium, this.now());
-    this.observationSlots.set(attempt.attemptId, account);
-    try {
-      await this.plannedCall(signal, binding.gate, account, this.production!.apiTimeoutMs + 250,
-        () => this.production!.dispatch({ attempt, delivery, ...(bytes ? { bytes } : {}),
-          beforeSend: () => {
-            this.plannedNow(signal, binding.gate, account);
-            this.store.recordDeliveryStarted(attempt.attemptId, binding.gate, this.now());
-          }, observe: value => this.observePlatform(attempt.attemptId, value),
-          released: () => { this.observationSlots.delete(attempt.attemptId); } }));
-    } catch (error) {
-      const saved = this.store.deliveryAttempt(attempt.attemptId)!;
-      if (saved.startedAt === null) this.observationSlots.delete(attempt.attemptId);
-      else if (!this.knownAcks.has(attempt.attemptId)
-        && !this.store.deliveryReceipts(attempt.attemptId).some(r => ["ack", "rejected", "uncertain"].includes(r.kind)))
-        await this.observePlatform(attempt.attemptId, { kind: "uncertain" });
-      try {
-        this.store.deliveryWrite(() => this.store.setTurn(binding.turnId, this.knownAcks.has(attempt.attemptId) ? "sent_unrecorded"
-          : this.store.deliveryReceipts(attempt.attemptId).some(r => r.kind === "rejected")
-            ? medium === "text" ? "text_failed" : "audio_failed" : medium === "text" ? "text_uncertain" : "audio_uncertain"));
-      } catch { /* Persisted started is sufficient to fence recovery. */ }
-      throw error;
-    }
-    if (this.store.deliveryHold()) throw new Error("delivery_unknown");
-  }
-  private async runPlatformTurn(binding: WorkerTurnBinding, text: string, prompt: RoomPrompt,
-    mode: "text" | "both" | "voice", signal: AbortSignal,
-    completionReason: "explicit_no_answer_fallback" | "platform_delivery_committed" = "platform_delivery_committed"): Promise<number> {
-    const c = this.config.characters.find(c => c.id === binding.characterId)!, gate = binding.gate;
-    let delivery: RoomDelivery = Object.freeze({ accountKey: c.accountKey, characterId: c.id, voiceKey: c.voiceKey, turnId: binding.turnId, text });
-    this.store.prepared(delivery, mode);
-    if (mode !== "voice") await this.platformSend(binding, delivery, "text", signal);
-    if (mode === "text") return this.store.finishPlatformTurn(binding, "text_only", completionReason);
-    let audio: Uint8Array | undefined;
-    try {
-      const language = this.config.characterLanguages[c.id]!;
-      if (!this.store.canSpend("tts", this.plannedNow(signal, gate, c.accountKey))) throw new Error("tts_budget");
-      let voiceText = text;
-      if (language.translateForVoice) {
-        if (!this.deps.translateVoice) throw new Error("voice_translation_unavailable");
-        const translation = buildVoiceTranslationPrompt(prompt, text, { ...this.config.limits,
-          maxTextChars: binding.plan.budget.maxTextChars, outputTokens: 2048 });
-        if (!this.permitsPrompt(translation) || !this.store.spend("model", this.plannedNow(signal, gate, c.accountKey))) throw new Error("voice_translation_blocked");
-        this.store.setTurn(binding.turnId, "translating");
-        voiceText = await this.plannedCall(signal, gate, c.accountKey, this.config.limits.requestTimeoutMs, s => this.deps.translateVoice!(translation, s));
-        if (!validJapaneseVoice(voiceText, text)) throw new Error("voice_translation_invalid");
-      }
-      if (!this.permits(voiceText) || [...voiceText].length > 1000 || !voiceText.trim()) throw new Error("voice_text_limit");
-      delivery = Object.freeze({ ...delivery, voiceText, voiceLanguage: language.voiceLanguage });
-      this.store.prepared(delivery, mode); this.store.setTurn(binding.turnId, "synthesizing");
-      if (!this.store.spend("tts", this.plannedNow(signal, gate, c.accountKey))) throw new Error("tts_budget");
-      audio = await this.plannedCall(signal, gate, c.accountKey, this.config.limits.requestTimeoutMs, s => this.deps.synthesize(delivery, s));
-      if (!(audio instanceof Uint8Array) || !audio.byteLength || audio.byteLength > 10 * 1024 * 1024) throw new Error("voice_audio_invalid");
-    } catch {
-      this.plannedNow(signal, gate, c.accountKey); // Cancellation never becomes a text fallback.
-      if (mode === "voice") throw new Error("voice_preparation_failed");
-      return this.store.finishPlatformTurn(binding, "text_only", completionReason);
-    }
-    await this.platformSend(binding, delivery, "audio", signal, audio);
-    this.plannedNow(signal, gate, c.accountKey);
-    return this.store.finishPlatformTurn(binding, "delivered", completionReason);
-  }
   workerStatusForTest() {
     let control: RoomControlState | undefined;
     try { control = this.store.controlState(); } catch { /* Closed stores are reported by phase. */ }
     return Object.freeze({ consumer: this.consumer, phase: this.workerPhase, readyEpoch: this.readyEpoch,
-      activeWorkItemId: this.workerRun?.item.workItemId, lastError: this.lastError,
+      lastError: this.lastError,
       ...(control ? { mode: control.mode, paused: control.paused, executionRevision: control.executionRevision,
-        sessionExpiresAt: control.sessionExpiresAt } : {}),
-      lastGate: this.lastGate ? Object.freeze({ ...this.lastGate }) : undefined });
-  }
-  /** Synthetic fixture admission only, fenced by the successfully verified ready epoch. */
-  acceptWorkForTest(input: RoomInput, policy: RoomQueuePolicy) {
-    if (this.consumer !== "worker-test") throw new Error("room-worker-not-ready");
-    return this.admitWorkerInput(input, policy);
-  }
-  acceptWork(input: RoomInput, policy: RoomQueuePolicy) {
-    if (this.consumer !== "worker") throw new Error("room-worker-not-ready");
-    return this.admitWorkerInput(input, policy);
-  }
-  private admitWorkerInput(input: RoomInput, policy: RoomQueuePolicy) {
-    if (this.consumer === "legacy" || this.workerPhase !== "ready" || this.closed) throw new Error("room-worker-not-ready");
-    try {
-      this.store.expireSession(this.now());
-      const state = this.store.controlState();
-      const mentioned = Boolean(input.mentions?.some(id => this.config.characters.some(c => c.selfId === id)));
-      // Pause and mention_only still record the message, but create no execution order.
-      if (state.paused || !mentioned) {
-        return this.store.acceptInput(input, { mode: "record_only", source: "direct", now: this.now(),
-          expectedEpoch: this.readyEpoch! });
-      }
-      const result = this.store.acceptInput(input, { mode: "enqueue", source: "direct", now: this.now(),
-        expectedEpoch: this.readyEpoch!, policy });
-      if (result.kind === "enqueue") this.wakeWorker();
-      return result;
-    } catch (error) {
-      if (error instanceof Error && error.message === "room-work-input-invalid") {
-        return { kind: "reject", item: null, reason: "room-input-invalid" } as const;
-      }
-      this.faultWorker("room-worker-admission-failed");
-      throw error;
-    }
-  }
-  wakeWorkerForTest(): void { this.wakeWorker(); }
-  private wakeWorker(): void {
-    if (this.consumer === "legacy" || this.closed || this.workerPhase !== "ready") return;
-    this.wakeRequested = true;
-    if (this.pumpPromise) return;
-    this.pumpPromise = Promise.resolve().then(() => this.pumpQueue()).catch(() => {
-      this.faultWorker("room-worker-pump-failed");
-    }).finally(() => {
-      this.pumpPromise = undefined;
-      if (this.wakeRequested && this.workerPhase === "ready" && !this.closed) this.wakeWorker();
-    });
+        sessionExpiresAt: control.sessionExpiresAt } : {}) });
   }
   private faultWorker(code: string): void {
     if (this.workerPhase === "closed" || this.workerPhase === "faulted") return;
     this.startupFence = undefined;
     this.lastError = code;
-    if (this.workerPhase === "closing") return; // Preserve a close-time storage failure without reopening the lifecycle.
+    if (this.workerPhase === "closing") return;
     this.workerPhase = "faulted";
-    this.wakeRequested = false;
     this.lifecycleWakeRequested = false;
     this.lifecycleDeliveryWakeRequested = false;
     this.stopLifecycleLease();
-    if (this.workerRun) { this.workerRun.faultReason ??= code; this.workerRun.controller.abort(); }
-    if (this.consumer === "lifecycle") {
-      try { this.store.cancelLifecycleAll("lifecycle_fault", this.now()); }
-      catch { /* The control fence below remains fail-closed. */ }
-      this.abortLifecycleWork();
-    }
-    const fence = () => {
-      try { this.executionRevision = this.store.faultControl().executionRevision; }
-      catch { try { this.store.setPaused(true); } catch { /* Storage failure cannot grant further work. */ } }
-    };
-    if (this.production) this.store.deliveryWrite(fence); else fence();
-  }
-  private issueGate(item: RoomWorkItem): RoomGatePermit | undefined {
-    try {
-      const state = this.store.controlState();
-      if (this.closed || this.workerPhase !== "ready" || state.paused
-        || state.executionRevision !== this.executionRevision || state.epoch !== this.readyEpoch) return undefined;
-      this.gateCounter++;
-      return Object.freeze({ gateId: `gate-${this.gateCounter}`, roomId: this.config.roomId,
-        workItemId: item.workItemId, burstId: item.burstId!, eventKey: item.eventKey,
-        executionEpoch: item.executionEpoch, executionRevision: state.executionRevision,
-        policyRevision: 1, issuedAt: this.now(), slot: `work:${item.workItemId}` });
-    } catch { return undefined; }
-  }
-  private gateValid(gate: RoomGatePermit): boolean {
-    try {
-      const state = this.store.controlState();
-      return !this.closed && this.workerPhase === "ready" && gate.roomId === this.config.roomId
-        && gate.executionEpoch === this.readyEpoch && gate.executionRevision === state.executionRevision
-        && !state.paused;
-    } catch { return false; }
-  }
-  private async pumpQueue(): Promise<void> {
-    let nullAttempts = 0;
-    while (this.workerPhase === "ready" && !this.closed) {
-      this.wakeRequested = false;
-      if (this.production && this.physicalCalls.size) return;
-      for (const id of this.knownAcks) if (!this.observationSlots.has(id)) this.knownAcks.delete(id);
-      if (this.production && this.store.deliveryHold()) return;
-      this.store.expireSession(this.now());
-      const view = this.store.inspectQueue();
-      if (view.epoch !== this.readyEpoch || view.futureCount) throw new Error("room-worker-epoch-invalid");
-      if (this.workerRun) return; // A wake during execute only coalesces; no second claim.
-      if (view.claimedCount || view.runningBurstCount) throw new Error("room-worker-orphan");
-      if (view.paused) return;
-      const item = this.store.claimNext({ expectedEpoch: this.readyEpoch!, now: this.now(), burstId: randomUUID() });
-      if (!item) {
-        const after = this.store.inspectQueue();
-        if (after.epoch !== this.readyEpoch || after.futureCount || after.claimedCount || after.runningBurstCount) throw new Error("room-worker-orphan");
-        if (after.paused) return;
-        if (!after.queuedCount) return;
-        if (++nullAttempts >= 2) throw new Error("room-worker-queue-inconsistent");
-        continue;
-      }
-      nullAttempts = 0;
-      const after = this.store.inspectQueue();
-      if (item.status !== "claimed" || item.executionEpoch !== this.readyEpoch || !item.burstId || !item.payload
-        || after.epoch !== this.readyEpoch || after.claimedCount !== 1 || after.runningBurstCount !== 1
-        || after.claimedWorkItemId !== item.workItemId || after.burstId !== item.burstId || after.futureCount) {
-        throw new Error("room-worker-claim-invalid");
-      }
-      if (this.closed || this.workerPhase !== "ready") {
-        if (!this.store.settleWorkItem(item.workItemId, { expectedEpoch: this.readyEpoch!, burstId: item.burstId,
-          status: "cancelled", reason: "worker_closed", now: this.now() })) throw new Error("room-worker-settlement-failed");
-        return;
-      }
-      const gate = this.issueGate(item);
-      if (!gate) {
-        if (!this.store.settleWorkItem(item.workItemId, { expectedEpoch: this.readyEpoch!, burstId: item.burstId,
-          status: "cancelled", reason: "control_revision_changed", now: this.now() })) throw new Error("room-worker-settlement-failed");
-        this.lastGate = { gateId: "unissued", revision: this.executionRevision, cancelled: true, returned: false };
-        continue;
-      }
-      const run: { item: RoomWorkItem; controller: AbortController; gate: RoomGatePermit; cancelReason?: string; faultReason?: string } = { item, controller: new AbortController(), gate };
-      this.workerRun = run;
-      // Abort revokes execution, but only a real control cancellation selects cancelled.
-      // Preserve that cancellation if a receipt/storage fault races with Stop/Pause/close.
-      const interruption = (): { status: "cancelled" | "failed"; reason: string } => run.cancelReason
-        ? { status: "cancelled", reason: run.cancelReason } : this.closed
-          ? { status: "cancelled", reason: "worker_closed" } : run.faultReason
-            ? { status: "failed", reason: run.faultReason } : { status: "cancelled", reason: "control_revision_changed" };
-      let onAbort!: () => void;
-      const aborted = new Promise<never>((_, reject) => {
-        onAbort = () => reject(new Error("room-worker-execution-aborted"));
-        run.controller.signal.addEventListener("abort", onAbort, { once: true });
-      });
-      // Observe abort before evaluating a port that may throw synchronously. Its original
-      // rejection still participates in the race; execution errors still fault and settle.
-      void aborted.catch(() => {});
-      const timer = setTimeout(() => run.controller.abort(), this.production
-        ? 2 * (3 * this.config.limits.requestTimeoutMs + 2 * this.production.apiTimeoutMs + 1000)
-        : this.config.limits.requestTimeoutMs);
-      let status: "completed" | "failed" | "cancelled" = "failed", reason = "synthetic_execution_failed";
-      try {
-        // Only the selected Worker port; never enters Legacy run or falls back after failure.
-        const result = await Promise.race([this.workerPort!.execute(item, run.controller.signal, gate), aborted]);
-        if (!this.gateValid(gate) || this.closed || this.workerPhase !== "ready") {
-          ({ status, reason } = interruption());
-        }
-        else if (!result || !["completed", "failed"].includes(result.status)
-          || typeof result.reason !== "string" || !/^[a-z][a-z0-9_-]{0,79}$/.test(result.reason)) throw new Error("room-worker-result-invalid");
-        else { status = result.status; reason = result.reason; }
-      } catch {
-        if (run.cancelReason || this.closed || run.faultReason) ({ status, reason } = interruption());
-        else this.faultWorker("room-worker-execution-failed");
-      } finally {
-        clearTimeout(timer);
-        run.controller.signal.removeEventListener("abort", onAbort);
-      }
-      // Keep active ownership until both WorkItem and Burst have atomically settled.
-      if (this.production && status === "failed" && run.faultReason === reason
-        && ["delivery_unknown", "sent_unrecorded", "storage_fault"].includes(reason)) {
-        const index = this.store.workerObligations(item.burstId).findIndex(o => o.status === "pending" && o.turnId !== null);
-        if (index >= 0) this.store.failWorkerObligation(item.workItemId, index, reason);
-      }
-      if (this.production && status === "failed") this.lastError = reason;
-      if (!this.store.settleWorkItem(item.workItemId, { expectedEpoch: this.readyEpoch!, burstId: item.burstId,
-        status, reason, now: this.now() })) throw new Error("room-worker-settlement-failed");
-      this.lastGate = { gateId: gate.gateId, revision: gate.executionRevision,
-        cancelled: status !== "completed", returned: status === "completed" };
-      this.workerRun = undefined;
-    }
+    this.stopLifecycleRetention();
+    try { this.store.cancelLifecycleAll("lifecycle_fault", this.now()); }
+    catch { /* The control fence below remains fail-closed. */ }
+    this.abortLifecycleWork();
+    try { this.executionRevision = this.store.faultControl().executionRevision; }
+    catch { try { this.store.setPaused(true); } catch { /* Storage failure cannot grant further work. */ } }
   }
   async whenIdle(): Promise<void> {
-    if (this.consumer === "legacy") { await this.tail; return; }
     await this.startupPromise?.catch(() => {});
     // Generation completion can wake a delivery pump after the previous pump
     // has already drained. Keep observing all stages until none can create work.
     for (;;) {
       const work = [
-        this.pumpPromise,
         this.lifecyclePumpPromise,
         this.lifecycleDeliveryPumpPromise,
         this.lifecycleDelivery?.promise,
@@ -2420,22 +1474,16 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
   }
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
-    if (this.production) return this.closeProduction();
     if (this.lifecycleWorker) return this.closeLifecycleProduction();
     this.closed = true;
     this.startupFence = undefined;
-    if (this.consumer !== "legacy") {
-      this.workerPhase = "closing";
-      this.wakeRequested = false;
-      this.workerRun?.controller.abort();
-      this.closePromise = (async () => {
-        try { await this.startupPromise?.catch(() => {}); await this.pumpPromise; }
-        finally { this.store.close(); this.workerPhase = "closed"; }
-      })();
-    } else {
-      this.stop();
-      this.closePromise = this.tail.then(() => { this.store.close(); });
-    }
+    this.workerPhase = "closing";
+    this.stopLifecycleLease();
+    this.stopLifecycleRetention();
+    this.closePromise = (async () => {
+      try { await this.startupPromise?.catch(() => {}); }
+      finally { this.store.close(); this.workerPhase = "closed"; }
+    })();
     return this.closePromise;
   }
   private closeLifecycleProduction(): Promise<void> {
@@ -2443,10 +1491,10 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
     this.closed = true;
     this.startupFence = undefined;
     this.workerPhase = "closing";
-    this.wakeRequested = false;
     this.lifecycleWakeRequested = false;
     this.lifecycleDeliveryWakeRequested = false;
     this.stopLifecycleLease();
+    this.stopLifecycleRetention();
     const observeUntil = Date.now() + worker.apiTimeoutMs;
     this.receiptDrainDeadline = observeUntil + this.closePolicy.drainMs;
     try { worker.beginClose(observeUntil); } catch { this.lastError = "storage_fault"; }
@@ -2473,44 +1521,7 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
         await worker.sealObservations();
       } finally {
         try { await worker.sealObservations(); }
-        finally { this.lifecycleAudioObservations.clear(); this.receiptWritesOpen = false; this.store.close(); this.workerPhase = "closed"; }
-      }
-    })();
-  }
-  private closeProduction(): Promise<void> {
-    this.closed = true; this.startupFence = undefined; this.workerPhase = "closing"; this.wakeRequested = false;
-    const observeUntil = Date.now() + this.production!.apiTimeoutMs;
-    this.receiptDrainDeadline = observeUntil + this.closePolicy.drainMs;
-    try { this.production!.beginClose(observeUntil); } catch { this.lastError = "storage_fault"; }
-    try { this.store.beginDeliveryClose(); } catch { this.lastError = "storage_fault"; }
-    this.abortWorkerRun("worker_closed");
-    return this.closePromise = (async () => {
-      try {
-        await this.startupPromise?.catch(() => {});
-        await this.pumpPromise?.catch(() => { this.lastError = "storage_fault"; });
-        let unresolved = true;
-        try { unresolved = this.store.hasUnresolvedDelivery(); } catch { this.lastError = "storage_fault"; }
-        if (unresolved && Date.now() < observeUntil) await new Promise<void>(resolve => setTimeout(resolve, observeUntil - Date.now()));
-        const accepted = this.production!.sealObservations();
-        if (accepted) {
-          this.receiptJobs.add(accepted);
-          void accepted.then(() => this.receiptJobs.delete(accepted), () => {
-            this.receiptJobs.delete(accepted); this.lastError = "storage_fault";
-          });
-        }
-        while (this.receiptJobs.size && Date.now() < this.receiptDrainDeadline) {
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          try { await Promise.race([Promise.allSettled([...this.receiptJobs]),
-            new Promise<void>(resolve => { timer = setTimeout(resolve, Math.max(0, this.receiptDrainDeadline - Date.now())); })]); }
-          finally { clearTimeout(timer); }
-        }
-        if (this.lastError !== "sent_unrecorded" && this.lastError !== "storage_fault") {
-          try { await this.receiptWrite(() => this.store.recoverDeliveryFacts()); }
-          catch { this.lastError = "storage_fault"; }
-        }
-      } finally {
-        try { this.production!.sealObservations(); }
-        finally { this.receiptWritesOpen = false; this.store.close(); this.workerPhase = "closed"; }
+        finally { this.lifecycleAudioObservations.clear(); this.store.close(); this.workerPhase = "closed"; }
       }
     })();
   }

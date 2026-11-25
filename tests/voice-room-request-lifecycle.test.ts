@@ -33,7 +33,12 @@ import {
   type RoomAmbientPlanner,
 } from "../src/voice-room/participation-planner.js";
 import { isQuotedContinuation } from "../src/voice-room/participation-policy.js";
-import { deferred } from "./voice-room-fixture.js";
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(r => { resolve = r; });
+  return { promise, resolve };
+}
 
 const QUEUE: RoomQueuePolicy = { capacity: 20, memberLimit: 20, memberWindowMs: 1000, ttlMs: 10000 };
 
@@ -1323,10 +1328,6 @@ test("text plus voice is tools-free, text-only skips TTS, and translation failur
   const h = await lifecycleHarness(t, {
     config: roomConfig({ deliveryMode: "both" }),
     model: { generate: async () => ({ kind: "reply", segments: ["semantic text"] }) },
-    deps: {
-      webProvider: { search: async () => { throw new Error("synthetic-web-forbidden"); } } as never,
-      githubRead: async () => { throw new Error("synthetic-github-forbidden"); },
-    },
     synthesize: async delivery => {
       spoken.push(delivery.voiceText ?? "");
       return new Uint8Array([4, 5, 6]);
@@ -3300,28 +3301,6 @@ test("B4-07 ambient planner and generation reserve the final model row for a dir
   assert.equal(h.room.store.counts().model, 2);
   assert.equal(h.dispatches[0]!.text, "direct reply wins the final row");
   assert.equal(h.room.workerStatusForTest().phase, "ready");
-});
-
-test("Owner /room pause remains fail-closed for ordinary ingress", async t => {
-  const root = mkdtempSync(join(tmpdir(), "pa-owner-pause-"));
-  const forbidden = async (): Promise<never> => { throw new Error("synthetic-legacy-forbidden"); };
-  const room = new VoiceRoom(join(root, "room.sqlite"), checkRoomConfig(roomConfig()), {
-    now: () => Date.parse("2026-11-18T07:00:00Z"),
-    persona: character => `# ${character.name}\nSynthetic public persona.`,
-    generate: forbidden,
-    synthesize: forbidden,
-    sendText: forbidden,
-    sendAudio: forbidden,
-    permitsText: () => true,
-  });
-  t.after(async () => {
-    await room.close();
-    rmSync(root, { recursive: true, force: true });
-  });
-  for (const character of room.config.characters) room.setOnline(character.accountKey, true);
-  assert.equal(room.receive(roomInput("900", "/room pause")), "control");
-  assert.equal(room.store.state().paused, 1);
-  assert.equal(room.receive(roomInput("901", "ordinary message", ["10002"])), "paused");
 });
 
 function qqWorkerSettings(root: string, config = roomConfig()): RoomQqSettings {

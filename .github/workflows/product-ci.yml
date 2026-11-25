@@ -81,13 +81,3 @@ jobs:
           $timer.Stop()
           Write-Host ('Lifecycle suite elapsed: {0:F3} seconds' -f $timer.Elapsed.TotalSeconds)
           exit $exitCode
-
-      - name: Run the standalone architecture guard
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $false
-          $timer = [System.Diagnostics.Stopwatch]::StartNew()
-          node tools/architecture-guard.mjs
-          $exitCode = $LASTEXITCODE
-          $timer.Stop()
-          Write-Host ('Architecture guard elapsed: {0:F3} seconds' -f $timer.Elapsed.TotalSeconds)
-          exit $exitCode

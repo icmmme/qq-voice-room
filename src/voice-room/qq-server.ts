@@ -103,37 +103,15 @@ export async function startRoomQq(settings: RoomQqSettings,
   const ackAt = new Map<string, number>();
   let closing = false, closePromise: Promise<void> | undefined;
   let workerStarted = false;
-  const generate: RoomDependencies["generate"] = deps.generate
-    ?? (async () => { throw new Error("room-lifecycle-legacy-generator-unavailable"); });
   const room = new VoiceRoom(join(settings.dataDir, "room.sqlite"), config, {
-    persona: deps.persona, generate, ...(deps.translateVoice ? { translateVoice: deps.translateVoice } : {}),
+    persona: deps.persona, ...(deps.translateVoice ? { translateVoice: deps.translateVoice } : {}),
     permitsText: deps.permitsText, ...(deps.permitsPrompt ? { permitsPrompt: deps.permitsPrompt } : {}),
     ...(deps.now ? { now: deps.now } : {}), ...(deps.onContextCompacted ? { onContextCompacted: deps.onContextCompacted } : {}),
     voiceAvailable: Boolean(voice), onParticipation: decision => notice("participation", decision.reason),
     onVoicePreparation: decision => notice("voice-preparation", decision.code, decision.elapsedMs),
     onAmbientParticipation: ({ code, anchorRowId }) => onNotice({ type: "participation", code, anchorRowId }),
     synthesize: voice?.synthesize ?? (async () => { throw new Error("room-voice-unavailable"); }),
-    sendAudio: async (delivery, bytes, signal) => {
-      if (!voice || signal.aborted || closing) throw new RoomSendError("rejected");
-      const peer = peers.get(delivery.accountKey);
-      if (!peer?.open) throw new RoomSendError("rejected");
-      let record;
-      try { record = roomRecord(bytes); } catch { throw new RoomSendError("rejected"); }
-      try { return await peer.request("send_group_msg", { group_id: Number(config.groupId), message: [record] }); }
-      catch (error) { throw new RoomSendError(error instanceof QqApiError && error.code === "api-rejected" ? "rejected" : "uncertain"); }
-    },
-    sendText: async (delivery, signal) => {
-      if (signal.aborted || closing) throw new RoomSendError("rejected");
-      const peer = peers.get(delivery.accountKey);
-      if (!peer?.open) throw new RoomSendError("rejected");
-      try {
-        return await peer.request("send_group_msg", { group_id: Number(config.groupId),
-          message: [{ type: "text", data: { text: delivery.text } }], auto_escape: true });
-      } catch (error) {
-        throw new RoomSendError(error instanceof QqApiError && error.code === "api-rejected" ? "rejected" : "uncertain");
-      }
-    },
-  }, { execution: workerSelected ? "lifecycle" : "legacy" });
+  }, { execution: "lifecycle" });
   let workerModes: Pick<RoomQqWorkerStatus, "configuredDeliveryMode" | "effectiveDeliveryMode"> | undefined;
   if (startupModes) {
     try {
@@ -193,9 +171,9 @@ export async function startRoomQq(settings: RoomQqSettings,
         if (!input) return;
         if (!room.ready) { notice("rejected", "room-not-ready"); return; }
         try {
-          const receipt = workerSelected ? room.receiveLifecycle(input, workerQueue!) : room.receive(input);
+          const receipt = room.receiveLifecycle(input, workerQueue!);
           notice("received", receipt);
-          if (workerSelected && receipt === "control") {
+          if (receipt === "control") {
             const trimmed = input.text.trim();
             const lifecycle = room.store.lifecycleControlState();
             let text: string;
@@ -212,19 +190,10 @@ export async function startRoomQq(settings: RoomQqSettings,
               text = `房间模式已切换为 ${lifecycle.mode === "ambient" ? "ambient" : "mention_only"}。`;
             }
             void acknowledge(account.accountKey, text);
-          } else if (!workerSelected && (receipt === "control" || (receipt === "scheduled" && input.text.startsWith("/room start")))) {
-            const status = room.status();
-            const delivery = { text: "仅文字", both: "文字＋语音", voice: "仅语音", auto: "自动投递" }[status.deliveryMode];
-            const text = input.text === "/room status"
-              ? `房间：${status.paused ? "暂停" : "观察中"}；${status.busy ? "正在回复" : "空闲"}；${voice ? delivery : "仅文字"}；角色：${status.characters.join("、")}；自动参与：${status.automaticStopped || !config.participation.enabled ? "已停" : "开启"}；本次启动判定 ${status.participation.evaluated}，触发 ${status.participation.scheduled}`
-              : input.text === "/room stop" ? "本轮已停止，自动参与已关闭；/room resume 恢复。" : "房间控制已生效。";
-            void acknowledge(account.accountKey, text);
-          } else if (!voice && receipt === "rejected" && input.senderId === config.ownerId && /^\/room (?:voice|voice-only|both|auto)$/.test(input.text)
-            && account.accountKey === config.ingressAccountKey) void acknowledge(account.accountKey, "当前为文字接入阶段，语音尚未启用。");
+          }
         } catch {
           try {
-            if (workerSelected) room.store.cancelLifecycleAll("ingress_failed", Date.now());
-            else { room.stop(); room.store.setPaused(true); }
+            room.store.cancelLifecycleAll("ingress_failed", Date.now());
           } catch { /* Do not continue on unavailable storage. */ }
           notice("error", "room-input-failed");
         }
@@ -272,8 +241,7 @@ export async function startRoomQq(settings: RoomQqSettings,
   } catch (error) { sockets.close(); await room.close(); throw error; }
   publishWorkerStatus();
   const poll = setInterval(() => {
-    if (workerSelected) { publishWorkerStatus(); return; }
-    try { room.tick(); } catch { notice("error", "room-tick-failed"); try { room.stop(); room.store.setPaused(true); } catch {} }
+    publishWorkerStatus();
   }, 500);
   const heartbeat = setInterval(() => {
     for (const peer of peers.values()) { if (!peer.alive) peer.close(); else { peer.alive = false; try { peer.socket.ping(); } catch { peer.close(); } } }

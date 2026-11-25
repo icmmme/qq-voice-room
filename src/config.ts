@@ -1,7 +1,3 @@
-import { resolve } from "node:path";
-import { readPersonaSettings } from "./file-persona.js";
-import { resolveTimezone } from "./relationship/timezone.js";
-import { readDialogueStyleConfig, type DialogueStyleConfig } from "./dialogue-style/config.js";
 import { calculateContextBudget, HIGH_CONTEXT_WINDOW_THRESHOLD,
   type PaContextWindowSource } from "./prompting/context-budget.js";
 
@@ -10,38 +6,14 @@ export interface ModelConfig {
   modelId: string;
   apiKey: string;
   contextWindow: number;
-  /** Present on readConfig results; direct library configs may omit it. */
   contextWindowSource?: PaContextWindowSource;
-  /** The operator explicitly verified the configured provider route window. */
   contextWindowVerified?: boolean;
   maxTokens: number;
   requestTimeoutMs: number;
-  /** Present on readConfig results for sanitized startup diagnostics. */
   requestTimeoutSource?: "env" | "default";
   tavilyApiKey?: string;
   webTimeoutMs?: number;
   webTimeoutSource?: "env" | "default";
-}
-
-export interface PaConfig extends ModelConfig {
-  style?: DialogueStyleConfig;
-  dataDir: string;
-  /** Both are set together; relative paths were resolved against the launch cwd. */
-  personaFile: string;
-  personaId: string;
-  personaGroupFile?: string;
-  autoMemory?: boolean;
-  timezone?: string;
-  /**
-   * Automatic event retrieval/extraction. Explicit note and event tools remain
-   * available either way. A direct library config must set this to true; only
-   * readConfig enables it by default.
-   */
-  eventMemory?: boolean;
-}
-
-export function dataDirectory(env: NodeJS.ProcessEnv = process.env): string {
-  return resolve(env.PA_DATA_DIR || "data");
 }
 
 function positiveInteger(value: string | undefined, fallback: number, name: string): number {
@@ -101,24 +73,4 @@ export function readModelConfig(env: NodeJS.ProcessEnv = process.env): ModelConf
     ...(webTimeoutInput ? { webTimeoutMs: positiveInteger(webTimeoutInput, 10000, "PA_WEB_TIMEOUT_MS") } : {}),
     webTimeoutSource: webTimeoutInput ? "env" : "default",
   };
-}
-
-export function readConfig(env: NodeJS.ProcessEnv = process.env): PaConfig {
-  const style = readDialogueStyleConfig(env);
-  // File personas are mandatory. There is no character-card or default-assistant fallback.
-  const persona = readPersonaSettings(env);
-  return {
-    ...readModelConfig(env),
-    style,
-    dataDir: dataDirectory(env), personaFile: persona.file, personaId: persona.id,
-    personaGroupFile: persona.groupFile,
-    autoMemory: booleanSetting(env.PA_AUTO_MEMORY, true, "PA_AUTO_MEMORY"),
-    timezone: resolveTimezone(env.PA_TIMEZONE),
-    eventMemory: booleanSetting(env.PA_EVENT_MEMORY, true, "PA_EVENT_MEMORY"),
-  };
-}
-
-export function safeError(error: unknown, apiKey?: string): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return apiKey ? message.split(apiKey).join("[API KEY]") : message;
 }

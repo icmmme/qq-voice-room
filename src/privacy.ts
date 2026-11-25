@@ -1,5 +1,3 @@
-import type { Memory } from "./storage.js";
-
 const MASK = "[已隐藏]";
 const MASK_INTERNAL = "[已隐藏内部信息]";
 const MIN_PROTECTED_LENGTH = 4;
@@ -167,7 +165,7 @@ export class PrivacyGuard {
     if (value.length >= 2 && value.length <= 64) this.privateExactValues.add(value);
   }
 
-  addPrivateMemory(item: Pick<Memory, "content" | "key">): void {
+  addPrivateMemory(item: { content: string; key?: string }): void {
     this.addPrivateText(item.content);
     if (item.key && item.key.length >= 8 && !/^note:[0-9a-f-]{36}$/i.test(item.key)) this.addPrivateText(item.key);
   }
@@ -374,22 +372,6 @@ export class PrivacyGuard {
     }
     return value;
   }
-}
-
-/** Stable, model-facing projection: no subject/speaker/group IDs, source or evidence fields. */
-export function projectMemoryForModel(item: Memory): Record<string, unknown> {
-  return {
-    id: item.id,
-    layer: item.layer,
-    kind: item.kind,
-    key: item.key || undefined,
-    content: item.content,
-    status: item.status,
-    confidence: item.confidence,
-    createdAt: item.createdAt,
-    updatedAt: item.updatedAt,
-    lastSeenAt: item.lastSeenAt,
-  };
 }
 
 function escapeRegExp(value: string): string {
