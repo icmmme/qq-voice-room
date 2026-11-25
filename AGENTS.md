@@ -1,21 +1,18 @@
 # qq-voice-room — Agent Instructions
 
-This repository is the successor voice-room product repository. M1 is an
-engineering-foundation phase only: it creates build, harness, feature-map,
-architecture-guard, synthetic-contract and evidence capabilities. It does not
-create product runtime behavior.
+This is the successor Voice Room product repository. M1 was the engineering
+foundation phase. Its acceptance does not cover product runtime or product CI.
 
 ## Sources of truth
 
-1. The active task contract is `.harness/CURRENT_TASK.md`. There is exactly one.
+1. [Current task](.harness/CURRENT_TASK.md) registers exactly one active task
+   and links to its governing contract.
 2. The canonical project state is the single `Canonical Current State` section
    in `.harness/PROJECT_STATE.md`.
 3. The working rules are `.harness/WORKFLOW.md`.
 4. The feature authority is `docs/architecture/feature-map.json`.
-5. The direct-Node verifier `node tools/verify-foundation.mjs --clean` is the
-   sole foundation authority, as approved by Contract Addendum 01.
-   `npm.cmd run verify:foundation` is a non-authoritative compatibility check
-   and cannot be QA or Review evidence.
+5. The active contract selects the verification commands. M1 foundation
+   acceptance is separate from product checks.
 
 Do not infer an active task from chat, memory, branch names or old reports.
 
@@ -49,8 +46,10 @@ Review or as a PASS for acceptance.
   code and raw-log SHA256.
 - A changed input, toolchain, command or candidate marks evidence stale.
 - An old PASS never transfers to a new candidate.
-- Until independent QA and Review bind to the same frozen candidate, the task
-  status is `REVIEW_PENDING`.
+- A frozen candidate remains `REVIEW_PENDING` while required verification,
+  independent QA or Review, or the Owner's acceptance is incomplete. Record what
+  passed and what remains unverified. Use `REVIEW_FAILED` for blocking review
+  findings.
 
 ## Enforcement map
 
@@ -86,10 +85,17 @@ Review or as a PASS for acceptance.
 - No `npm test`, legacy lifecycle test, `room:doctor`, `room:qq` or `demo`
   invocation as foundation evidence.
 
-## Commands
+## Verification commands
 
-Use PowerShell and `npm.cmd` (the `npm.ps1` shim may be blocked by execution
-policy). The approved install/check sequence is:
+On Windows, use PowerShell and `npm.cmd`. Follow the active contract. The
+[product PR gate](.harness/CI_PRODUCT_PR_GATE.md#workflow) defines its own
+sequence. Do not add a separate typecheck, Foundation verification, or
+`npm test` to that sequence.
+
+### M1 foundation only
+
+Contract Addendum 01 approves the following sequence for the bound M1 foundation
+candidate. The direct-Node verifier is the sole foundation acceptance authority:
 
 ```powershell
 npm.cmd ci --ignore-scripts --no-audit --no-fund
