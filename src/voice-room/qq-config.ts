@@ -97,6 +97,7 @@ export function readRoomModelConfig(env: NodeJS.ProcessEnv = process.env): Model
   return readModelConfig(Object.fromEntries([
     "PA_BASE_URL", "PA_MODEL", "PA_API_KEY", "PA_CONTEXT_WINDOW", "PA_MAX_TOKENS",
     "PA_CONTEXT_WINDOW_VERIFIED", "PA_REQUEST_TIMEOUT_MS", "PA_THINKING",
+    "PA_VISION_MODEL", "PA_VISION_BASE_URL", "PA_VISION_API_KEY", "PA_MODEL_SUPPORTS_VISION",
     "TAVILY_API_KEY", "BOCHA_API_KEY", "EXA_API_KEY", "JINA_API_KEY", "GITHUB_TOKEN", "PA_WEB_TIMEOUT_MS",
   ].map(key => [key, env[key]])));
 }

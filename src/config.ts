@@ -14,6 +14,10 @@ export interface ModelConfig {
   requestTimeoutMs: number;
   requestTimeoutSource?: "env" | "default";
   thinkingMode?: ModelThinkingMode;
+  visionModelId?: string;
+  visionBaseUrl?: string;
+  visionApiKey?: string;
+  modelSupportsVision?: boolean;
   tavilyApiKey?: string;
   bochaApiKey?: string;
   exaApiKey?: string;
@@ -37,6 +41,19 @@ function booleanSetting(value: string | undefined, fallback: boolean, name: stri
   throw new Error(`${name} 只能填写 true 或 false。`);
 }
 
+function validateApiBaseUrl(rawUrl: string, name: string, keyName: string): string {
+  const url = new URL(rawUrl);
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (url.username || url.password || url.search || url.hash ||
+      (url.protocol !== "https:" && !(url.protocol === "http:" && local))) {
+    throw new Error(`${name} 请使用 HTTPS 地址；本机调试可用 HTTP。凭据请放在 ${keyName} 中。`);
+  }
+  if (/\/(chat\/completions|responses)\/?$/.test(url.pathname)) {
+    throw new Error(`${name} 应填写 API 基址（例如 /v1），不要带 /chat/completions 或 /responses。`);
+  }
+  return rawUrl.replace(/\/$/, "");
+}
+
 export function readModelConfig(env: NodeJS.ProcessEnv = process.env): ModelConfig {
   const baseUrl = env.PA_BASE_URL?.trim();
   const modelId = env.PA_MODEL?.trim();
@@ -45,15 +62,7 @@ export function readModelConfig(env: NodeJS.ProcessEnv = process.env): ModelConf
       modelId === "your-model-id" || apiKey === "replace-with-your-api-key") {
     throw new Error("请先复制 .env.example 为 .env，填写 PA_BASE_URL、PA_MODEL 和 PA_API_KEY。密钥只填在本地文件中。");
   }
-  const url = new URL(baseUrl);
-  const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-  if (url.username || url.password || url.search || url.hash ||
-      (url.protocol !== "https:" && !(url.protocol === "http:" && local))) {
-    throw new Error("PA_BASE_URL 请使用 HTTPS 地址；本机调试可用 HTTP。凭据请放在 PA_API_KEY 中。");
-  }
-  if (/\/(chat\/completions|responses)\/?$/.test(url.pathname)) {
-    throw new Error("PA_BASE_URL 应填写 API 基址（例如 /v1），不要带 /chat/completions 或 /responses。");
-  }
+  const normalizedBaseUrl = validateApiBaseUrl(baseUrl, "PA_BASE_URL", "PA_API_KEY");
   const contextWindowInput = env.PA_CONTEXT_WINDOW?.trim();
   const contextWindow = positiveInteger(contextWindowInput, 32768, "PA_CONTEXT_WINDOW");
   const contextWindowSource: PaContextWindowSource = contextWindowInput ? "env" : "default";
@@ -82,6 +91,16 @@ export function readModelConfig(env: NodeJS.ProcessEnv = process.env): ModelConf
       throw new Error("PA_THINKING 仅支持 auto、enabled 或 disabled。");
     }
   }
+  const visionModelId = env.PA_VISION_MODEL?.trim() || undefined;
+  const visionBaseUrlRaw = env.PA_VISION_BASE_URL?.trim();
+  if (visionBaseUrlRaw && visionBaseUrlRaw.includes("example.com")) {
+    throw new Error("PA_VISION_BASE_URL 仍是示例占位值；暂不使用时请留空。");
+  }
+  const visionBaseUrl = visionBaseUrlRaw
+    ? validateApiBaseUrl(visionBaseUrlRaw, "PA_VISION_BASE_URL", "PA_VISION_API_KEY")
+    : undefined;
+  const visionApiKey = optionalSecret(env.PA_VISION_API_KEY, "PA_VISION_API_KEY");
+  const modelSupportsVision = booleanSetting(env.PA_MODEL_SUPPORTS_VISION, false, "PA_MODEL_SUPPORTS_VISION");
   const tavilyApiKey = optionalSecret(env.TAVILY_API_KEY, "TAVILY_API_KEY");
   const bochaApiKey = optionalSecret(env.BOCHA_API_KEY, "BOCHA_API_KEY");
   const exaApiKey = optionalSecret(env.EXA_API_KEY, "EXA_API_KEY");
@@ -90,11 +109,15 @@ export function readModelConfig(env: NodeJS.ProcessEnv = process.env): ModelConf
   const webTimeoutInput = env.PA_WEB_TIMEOUT_MS?.trim();
   const requestTimeoutInput = env.PA_REQUEST_TIMEOUT_MS?.trim();
   return {
-    baseUrl: baseUrl.replace(/\/$/, ""), modelId, apiKey,
+    baseUrl: normalizedBaseUrl, modelId, apiKey,
     contextWindow, contextWindowSource, contextWindowVerified, maxTokens,
     requestTimeoutMs: positiveInteger(requestTimeoutInput, 60000, "PA_REQUEST_TIMEOUT_MS"),
     requestTimeoutSource: requestTimeoutInput ? "env" : "default",
     thinkingMode,
+    ...(visionModelId ? { visionModelId } : {}),
+    ...(visionBaseUrl ? { visionBaseUrl } : {}),
+    ...(visionApiKey ? { visionApiKey } : {}),
+    modelSupportsVision,
     tavilyApiKey,
     bochaApiKey,
     exaApiKey,

@@ -1,3 +1,4 @@
+import type { ImageContent } from "@earendil-works/pi-ai";
 import { checkRoomConfig, checkClosePolicy, ROOM_CLOSE_POLICY, ROOM_HISTORY_PAGE_LIMIT,
   roomInputId, type CheckedRoomConfig, type RoomClosePolicy } from "./config.js";
 import { buildRoomPromptFromPages, type WebEvidenceItem } from "./context.js";
@@ -17,6 +18,7 @@ import { ROOM_LIFECYCLE_DEEP_MAX_SEGMENTS, ROOM_LIFECYCLE_DEEP_MAX_TOKENS, ROOM_
   type RoomLifecycleGenerateOptions } from "./model.js";
 import { dynamicPageTokenBudget, extractPublicUrls, isDeepRequest, WEB_HARD_CHAR_CEILING,
   type RoomWebToolkit } from "./web.js";
+import { fetchRoomImages, type RoomImageFetcher } from "./image.js";
 import { loadRoomSkill, selectRoomSkill } from "./skills.js";
 import {
   AMBIENT_HISTORY_LIMIT,
@@ -36,6 +38,7 @@ export const WORKER_EXPLICIT_NO_ANSWER_FALLBACK = Object.freeze({
   reason: "explicit_no_answer_fallback",
 } as const);
 export interface RoomLifecycleModelPort {
+  readonly visionCapable?: boolean;
   generate: (prompt: RoomPrompt, signal: AbortSignal, maxChars: number,
     options?: RoomLifecycleGenerateOptions) => Promise<RoomLifecycleAnswer>;
 }
@@ -55,6 +58,7 @@ export interface RoomLifecycleDispatch {
 export interface RoomLifecycleWorker {
   model: RoomLifecycleModelPort;
   web?: RoomWebToolkit;
+  imageFetcher?: RoomImageFetcher;
   ambientPlanner?: RoomAmbientPlanner;
   apiTimeoutMs: number;
   closePolicy?: Partial<RoomClosePolicy>;
@@ -86,6 +90,11 @@ class RoomLifecycleStorageError extends Error {
 class RoomLifecycleVoiceError extends Error {}
 
 interface LifecycleTranslationPrompt { readonly requestId: string; readonly prompt: RoomPrompt }
+type LifecycleImageNotice =
+  | { readonly kind: "loaded"; readonly count: number }
+  | { readonly kind: "partial"; readonly loaded: number; readonly failed: number }
+  | { readonly kind: "fetch_failed"; readonly count: number }
+  | { readonly kind: "vision_unconfigured"; readonly count: number };
 
 /** One Room lifecycle runtime; adapters supply model, voice and transport operations. */
 export class VoiceRoom {
@@ -122,6 +131,8 @@ export class VoiceRoom {
   private readonly lifecycleTranslationPrompts = new Map<string, LifecycleTranslationPrompt>();
   /** Structured paragraph nodes for long/deep turns delivered via QQ forward card. */
   private readonly lifecycleForwardNodes = new Map<string, readonly string[]>();
+  /** Validated public image URLs per active request; strictly memory-only and never persisted to SQLite. */
+  private readonly lifecycleInputImages = new Map<string, readonly string[]>();
   private readonly lifecycleGenerationTasks = new Set<Promise<void>>();
   private readonly ambientTimers = new Set<ReturnType<typeof setTimeout>>();
   private ambientPlan?: { readonly controller: AbortController; readonly promise: Promise<void> };
@@ -348,6 +359,9 @@ export class VoiceRoom {
         enqueue: selectedCharacterIds.length > 0, deliveryMode, policy,
       });
       if (admitted.kind === "enqueue") {
+        if (admitted.request && input.images?.length) {
+          this.lifecycleInputImages.set(admitted.request.requestId, Object.freeze([...input.images]));
+        }
         this.wakeLifecycleGenerations();
         return "scheduled";
       }
@@ -535,6 +549,7 @@ export class VoiceRoom {
   private abortLifecycleWork(): void {
     this.lifecycleTranslationPrompts.clear();
     this.lifecycleForwardNodes.clear();
+    this.lifecycleInputImages.clear();
     for (const generation of this.lifecycleGenerations.values()) generation.controller.abort();
     this.lifecycleDelivery?.controller.abort();
     this.clearAmbientTimers();
@@ -769,6 +784,7 @@ export class VoiceRoom {
       deep?: boolean;
       webEvidence?: readonly WebEvidenceItem[];
       quotedMessage?: RoomMessage;
+      imageNotice?: LifecycleImageNotice;
     } = {}): RoomPrompt {
     const target = this.store.historyMessage(request.messageRowId);
     if (!target) throw new Error("room-lifecycle-target-missing");
@@ -796,6 +812,25 @@ export class VoiceRoom {
     delete payload.search;
     delete payload.github;
     delete payload.directPage;
+    if (options.imageNotice) {
+      payload.attachedImageCount = options.imageNotice.kind === "partial"
+        ? options.imageNotice.loaded + options.imageNotice.failed
+        : options.imageNotice.count;
+    }
+    const imageInstruction = (() => {
+      const notice = options.imageNotice;
+      if (!notice) return "";
+      if (notice.kind === "loaded") {
+        return `\n图片说明：用户本次附带了 ${notice.count} 张图片且已成功加载到输入中。请直接结合图片内容与文字作答，不要编造图中不存在的细节。`;
+      }
+      if (notice.kind === "partial") {
+        return `\n图片说明：用户附带了多张图片，其中 ${notice.loaded} 张已加载、${notice.failed} 张读取失败。请仅基于已加载的图片作答，并坦诚说明部分图片未能读取，不要猜测失败图片的内容。`;
+      }
+      if (notice.kind === "fetch_failed") {
+        return `\n图片说明：用户附带了 ${notice.count} 张图片，但本次图片读取失败或无法访问。请坦诚告知无法查看该图片，绝不要猜测图片内容，并继续回答文字问题（如有）。`;
+      }
+      return `\n图片说明：用户附带了 ${notice.count} 张图片，但当前未启用看图（多模态）能力。请坦诚告知当前无法查看图片，绝不要猜测图片内容，并继续回答文字问题（如有）。`;
+    })();
     const ambient = request.source === "ambient";
     const hasWebEvidence = Boolean(options.webEvidence?.length);
     const hasUrls = extractPublicUrls(target.text).length > 0;
@@ -819,7 +854,7 @@ ${skillText}
 2. 重点回应当前消息 targetId 与最近连续对话（留意每条消息的 ago 相对时间）；不要主动续接早已结束的旧话题，除非存在 quotedMessage。
 3. 真实明确 @ 必须形成回应义务；不能 skip，也不能敷衍了事；不得输出动作旁白、角色名前缀或成人内容。
 4. 事实依据：${hasWebEvidence ? "输入 JSON 中的 webEvidence 是已抓取的公开网页/GitHub/X 原文。请严格基于这些原文提炼核心判断与硬核要点；若部分内容被截断或抓取失败，坦诚说明，绝不编造。" : hasUrls ? "用户发了链接但本次未能抓到正文，请坦诚告知无法读取该链接，不要凭空猜测内容。" : "请基于可靠知识严谨分析。"}${hasWebTools ? "若需要核对最新事实或进一步阅读未抓取的链接，可先调用 web_search 或 web_fetch 工具再作答。" : ""}
-5. 只返回 JSON：{"kind":"reply","segments":["第一段","第二段",...]}。`;
+5. 只返回 JSON：{"kind":"reply","segments":["第一段","第二段",...]}。${imageInstruction}`;
     } else {
       const segmentRule = maxSegments === 1 ? "exactly one segment" : "one or two character lines";
       payload.outputProtocol = `Return ONLY one JSON object matching {"kind":"skip"} or `
@@ -840,7 +875,7 @@ ${skillText}
 ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 skip。"
     : "真实明确 @ 必须形成回应义务；不能 skip，也不能用空回答吞掉该义务。没有合适内容时给出一句诚实、简短的说明。"}
 每条回复必须是${maxSegments === 1 ? "一段" : "一到两段"}自然中文台词，${maxSegments === 1 ? "" : "不为凑数补第二段；"}不得输出动作旁白、角色名前缀、他人台词或成人内容。
-只返回 JSON：{"kind":"skip"} 或 {"kind":"reply","segments":["台词"]}。`;
+只返回 JSON：{"kind":"skip"} 或 {"kind":"reply","segments":["台词"]}。${imageInstruction}`;
     }
     const maxInputTokens = this.config.limits.contextTokens - lifecycleOutputReserve - 1024
       - ROOM_LIFECYCLE_PROTOCOL_RESERVE_TOKENS;
@@ -963,10 +998,36 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
         }
       }
       if (signal.aborted || !this.lifecycleRevisionLive(revision, character.accountKey)) return;
+      const imageUrls = this.lifecycleInputImages.get(request.requestId) ?? [];
+      let fetchedImages: readonly ImageContent[] = [];
+      let imageNotice: LifecycleImageNotice | undefined;
+      if (imageUrls.length > 0) {
+        if (this.lifecycleWorker?.model.visionCapable) {
+          const remainingForFetch = Math.max(1, Math.min(LIFECYCLE_WEB_FETCH_BUDGET_MS, request.expiresAt - this.now()));
+          const fetcher = this.lifecycleWorker.imageFetcher ?? fetchRoomImages;
+          try {
+            const batch = await this.callLifecycle(signal, remainingForFetch, child => fetcher(imageUrls, child));
+            fetchedImages = batch.images;
+            imageNotice = batch.images.length > 0 && batch.failed === 0
+              ? { kind: "loaded", count: batch.images.length }
+              : batch.images.length > 0
+                ? { kind: "partial", loaded: batch.images.length, failed: batch.failed }
+                : { kind: "fetch_failed", count: imageUrls.length };
+          } catch {
+            if (signal.aborted || !this.lifecycleRevisionLive(revision, character.accountKey)) return;
+            fetchedImages = [];
+            imageNotice = { kind: "fetch_failed", count: imageUrls.length };
+          }
+        } else {
+          imageNotice = { kind: "vision_unconfigured", count: imageUrls.length };
+        }
+      }
+      if (signal.aborted || !this.lifecycleRevisionLive(revision, character.accountKey)) return;
       const prompt = this.lifecyclePrompt(character, request, maxSegments, maxChars, {
         deep,
         ...(webEvidence.length ? { webEvidence } : {}),
         ...(quotedMessage ? { quotedMessage } : {}),
+        ...(imageNotice ? { imageNotice } : {}),
       });
       if (!this.permitsPrompt(prompt)) return fail("lifecycle_privacy_rejected");
       const modelReserve = request.source === "ambient" ? 1 : 0;
@@ -982,13 +1043,16 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
         request.expiresAt - this.now()));
       let answer: unknown;
       try {
-        answer = await this.callLifecycle(signal, remaining, child => deep
-          ? this.lifecycleWorker!.model.generate(prompt, child, maxChars, {
-            deep: true,
-            maxSegments,
-            ...(this.lifecycleWorker?.web ? { web: this.lifecycleWorker.web } : {}),
-          })
-          : this.lifecycleWorker!.model.generate(prompt, child, maxChars));
+        answer = await this.callLifecycle(signal, remaining, child => {
+          const generateOptions: RoomLifecycleGenerateOptions = {
+            ...(deep ? { deep: true, maxSegments } : {}),
+            ...(deep && this.lifecycleWorker?.web ? { web: this.lifecycleWorker.web } : {}),
+            ...(fetchedImages.length ? { images: fetchedImages } : {}),
+          };
+          return Object.keys(generateOptions).length > 0
+            ? this.lifecycleWorker!.model.generate(prompt, child, maxChars, generateOptions)
+            : this.lifecycleWorker!.model.generate(prompt, child, maxChars);
+        });
       } catch (error) {
         if (signal.aborted || !this.lifecycleRevisionLive(revision, character.accountKey)) return;
         return fail(error instanceof RoomModelError && error.code === "deadline"
@@ -1089,6 +1153,13 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
         if (!activeTurnIds.has(turnId) && !this.lifecycleGenerations.has(turnId)) {
           this.lifecycleForwardNodes.delete(turnId);
         }
+      }
+    }
+    for (const requestId of this.lifecycleInputImages.keys()) {
+      const request = this.lifecycleStore("lifecycle_prompt_cache_read_failed", () =>
+        this.store.lifecycleRequestById(requestId));
+      if (!request || ["completed", "failed", "cancelled", "restart_not_resumed"].includes(request.status)) {
+        this.lifecycleInputImages.delete(requestId);
       }
     }
   }
@@ -1666,7 +1737,7 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
     this.stopLifecycleRetention();
     this.closePromise = (async () => {
       try { await this.startupPromise?.catch(() => {}); }
-      finally { this.store.close(); this.workerPhase = "closed"; }
+      finally { this.lifecycleInputImages.clear(); this.store.close(); this.workerPhase = "closed"; }
     })();
     return this.closePromise;
   }
@@ -1705,7 +1776,12 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
         await worker.sealObservations();
       } finally {
         try { await worker.sealObservations(); }
-        finally { this.lifecycleAudioObservations.clear(); this.store.close(); this.workerPhase = "closed"; }
+        finally {
+          this.lifecycleAudioObservations.clear();
+          this.lifecycleInputImages.clear();
+          this.store.close();
+          this.workerPhase = "closed";
+        }
       }
     })();
   }

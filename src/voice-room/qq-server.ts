@@ -11,6 +11,7 @@ import { checkedWorkerQueue, RoomWorkerDeliveryError, workerDeliveryModes } from
 import { VoiceRoom, type RoomLifecycleModelPort } from "./runtime.js";
 import type { RoomAmbientPlanner } from "./participation-planner.js";
 import type { RoomWebToolkit } from "./web.js";
+import type { RoomImageFetcher } from "./image.js";
 import { RoomSendError, type RoomControlAction, type RoomDependencies, type RoomInput,
   type RoomParticipationMode, type RoomPrompt } from "./types.js";
 import { roomRecord } from "./fish.js";
@@ -42,7 +43,7 @@ const equal = (a: string, b: string) => {
 export async function startRoomQq(settings: RoomQqSettings,
   deps: Pick<RoomDependencies, "persona" | "permitsText" | "permitsPrompt" | "now" | "onContextCompacted">
     & Partial<Pick<RoomDependencies, "generate" | "translateVoice">>
-    & { lifecycleModel?: RoomLifecycleModelPort; web?: RoomWebToolkit },
+    & { lifecycleModel?: RoomLifecycleModelPort; web?: RoomWebToolkit; imageFetcher?: RoomImageFetcher },
   onNotice: (notice: RoomQqNotice) => void = () => {},
   voice?: { synthesize: RoomDependencies["synthesize"] },
   options: { disconnectGraceMs?: number; offlineAlertMs?: number; startupSingleAccountMs?: number } = {}) {
@@ -127,6 +128,7 @@ export async function startRoomQq(settings: RoomQqSettings,
     if (startupFallbackTimer) { clearTimeout(startupFallbackTimer); startupFallbackTimer = undefined; }
     void room.startLifecycleProductionWorker({ model: deps.lifecycleModel!, ambientPlanner,
       ...(deps.web ? { web: deps.web } : {}),
+      ...(deps.imageFetcher ? { imageFetcher: deps.imageFetcher } : {}),
       apiTimeoutMs: settings.apiTimeoutMs,
       closePolicy, dispatch: async request => {
         if (closing || request.signal.aborted) throw new RoomSendError("rejected");

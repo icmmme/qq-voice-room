@@ -9,12 +9,15 @@ import type { RoomCharacter, RoomPrompt } from "./types.js";
 export function roomPublicPolicy(settings: RoomQqSettings, model: ModelConfig, configFile: string, additionalProtected: readonly string[] = []) {
   const guard = new PrivacyGuard({
     secrets: [
-      model.apiKey, model.tavilyApiKey, model.bochaApiKey, model.exaApiKey,
+      model.apiKey, model.visionApiKey, model.tavilyApiKey, model.bochaApiKey, model.exaApiKey,
       model.jinaApiKey, model.githubToken,
       ...settings.accounts.map(a => a.token), ...additionalProtected,
     ].filter((value): value is string => typeof value === "string" && value.length > 0),
     identityIds: [settings.room.ownerId, settings.room.groupId, ...settings.room.characters.map(c => c.selfId)],
-    internalValues: [settings.dataDir, model.baseUrl, configFile, ...settings.accounts.map(a => a.personaFile)],
+    internalValues: [
+      settings.dataDir, model.baseUrl, model.visionBaseUrl, configFile,
+      ...settings.accounts.map(a => a.personaFile),
+    ].filter((value): value is string => typeof value === "string" && value.length > 0),
   });
   const privacy = (text: string) => textVariants(text).every(v =>
     guard.sanitizeForModel(v) === v && guard.redactOutbound(v) === v);
