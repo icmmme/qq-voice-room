@@ -18,20 +18,21 @@ interface CachedSkill {
 
 const FALLBACK_SKILLS: Readonly<Record<RoomSkillName, { description: string; body: string }>> = Object.freeze({
   "deep-link-analysis": {
-    description: "Read shared links, repos, X posts, and meme pages with intent triage: punchy banter for memes/drama, sharp Analytical Lens breakdowns for serious tech articles.",
+    description: "Synthesize shared links, GitHub repos, X posts, and meme pages with intent triage: punchy banter for memes, two-hop source inspection + anti-slop engineering analysis for serious repos and essays.",
     body: [
-      "先看气氛与意图再定篇幅：乐子/整活/吐槽链接 1-2 段（120-320 字）先接梗抓最荒诞细节吐槽，严禁写成四段长评或安全说教；短帖/X 动态 1-3 段；硬核长文/开源仓库 3-4 段（450-900 字）。",
+      "先看气氛与意图再定篇幅：乐子/整活/吐槽链接 1-2 段（120-320 字）先接梗抓最荒诞细节吐槽，严禁写成四段长评或安全说教；短帖/X 动态 1-3 段；硬核长文/开源仓库 3-6 段（500-1100 字），0 Markdown 符号并穿插单句立论段切分节奏。",
+      "读 GitHub 仓库或硬核博客时，结合目录树主动用 web_fetch 深挖关键源码/文档（或配 preferGlobal web_search 查外部对照），不要只复述 README/原文目录。",
       "## Analytical Lens（硬核拆解视角）",
-      "处理硬核长文时用三个问题筛一遍材料——真问题与核心判断、关键机制、代价与盲区；保持角色本色，不写总-分-总，禁用“综上所述/总的来说/值得注意的是/作为AI”等套话。",
+      "处理硬核长文时用三个问题筛一遍材料——真问题与核心判断、关键机制、原文没写的代价与失效边界；保持角色本色，禁用“我先说结论/不是X而是Y/综上所述/总的来说/值得注意的是/作为AI”等套话。",
       "所有事实严格锚定 webEvidence（及补充 web_fetch 原文），未抓全或被截断时坦诚说明，绝不编造。",
     ].join("\n"),
   },
   "deep-tech-qa": {
-    description: "Answer tech questions and recent drama/news with intent triage, bilingual web search, upfront verdicts, and natural QQ group personality.",
+    description: "Answer tech questions, company/product analyses, and recent drama with multi-step deep research, concrete human-grounded facts, anti-slop prose rhythm, and natural QQ group peer voice.",
     body: [
-      "先分场景再定长短：吃瓜/热点 1-3 段（180-450 字）直讲谁干了啥和槽点；硬核技术问答 2-4 段（350-850 字）用 Analytical Lens 先亮判断、抓准机制与坑点、交代具体边界。",
-      "遇到海外项目、开源工具或 X/Reddit 讨论，不要只搜中文关键词，主动用英文项目名+社区词（drama/controversy/reddit/hackernews/twitter）做 web_search，必要时 web_fetch 一手原文；查不到坦诚说没查到，绝不编造。",
-      "贴合角色本色，讲透即收尾不凑总结段，禁用“综上所述/总的来说/值得注意的是/作为AI/希望以上回答对你有帮助”等套话。",
+      "先分场景再定长短：吃瓜/热点 1-3 段（180-450 字）直讲谁干了啥和槽点；硬核技术与公司/产品分析 3-6 段（500-1100 字）使用 0 Markdown 纯文字 + 长短段错落（含单句立论段），用 Analytical Lens 讲透定性+硬事实、底层机制、最硬工程/商业瓶颈与可执行结论。",
+      "禁止拿首轮摘要直接交卷：先用 web_search 检索（海外公司/开源项目/X/Reddit 讨论请设 preferGlobal: true 并搜英文关键词+社区词如 drama/controversy/reddit/hackernews），再对高价值一手源调用 web_fetch 读全文，提炼具体人物、产品、数据与竞品；查不到坦诚说没查到，绝不编造。",
+      "贴合角色本色，禁用“我先说结论/不过我也留个保留意见/不是X而是Y/综上所述/总的来说/值得注意的是/作为AI/希望以上回答对你有帮助”等套话。",
     ].join("\n"),
   },
   "casual-chat": {

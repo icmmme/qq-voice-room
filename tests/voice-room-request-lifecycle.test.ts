@@ -5238,6 +5238,39 @@ test("web fetch module blocks SSRF, routes GitHub/Jina/HTML fallback, masks thir
   assert.ok(ghItem?.content.includes("octocat/hello-world"));
   assert.ok(ghItem?.content.includes("Verification details here."));
 
+  // GitHub repo includes top-level directory tree + blob fetch hint when /contents succeeds
+  const mockGhTreeFetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url === "https://api.github.com/repos/acme/engine") {
+      return new Response(JSON.stringify({
+        full_name: "acme/engine",
+        description: "Core engine",
+        language: "TypeScript",
+        stargazers_count: 42,
+        forks_count: 5,
+        default_branch: "develop",
+      }), { status: 200 });
+    }
+    if (url === "https://api.github.com/repos/acme/engine/readme") {
+      return new Response(JSON.stringify({
+        encoding: "base64",
+        content: Buffer.from("# Engine\nHello", "utf8").toString("base64"),
+      }), { status: 200 });
+    }
+    if (url === "https://api.github.com/repos/acme/engine/contents") {
+      return new Response(JSON.stringify([
+        { name: "src", type: "dir" },
+        { name: "RELATED_WORK.md", type: "file" },
+      ]), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  }) as typeof fetch;
+  const ghTreeItem = await fetchPublicUrl("https://github.com/acme/engine", { fetchImpl: mockGhTreeFetch, sanitizeText: sanitize });
+  assert.equal(ghTreeItem?.kind, "github");
+  assert.ok(ghTreeItem?.content.includes("src/"));
+  assert.ok(ghTreeItem?.content.includes("RELATED_WORK.md"));
+  assert.ok(ghTreeItem?.content.includes("https://github.com/acme/engine/blob/develop/<path>"));
+
   // Dynamic 75/25 truncation preserves head & tail when over budget, keeps 15k English intact when within budget
   const essay = `HEAD_MARKER ${"verification ".repeat(1100)} TAIL_MARKER`;
   const intact = truncateByBudget(essay, 40_000, 10_000);
@@ -5706,6 +5739,28 @@ test("searchPublicWebDetailed supports Bocha -> Exa -> Tavily failover, outcome 
   const legacyHits = await searchPublicWeb("MCP spec", { exaApiKey: "exa-k", tavilyApiKey: "tavily-k", fetchImpl: fetchExaEmptyTavilyOk });
   assert.equal(legacyHits.length, 1);
 
+  // 2b. preferGlobal reorders Exa -> Tavily -> Bocha (still failing over cleanly)
+  const callOrderGlobal: string[] = [];
+  const fetchGlobalOrder = (async (input: string | URL | Request) => {
+    const url = String(input);
+    callOrderGlobal.push(url);
+    if (url.includes("exa.ai")) {
+      return new Response(JSON.stringify({
+        results: [{ title: "Photon iMessage Infra", url: "https://photon.example/launch", text: "Spectrum SDK details" }],
+      }), { status: 200 });
+    }
+    return new Response("unexpected", { status: 500 });
+  }) as typeof fetch;
+  const globalRes = await searchPublicWebDetailed("Photon Spectrum SDK", {
+    bochaApiKey: "bocha-k",
+    exaApiKey: "exa-k",
+    tavilyApiKey: "tavily-k",
+    fetchImpl: fetchGlobalOrder,
+  }, undefined, { preferGlobal: true });
+  assert.equal(globalRes.status, "ok");
+  assert.equal(globalRes.provider, "exa");
+  assert.deepEqual(callOrderGlobal, ["https://api.exa.ai/search"]);
+
   // 3. All providers error -> provider_error; all 200 empty -> empty; no keys -> unavailable; privacy -> blocked
   const fetchAllFail = (async () => new Response("bad gateway", { status: 502 })) as typeof fetch;
   const errRes = await searchPublicWebDetailed("query", { bochaApiKey: "b", tavilyApiKey: "t", fetchImpl: fetchAllFail });
@@ -5962,6 +6017,7 @@ test("room skills provide idiomatic Chinese QQ group-chat guidance with Analytic
   assert.ok(linkSkill.includes("web_fetch"));
   assert.ok(linkSkill.includes("综上所述"));
   assert.ok(linkSkill.includes("乐子 / 整活"));
+  assert.ok(linkSkill.includes("0 Markdown"));
 
   const qaSkill = loadRoomSkill("deep-tech-qa");
   assert.ok(qaSkill.includes("Analytical Lens"));
@@ -5969,6 +6025,8 @@ test("room skills provide idiomatic Chinese QQ group-chat guidance with Analytic
   assert.ok(qaSkill.includes("web_fetch"));
   assert.ok(qaSkill.includes("reddit"));
   assert.ok(qaSkill.includes("controversy"));
+  assert.ok(qaSkill.includes("preferGlobal"));
+  assert.ok(qaSkill.includes("0 Markdown"));
 
   const casualSkill = loadRoomSkill("casual-chat");
   assert.ok(casualSkill.includes("QQ 群"));

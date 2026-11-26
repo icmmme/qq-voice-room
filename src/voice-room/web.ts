@@ -39,10 +39,14 @@ export interface WebSearchOutcome {
   readonly hits: readonly WebSearchHit[];
 }
 
+export interface WebSearchOptions {
+  readonly preferGlobal?: boolean;
+}
+
 export interface RoomWebToolkit {
   readonly hasSearch: boolean;
-  readonly search: (query: string, signal?: AbortSignal) => Promise<readonly WebSearchHit[]>;
-  readonly searchDetailed?: (query: string, signal?: AbortSignal) => Promise<WebSearchOutcome>;
+  readonly search: (query: string, signal?: AbortSignal, options?: WebSearchOptions) => Promise<readonly WebSearchHit[]>;
+  readonly searchDetailed?: (query: string, signal?: AbortSignal, options?: WebSearchOptions) => Promise<WebSearchOutcome>;
   readonly fetchUrl: (url: string, options: { maxChars?: number; maxTokens?: number }, signal?: AbortSignal) => Promise<WebEvidenceItem | null>;
 }
 
@@ -316,24 +320,50 @@ async function fetchGithubTarget(target: ParsedGithubTarget, options: RoomWebCon
     "User-Agent": "qq-voice-room",
     ...(options.githubToken ? { Authorization: `Bearer ${options.githubToken}` } : {}),
   };
+  const getAnyJson = async (endpoint: string): Promise<unknown> => {
+    try {
+      const res = await fetchFn(`https://api.github.com${endpoint}`, { headers, signal });
+      if (!res.ok) return null;
+      return JSON.parse(await readBoundedText(res, WEB_MAX_RESPONSE_BYTES));
+    } catch (error) {
+      if (signal.aborted) throw error;
+      return null;
+    }
+  };
   const getJson = async (endpoint: string): Promise<Record<string, unknown> | null> => {
-    const res = await fetchFn(`https://api.github.com${endpoint}`, { headers, signal });
-    if (!res.ok) return null;
-    const text = await readBoundedText(res, WEB_MAX_RESPONSE_BYTES);
-    const parsed: unknown = JSON.parse(text);
-    return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : null;
+    const parsed = await getAnyJson(endpoint);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown> : null;
   };
 
   if (target.kind === "repo") {
     const repo = await getJson(`/repos/${target.owner}/${target.repo}`);
     if (!repo) return null;
-    const readme = await getJson(`/repos/${target.owner}/${target.repo}/readme`);
+    const defaultBranch = typeof repo.default_branch === "string" && repo.default_branch.trim()
+      ? repo.default_branch.trim() : "main";
+    const [readme, contentsRaw] = await Promise.all([
+      getJson(`/repos/${target.owner}/${target.repo}/readme`),
+      getAnyJson(`/repos/${target.owner}/${target.repo}/contents`),
+    ]);
     const readmeText = typeof readme?.content === "string" && readme.encoding === "base64"
       ? Buffer.from(readme.content.replace(/\s+/g, ""), "base64").toString("utf8") : "";
+    const topEntries = Array.isArray(contentsRaw)
+      ? (contentsRaw as Array<Record<string, unknown>>)
+        .map(entry => {
+          const name = typeof entry?.name === "string" ? entry.name.trim() : "";
+          if (!name) return "";
+          return entry.type === "dir" ? `${name}/` : name;
+        })
+        .filter(Boolean)
+        .slice(0, 25)
+      : [];
     const lines = [
       `# ${String(repo.full_name ?? `${target.owner}/${target.repo}`)}`,
       repo.description ? `简介：${String(repo.description)}` : "",
       `语言：${String(repo.language ?? "未知")}｜Stars：${String(repo.stargazers_count ?? 0)}｜Forks：${String(repo.forks_count ?? 0)}`,
+      topEntries.length
+        ? `\n## 仓库目录（可用 web_fetch 读取 https://github.com/${target.owner}/${target.repo}/blob/${defaultBranch}/<path>）\n${topEntries.join(", ")}`
+        : "",
       readmeText ? `\n## README\n${readmeText}` : "",
     ].filter(Boolean);
     return { title: String(repo.full_name ?? `${target.owner}/${target.repo}`), content: lines.join("\n") };
@@ -732,11 +762,11 @@ function buildSearchProviders(config: RoomWebConfig): readonly SearchProviderSpe
 }
 
 /**
- * Search public web across configured providers in Bocha -> Exa -> Tavily priority order
- * with per-provider automatic failover and structured outcome reporting.
+ * Search public web across configured providers (default Bocha -> Exa -> Tavily,
+ * or Exa -> Tavily -> Bocha when `options.preferGlobal` is true) with automatic failover.
  */
 export async function searchPublicWebDetailed(query: string, config: RoomWebConfig,
-  parentSignal?: AbortSignal): Promise<WebSearchOutcome> {
+  parentSignal?: AbortSignal, options?: WebSearchOptions): Promise<WebSearchOutcome> {
   if (parentSignal?.aborted) {
     throw parentSignal.reason instanceof Error ? parentSignal.reason : new Error("web-search-aborted");
   }
@@ -755,7 +785,11 @@ export async function searchPublicWebDetailed(query: string, config: RoomWebConf
 
   const fetchFn = config.fetchImpl ?? globalThis.fetch;
   const timeoutMs = config.timeoutMs ?? WEB_DEFAULT_TIMEOUT_MS;
-  const providers = buildSearchProviders(config).filter(spec => Boolean(spec.apiKey));
+  const rawProviders = buildSearchProviders(config).filter(spec => Boolean(spec.apiKey));
+  const globalOrder: Record<WebSearchProvider, number> = { exa: 0, tavily: 1, bocha: 2 };
+  const providers = options?.preferGlobal
+    ? [...rawProviders].sort((a, b) => globalOrder[a.name] - globalOrder[b.name])
+    : rawProviders;
   let anyOkResponse = false;
 
   for (const spec of providers) {
@@ -786,17 +820,17 @@ export async function searchPublicWebDetailed(query: string, config: RoomWebConf
   });
 }
 
-/** Search public web using Bocha -> Exa -> Tavily priority order. */
+/** Search public web across configured providers. */
 export async function searchPublicWeb(query: string, config: RoomWebConfig,
-  parentSignal?: AbortSignal): Promise<readonly WebSearchHit[]> {
-  return searchPublicWebDetailed(query, config, parentSignal).then(result => result.hits);
+  parentSignal?: AbortSignal, options?: WebSearchOptions): Promise<readonly WebSearchHit[]> {
+  return searchPublicWebDetailed(query, config, parentSignal, options).then(result => result.hits);
 }
 
 export function createRoomWebToolkit(config: RoomWebConfig): RoomWebToolkit {
   return Object.freeze({
     hasSearch: hasWebSearchProvider(config),
-    search: (query: string, signal?: AbortSignal) => searchPublicWeb(query, config, signal),
-    searchDetailed: (query: string, signal?: AbortSignal) => searchPublicWebDetailed(query, config, signal),
+    search: (query: string, signal?: AbortSignal, options?: WebSearchOptions) => searchPublicWeb(query, config, signal, options),
+    searchDetailed: (query: string, signal?: AbortSignal, options?: WebSearchOptions) => searchPublicWebDetailed(query, config, signal, options),
     fetchUrl: (url: string, options: { maxChars?: number; maxTokens?: number }, signal?: AbortSignal) =>
       fetchPublicUrl(url, { ...config, ...options }, signal),
   });

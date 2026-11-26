@@ -18,7 +18,7 @@ export const ROOM_LIFECYCLE_MAX_TOKENS = 1024;
 export const ROOM_LIFECYCLE_DEEP_MAX_TOKENS = 6144;
 export const ROOM_LIFECYCLE_PROTOCOL_RESERVE_TOKENS = 256;
 export const ROOM_LIFECYCLE_DEEP_MAX_SEGMENTS = 12;
-const ROOM_MAX_TOOL_ROUNDS = 3;
+const ROOM_MAX_TOOL_ROUNDS = 5;
 const ROOM_MAX_TOOL_CALLS_PER_ROUND = 3;
 const TOOL_ROUND_SAFETY_RESERVE = 512;
 
@@ -386,7 +386,7 @@ function createRuntimeAccessor(config: ModelConfig, roomDataDir: string, registe
 function buildWebTools(web: RoomWebToolkit): Tool[] {
   const tools: Tool[] = [{
     name: "web_fetch",
-    description: "Fetch and read a public web page or GitHub repository/issue/PR/file as clean text or Markdown.",
+    description: "Fetch and read a public web page, blog post, docs page, or GitHub repo/issue/PR/file (including https://github.com/<owner>/<repo>/blob/<branch>/<path>) as clean text.",
     parameters: {
       type: "object",
       properties: {
@@ -399,11 +399,15 @@ function buildWebTools(web: RoomWebToolkit): Tool[] {
   if (web.hasSearch) {
     tools.unshift({
       name: "web_search",
-      description: "Search the public web ONLY when you need up-to-date facts, recent events/news, external projects/docs you are unsure of, or when the user asks to look something up. Do NOT call for greetings, casual banter, or questions answerable from conversation context.",
+      description: "Search the public web ONLY when you need up-to-date facts, recent events/news, external projects/docs/companies you are unsure of, or when the user asks to look something up. Do NOT call for greetings, casual banter, or questions answerable from conversation context.",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string", description: "Concise search query." },
+          preferGlobal: {
+            type: "boolean",
+            description: "Set true when querying English/overseas tech companies, OSS projects, papers, benchmarks, or global developer discussions so global search engines run first.",
+          },
         },
         required: ["query"],
         additionalProperties: false,
@@ -539,7 +543,8 @@ async function executeWebToolCall(
       const query = typeof call.arguments?.query === "string" ? call.arguments.query : "";
       const trimmed = query.trim();
       if (!trimmed) return makeResult({ error: "empty_query" }, true);
-      const callKey = `web_search:${trimmed.replace(/\s+/g, " ").toLowerCase()}`;
+      const preferGlobal = call.arguments?.preferGlobal === true;
+      const callKey = `web_search:${preferGlobal ? "global:" : ""}${trimmed.replace(/\s+/g, " ").toLowerCase()}`;
       if (seenCalls.has(callKey)) {
         return makeResult({
           duplicate: true,
@@ -553,8 +558,9 @@ async function executeWebToolCall(
         }, true);
       }
       seenCalls.add(callKey);
+      const searchOpts = preferGlobal ? { preferGlobal: true } : undefined;
       if (web.searchDetailed) {
-        const outcome = await web.searchDetailed(trimmed, signal);
+        const outcome = await web.searchDetailed(trimmed, signal, searchOpts);
         const note = searchStatusNote(outcome.status);
         return makeResult({
           query: trimmed,
@@ -564,7 +570,7 @@ async function executeWebToolCall(
           ...(note ? { note } : {}),
         }, outcome.status === "provider_error" || outcome.status === "blocked" || outcome.status === "unavailable");
       }
-      const hits = await web.search(trimmed, signal);
+      const hits = await web.search(trimmed, signal, searchOpts);
       return makeResult({
         query: trimmed,
         status: hits.length > 0 ? "ok" : "empty",
