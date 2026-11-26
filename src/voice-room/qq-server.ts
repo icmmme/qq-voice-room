@@ -53,11 +53,19 @@ export async function startRoomQq(settings: RoomQqSettings,
     },
   onNotice: (notice: RoomQqNotice) => void = () => {},
   voice?: { synthesize: RoomDependencies["synthesize"] },
-  options: { disconnectGraceMs?: number; offlineAlertMs?: number; startupSingleAccountMs?: number } = {}) {
+  options: {
+    disconnectGraceMs?: number;
+    offlineAlertMs?: number;
+    startupSingleAccountMs?: number;
+    livenessProbeMs?: number;
+    ingressFailoverMs?: number;
+  } = {}) {
   const testMode = settings.apiTimeoutMs <= 1000;
   const disconnectGraceMs = options.disconnectGraceMs ?? (testMode ? 0 : 10_000);
   const offlineAlertMs = options.offlineAlertMs ?? (testMode ? 150 : 30_000);
   const startupSingleAccountMs = options.startupSingleAccountMs ?? (testMode ? 250 : 15_000);
+  const livenessProbeMs = options.livenessProbeMs ?? (testMode ? 0 : 60_000);
+  const ingressFailoverMs = options.ingressFailoverMs ?? (testMode ? 0 : 800);
   const workerSelected = settings.execution === "worker";
   const workerTts = typeof voice?.synthesize === "function";
   const startupModes = workerSelected ? workerDeliveryModes(settings.room.deliveryMode, workerTts) : undefined;
@@ -119,6 +127,10 @@ export async function startRoomQq(settings: RoomQqSettings,
   const ackAt = new Map<string, number>();
   const disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const offlineAlertTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const pendingFailoverTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const recentPrimaryFingerprints = new Map<string, number>();
+  const zombieOfflineAccounts = new Set<string>();
+  const zombieAlertedAccounts = new Set<string>();
   let startupFallbackTimer: ReturnType<typeof setTimeout> | undefined;
   let closing = false, closePromise: Promise<void> | undefined;
   let workerStarted = false;
@@ -228,14 +240,81 @@ export async function startRoomQq(settings: RoomQqSettings,
   server.on("connection", socket => { connections.add(socket); socket.once("close", () => connections.delete(socket)); });
   const sockets = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024, perMessageDeflate: false });
 
-  async function acknowledge(accountKey: string, text: string) {
+  async function acknowledge(accountKey: string, text: string, throttle = true) {
     // Independent best-effort control ACK; never blocks stop and cannot accumulate a control queue.
-    const now = Date.now();
-    if (now - (ackAt.get(accountKey) ?? -Infinity) < 1000) return;
-    ackAt.set(accountKey, now);
+    if (throttle) {
+      const now = Date.now();
+      if (now - (ackAt.get(accountKey) ?? -Infinity) < 1000) return;
+      ackAt.set(accountKey, now);
+    }
     try { await peers.get(accountKey)?.request("send_group_msg", { group_id: Number(config.groupId),
       message: [{ type: "text", data: { text } }], auto_escape: true }); }
     catch { notice("error", "control-ack-failed"); }
+  }
+  function alertHealthyPeer(excludeAccountKey: string, text: string) {
+    let targetKey: string | undefined;
+    for (const [key, candidate] of peers.entries()) {
+      if (key === excludeAccountKey || !candidate.open) continue;
+      if (!zombieOfflineAccounts.has(key)) { targetKey = key; break; }
+      targetKey ??= key;
+    }
+    if (targetKey) void acknowledge(targetKey, text, false);
+  }
+  function handleLifecycleInput(accountKey: string, input: RoomInput) {
+    try {
+      const receipt = room.receiveLifecycle(input, workerQueue!);
+      notice("received", receipt);
+      if (receipt === "control") {
+        const trimmed = input.text.trim();
+        const memoryFeedback = room.consumeMemoryControlFeedback(input);
+        const memoryCmd = parseMemoryCommand(trimmed, { permitsText: deps.permitsText });
+        const lifecycle = room.store.lifecycleControlState();
+        let text: string;
+        if (memoryFeedback !== undefined) {
+          text = memoryFeedback;
+        } else if (memoryCmd?.kind === "list") {
+          text = memoryStore
+            ? formatMemorySummary(memoryStore.list(), { permitsText: deps.permitsText })
+            : "长期记忆未启用。";
+        } else if (/^\/room\s+status$/.test(trimmed)) {
+          const st = workerStatus();
+          text = st
+            ? `房间状态：模式 ${lifecycle.mode}｜投递 ${st.effectiveDeliveryMode}｜在线 ${st.connectedAccountCount}/${config.characters.length}｜${st.textCanProgress ? "文字正常" : "文字未就绪"}｜${st.audioBlockReason ? `语音受阻(${st.audioBlockReason})` : "语音正常"}${st.faultReason ? `｜故障(${st.faultReason})` : ""}`
+            : `房间模式：${lifecycle.mode}`;
+        } else if (/^\/room\s+stop$/.test(trimmed)) {
+          text = "已停止当前回复队列。";
+        } else if (/^\/room\s+mode$/.test(trimmed)) {
+          text = `房间模式：${lifecycle.mode === "ambient" ? "ambient" : "mention_only"}`;
+        } else {
+          text = `房间模式已切换为 ${lifecycle.mode === "ambient" ? "ambient" : "mention_only"}。`;
+        }
+        if (deps.permitsText(text)) {
+          void acknowledge(accountKey, text);
+        }
+      } else if (receipt === "rejected" && input.senderId === config.ownerId && input.text.trim().startsWith("/room")) {
+        const memoryCmd = parseMemoryCommand(input.text.trim(), { permitsText: deps.permitsText });
+        if (memoryCmd?.kind === "rejected") {
+          void acknowledge(accountKey, "未保存：记忆内容未通过隐私或安全检查。");
+        } else if (memoryCmd?.kind === "invalid") {
+          const usage = memoryCmd.action === "remember"
+            ? "用法：/room remember <要记住的事实>"
+            : memoryCmd.action === "forget"
+              ? "用法：/room forget <编号或关键词>"
+              : "用法：/room memory";
+          void acknowledge(accountKey, `指令格式无效（${usage}）。`);
+        }
+      }
+    } catch {
+      try {
+        room.store.cancelLifecycleAll("ingress_failed", Date.now());
+      } catch { /* Do not continue on unavailable storage. */ }
+      notice("error", "room-input-failed");
+    }
+  }
+  function pruneFingerprints(now: number) {
+    for (const [key, ts] of recentPrimaryFingerprints) {
+      if (now - ts > 5000) recentPrimaryFingerprints.delete(key);
+    }
   }
   server.on("upgrade", (req, socket, head) => {
     const deny = (status: number) => { notice("rejected", `upgrade-${status}`); socket.end(`HTTP/1.1 ${status} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); };
@@ -254,67 +333,59 @@ export async function startRoomQq(settings: RoomQqSettings,
         const input = parseRoomQqMessage(value, account.accountKey, config);
         if (!input) return;
         if (!room.ready) { notice("rejected", "room-not-ready"); return; }
-        try {
-          const receipt = room.receiveLifecycle(input, workerQueue!);
-          notice("received", receipt);
-          if (receipt === "control") {
-            const trimmed = input.text.trim();
-            const memoryFeedback = room.consumeMemoryControlFeedback(input);
-            const memoryCmd = parseMemoryCommand(trimmed, { permitsText: deps.permitsText });
-            const lifecycle = room.store.lifecycleControlState();
-            let text: string;
-            if (memoryFeedback !== undefined) {
-              text = memoryFeedback;
-            } else if (memoryCmd?.kind === "list") {
-              text = memoryStore
-                ? formatMemorySummary(memoryStore.list(), { permitsText: deps.permitsText })
-                : "长期记忆未启用。";
-            } else if (/^\/room\s+status$/.test(trimmed)) {
-              const st = workerStatus();
-              text = st
-                ? `房间状态：模式 ${lifecycle.mode}｜投递 ${st.effectiveDeliveryMode}｜在线 ${st.connectedAccountCount}/${config.characters.length}｜${st.textCanProgress ? "文字正常" : "文字未就绪"}｜${st.audioBlockReason ? `语音受阻(${st.audioBlockReason})` : "语音正常"}${st.faultReason ? `｜故障(${st.faultReason})` : ""}`
-                : `房间模式：${lifecycle.mode}`;
-            } else if (/^\/room\s+stop$/.test(trimmed)) {
-              text = "已停止当前回复队列。";
-            } else if (/^\/room\s+mode$/.test(trimmed)) {
-              text = `房间模式：${lifecycle.mode === "ambient" ? "ambient" : "mention_only"}`;
-            } else {
-              text = `房间模式已切换为 ${lifecycle.mode === "ambient" ? "ambient" : "mention_only"}。`;
+        if (ingressFailoverMs <= 0) {
+          handleLifecycleInput(account.accountKey, input);
+          return;
+        }
+        const now = Date.now();
+        pruneFingerprints(now);
+        const fingerprint = `${input.senderId}\0${input.text.trim()}\0${input.images?.length ?? 0}`;
+        if (account.accountKey === room.activeIngressAccountKey()) {
+          recentPrimaryFingerprints.set(fingerprint, now);
+          clearTimerMap(pendingFailoverTimers, fingerprint);
+          handleLifecycleInput(account.accountKey, input);
+          return;
+        }
+        if (recentPrimaryFingerprints.has(fingerprint)) {
+          handleLifecycleInput(account.accountKey, input);
+          return;
+        }
+        if (!pendingFailoverTimers.has(fingerprint)) {
+          const timer = setTimeout(() => {
+            pendingFailoverTimers.delete(fingerprint);
+            if (closing || peers.get(account.accountKey) !== peer || !peer.open) return;
+            const activeKey = room.activeIngressAccountKey();
+            if (activeKey !== account.accountKey) {
+              zombieOfflineAccounts.add(activeKey);
+              try { room.setOnline(activeKey, false); } catch { notice("error", "disconnect-state-failed"); }
+              notice("disconnected", "ingress-failover");
+              publishWorkerStatus();
+              if (!zombieAlertedAccounts.has(activeKey)) {
+                zombieAlertedAccounts.add(activeKey);
+                const deadChar = config.characters.find(c => c.accountKey === activeKey);
+                void acknowledge(account.accountKey,
+                  `提醒：${deadChar?.name ?? activeKey} 疑似假在线（未收到群消息），已自动切换由在线账号接管服务，请检查登录状态。`, false);
+              }
             }
-            if (deps.permitsText(text)) {
-              void acknowledge(account.accountKey, text);
-            }
-          } else if (receipt === "rejected" && input.senderId === config.ownerId && input.text.trim().startsWith("/room")) {
-            const memoryCmd = parseMemoryCommand(input.text.trim(), { permitsText: deps.permitsText });
-            if (memoryCmd?.kind === "rejected") {
-              void acknowledge(account.accountKey, "未保存：记忆内容未通过隐私或安全检查。");
-            } else if (memoryCmd?.kind === "invalid") {
-              const usage = memoryCmd.action === "remember"
-                ? "用法：/room remember <要记住的事实>"
-                : memoryCmd.action === "forget"
-                  ? "用法：/room forget <编号或关键词>"
-                  : "用法：/room memory";
-              void acknowledge(account.accountKey, `指令格式无效（${usage}）。`);
-            }
-          }
-        } catch {
-          try {
-            room.store.cancelLifecycleAll("ingress_failed", Date.now());
-          } catch { /* Do not continue on unavailable storage. */ }
-          notice("error", "room-input-failed");
+            handleLifecycleInput(account.accountKey, input);
+          }, ingressFailoverMs);
+          timer.unref();
+          pendingFailoverTimers.set(fingerprint, timer);
         }
       });
       peers.set(account.accountKey, peer);
       clearTimerMap(disconnectTimers, account.accountKey);
       clearTimerMap(offlineAlertTimers, account.accountKey);
+      zombieOfflineAccounts.delete(account.accountKey);
+      zombieAlertedAccounts.delete(account.accountKey);
       room.setOnline(account.accountKey, true);
       if (workerSelected && !workerStarted) {
         if (peers.size === config.characters.length) {
           ensureWorkerStarted();
-        } else if (peers.has(config.ingressAccountKey) && !startupFallbackTimer && startupSingleAccountMs >= 0) {
+        } else if (peers.size > 0 && !startupFallbackTimer && startupSingleAccountMs >= 0) {
           startupFallbackTimer = setTimeout(() => {
             startupFallbackTimer = undefined;
-            if (!closing && peers.has(config.ingressAccountKey)) ensureWorkerStarted();
+            if (!closing && peers.size > 0) ensureWorkerStarted();
           }, startupSingleAccountMs);
           startupFallbackTimer.unref();
         }
@@ -324,6 +395,8 @@ export async function startRoomQq(settings: RoomQqSettings,
       ws.once("close", () => {
         if (peers.get(account.accountKey) !== peer) return;
         peers.delete(account.accountKey);
+        zombieOfflineAccounts.delete(account.accountKey);
+        zombieAlertedAccounts.delete(account.accountKey);
         if (!closing) {
           const applyOffline = () => {
             if (closing || peers.has(account.accountKey)) return;
@@ -331,7 +404,7 @@ export async function startRoomQq(settings: RoomQqSettings,
             notice("disconnected", "account-offline");
             publishWorkerStatus();
           };
-          if (account.accountKey === config.ingressAccountKey && disconnectGraceMs > 0) {
+          if (account.accountKey === room.activeIngressAccountKey() && disconnectGraceMs > 0) {
             clearTimerMap(disconnectTimers, account.accountKey);
             const timer = setTimeout(() => {
               disconnectTimers.delete(account.accountKey);
@@ -343,16 +416,14 @@ export async function startRoomQq(settings: RoomQqSettings,
           } else {
             applyOffline();
           }
-          if (account.accountKey !== config.ingressAccountKey && offlineAlertMs > 0) {
+          if (offlineAlertMs > 0) {
             clearTimerMap(offlineAlertTimers, account.accountKey);
             const alertTimer = setTimeout(() => {
               offlineAlertTimers.delete(account.accountKey);
               if (closing || peers.has(account.accountKey)) return;
               notice("disconnected", "account-offline-alert");
-              if (peers.get(config.ingressAccountKey)?.open) {
-                void acknowledge(config.ingressAccountKey,
-                  `提醒：${character.name} 的 NapCat 连接已断开，当前由在线账号继续服务，请检查登录状态。`);
-              }
+              alertHealthyPeer(account.accountKey,
+                `提醒：${character.name} 的 NapCat 连接已断开，当前由在线账号继续服务，请检查登录状态。`);
             }, offlineAlertMs);
             alertTimer.unref();
             offlineAlertTimers.set(account.accountKey, alertTimer);
@@ -368,13 +439,52 @@ export async function startRoomQq(settings: RoomQqSettings,
       server.listen(settings.port, "127.0.0.1", () => { server.off("error", reject); resolve(); }); });
   } catch (error) { sockets.close(); await room.close(); throw error; }
   publishWorkerStatus();
+  const runLivenessProbe = async () => {
+    if (closing) return;
+    for (const [accountKey, peer] of [...peers.entries()]) {
+      if (closing || !peer.open) continue;
+      let status: unknown;
+      try {
+        status = await peer.requestData("get_status", {});
+      } catch {
+        continue;
+      }
+      if (closing || peers.get(accountKey) !== peer) continue;
+      if (!status || typeof status !== "object") continue;
+      const row = status as { online?: unknown; good?: unknown };
+      if (row.online === false || row.good === false) {
+        const newlyOffline = !zombieOfflineAccounts.has(accountKey);
+        zombieOfflineAccounts.add(accountKey);
+        if (newlyOffline) {
+          try { room.setOnline(accountKey, false); } catch { notice("error", "disconnect-state-failed"); }
+          notice("disconnected", "account-zombie-offline");
+          publishWorkerStatus();
+        }
+        if (!zombieAlertedAccounts.has(accountKey)) {
+          zombieAlertedAccounts.add(accountKey);
+          const deadChar = config.characters.find(c => c.accountKey === accountKey);
+          alertHealthyPeer(accountKey,
+            `提醒：${deadChar?.name ?? accountKey} 的 QQ 登录态已失效（假在线），已自动切换由在线账号继续服务，请重新扫码。`);
+        }
+      } else if (row.online === true && row.good !== false && zombieOfflineAccounts.has(accountKey)) {
+        zombieOfflineAccounts.delete(accountKey);
+        zombieAlertedAccounts.delete(accountKey);
+        try { room.setOnline(accountKey, true); } catch { /* Ignore if closed. */ }
+        notice("connected", "account-online");
+        publishWorkerStatus();
+      }
+    }
+  };
   const poll = setInterval(() => {
     publishWorkerStatus();
   }, 500);
   const heartbeat = setInterval(() => {
     for (const peer of peers.values()) { if (!peer.alive) peer.close(); else { peer.alive = false; try { peer.socket.ping(); } catch { peer.close(); } } }
   }, 15000);
-  poll.unref(); heartbeat.unref();
+  const livenessTimer = livenessProbeMs > 0
+    ? setInterval(() => { void runLivenessProbe(); }, livenessProbeMs)
+    : undefined;
+  poll.unref(); heartbeat.unref(); livenessTimer?.unref();
   const port = (server.address() as AddressInfo).port;
   return {
     room, url: `ws://127.0.0.1:${port}`,
@@ -384,7 +494,8 @@ export async function startRoomQq(settings: RoomQqSettings,
     close(): Promise<void> {
       return closePromise ??= (async () => {
         closing = true; clearInterval(poll); clearInterval(heartbeat);
-        clearTimerMap(disconnectTimers); clearTimerMap(offlineAlertTimers);
+        if (livenessTimer) clearInterval(livenessTimer);
+        clearTimerMap(disconnectTimers); clearTimerMap(offlineAlertTimers); clearTimerMap(pendingFailoverTimers);
         if (startupFallbackTimer) { clearTimeout(startupFallbackTimer); startupFallbackTimer = undefined; }
         try {
           if (!workerSelected) { for (const peer of peers.values()) peer.close(); peers.clear(); }

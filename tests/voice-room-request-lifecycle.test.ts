@@ -6971,3 +6971,124 @@ test("Stage 2 scoped long-term memory: owner-only commands, privacy gating, and 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("NapCat resilience: get_status zombie probe and dual-account ingress failover keep room serving", async () => {
+  const { startRoomQq } = await import("../src/voice-room/qq-server.js");
+  const { checkRoomConfig } = await import("../src/voice-room/config.js");
+  const dir = mkdtempSync(join(tmpdir(), "qq-room-failover-"));
+  const personaA = join(dir, "a.md");
+  const personaB = join(dir, "b.md");
+  writeFileSync(personaA, "你是甲。");
+  writeFileSync(personaB, "你是乙。");
+
+  const notices: Array<{ type: string; code: string }> = [];
+  const actions: Array<{ account: string; action: string; text: string }> = [];
+  let accountAStatus = { online: true, good: true };
+  let accountBStatus = { online: true, good: true };
+
+  const bridge = await startRoomQq({
+    room: checkRoomConfig(roomConfig({ deliveryMode: "text" })),
+    dataDir: join(dir, "data"),
+    port: 0,
+    apiTimeoutMs: 500,
+    execution: "worker",
+    workerQueue: QUEUE,
+    closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 200, releaseMs: 200, writeWaitMs: 50 },
+    accounts: [
+      { accountKey: "account-a", token: "token-aaaaaaaaaaaaaaaa", personaFile: personaA },
+      { accountKey: "account-b", token: "token-bbbbbbbbbbbbbbbb", personaFile: personaB },
+    ],
+  }, {
+    persona: c => c.id === "character-a" ? "你是甲。" : "你是乙。",
+    permitsText: () => true,
+    lifecycleModel: {
+      generate: async prompt => ({
+        kind: "reply",
+        segments: [prompt.characterId === "character-a" ? "甲回复" : "乙自动接管回复"],
+      }),
+    },
+  }, notice => { notices.push({ type: notice.type, code: notice.code }); }, undefined, {
+    disconnectGraceMs: 0,
+    offlineAlertMs: 80,
+    startupSingleAccountMs: 80,
+    livenessProbeMs: 40,
+    ingressFailoverMs: 60,
+  });
+
+  const { WebSocket } = await import("ws");
+  const connect = (accountKey: string, selfId: string, token: string) => new Promise<InstanceType<typeof WebSocket>>((resolve, reject) => {
+    const ws = new WebSocket(`${bridge.url}/room/${accountKey}`, {
+      headers: { Authorization: `Bearer ${token}`, "x-self-id": selfId, "x-client-role": "Universal" },
+    });
+    ws.on("message", raw => {
+      const msg = JSON.parse(String(raw)) as { action?: string; params?: Record<string, unknown>; echo?: string };
+      if (!msg.action || !msg.echo) return;
+      if (msg.action === "get_status") {
+        ws.send(JSON.stringify({
+          status: "ok",
+          retcode: 0,
+          data: accountKey === "account-a" ? accountAStatus : accountBStatus,
+          echo: msg.echo,
+        }));
+        return;
+      }
+      const message = msg.params?.message as Array<{ data?: { text?: string } }> | undefined;
+      actions.push({ account: accountKey, action: msg.action, text: String(message?.[0]?.data?.text ?? "") });
+      ws.send(JSON.stringify({ status: "ok", retcode: 0, data: 99200 + actions.length, echo: msg.echo }));
+    });
+    ws.once("open", () => resolve(ws));
+    ws.once("error", reject);
+  });
+
+  let wsA: InstanceType<typeof WebSocket> | undefined;
+  let wsB: InstanceType<typeof WebSocket> | undefined;
+  try {
+    wsA = await connect("account-a", "10002", "token-aaaaaaaaaaaaaaaa");
+    wsB = await connect("account-b", "10003", "token-bbbbbbbbbbbbbbbb");
+    await waitFor(() => bridge.status().worker?.phase === "ready" && bridge.status().online === 2, "failover-two-online");
+
+    // 1. Simulate account-a zombie via get_status returning online:false while WS remains open
+    accountAStatus = { online: false, good: false };
+    await waitFor(() => notices.some(n => n.code === "account-zombie-offline"), "zombie-probe-detected");
+    assert.equal(bridge.room.activeIngressAccountKey(), "account-b");
+    assert.equal(bridge.room.ready, true);
+    await waitFor(() => actions.some(a => a.account === "account-b" && a.text.includes("登录态已失效")), "zombie-alert-sent");
+
+    // Subsequent message sent to account-b succeeds cleanly
+    wsB.send(JSON.stringify({
+      post_type: "message",
+      message_type: "group",
+      group_id: 10000,
+      user_id: 10001,
+      self_id: 10003,
+      message_id: 98001,
+      message: [
+        { type: "at", data: { qq: "10003" } },
+        { type: "text", data: { text: " 在吗" } },
+      ],
+    }));
+    await waitFor(() => actions.some(a => a.account === "account-b" && a.text === "乙自动接管回复"), "failover-b-replied");
+
+    // 2. Recover account-a, then simulate silent deaf account-a (get_status still ok, but only account-b receives group message)
+    accountAStatus = { online: true, good: true };
+    await waitFor(() => bridge.room.activeIngressAccountKey() === "account-a", "account-a-recovered");
+
+    wsB.send(JSON.stringify({
+      post_type: "message",
+      message_type: "group",
+      group_id: 10000,
+      user_id: 10001,
+      self_id: 10003,
+      message_id: 98002,
+      message: [{ type: "text", data: { text: "/room status" } }],
+    }));
+    await waitFor(() => notices.some(n => n.code === "ingress-failover"), "ingress-failover-triggered");
+    assert.equal(bridge.room.activeIngressAccountKey(), "account-b");
+    await waitFor(() => actions.some(a => a.account === "account-b" && a.text.includes("房间状态：")), "failover-status-ack");
+  } finally {
+    wsA?.terminate();
+    wsB?.terminate();
+    await bridge.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

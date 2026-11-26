@@ -242,27 +242,34 @@ export class VoiceRoom {
       this.recentObservedImageUrls.set(entry.messageRowId, entry);
     }
   }
+  activeIngressAccountKey(): string {
+    if (this.online.has(this.config.ingressAccountKey)) return this.config.ingressAccountKey;
+    for (const character of this.config.characters) {
+      if (this.online.has(character.accountKey)) return character.accountKey;
+    }
+    return this.config.ingressAccountKey;
+  }
   setOnline(accountKey: string, value: boolean): void {
     if (!this.config.characters.some(c => c.accountKey === accountKey)) throw new Error("room-account-unknown");
+    const prevIngress = this.activeIngressAccountKey();
     if (value) {
       this.online.add(accountKey);
-      if (this.online.has(this.config.ingressAccountKey)) {
+      if (this.online.size > 0) {
         this.wakeLifecycleGenerations();
         this.wakeLifecycleDelivery();
       }
     } else {
       this.online.delete(accountKey);
-      if (accountKey === this.config.ingressAccountKey) {
+      if (this.online.size === 0 || accountKey === prevIngress) {
         this.cancelLifecycleConnectionWork();
       } else {
         this.cancelLifecycleAccountWork(accountKey);
       }
     }
   }
-  /** Read-only readiness gate: ready once recovery/control init completes and ingress account is online. */
+  /** Read-only readiness gate: ready once recovery/control init completes and at least one account is online. */
   get ready(): boolean {
-    return !this.closed && this.workerPhase === "ready"
-      && this.online.has(this.config.ingressAccountKey);
+    return !this.closed && this.workerPhase === "ready" && this.online.size > 0;
   }
   private controlResult(kind: RoomControlResult["kind"], action: RoomControlAction, reason: string | null,
     state: RoomControlState, cancelledQueued = 0, cancelledActive = false): RoomControlResult {
@@ -378,7 +385,7 @@ export class VoiceRoom {
   /** Worker-only lifecycle ingress. Old Session/Stop/Pause/Resume commands are unreachable. */
   receiveLifecycle(input: RoomInput, policy: RoomQueuePolicy): RoomReceipt {
     if (this.consumer !== "lifecycle" || !this.ready || this.closed
-      || input.accountKey !== this.config.ingressAccountKey) return "rejected";
+      || input.accountKey !== this.activeIngressAccountKey()) return "rejected";
     const token = this.lifecycleOwnerToken;
     if (!token) return "rejected";
     const text = input.text.trim();
@@ -631,7 +638,7 @@ export class VoiceRoom {
       const control = this.lifecycleControl();
       return this.lifecycleOwnerLive() && !control.paused && control.executionRevision === revision
         && control.epoch === this.readyEpoch
-        && this.online.has(this.config.ingressAccountKey)
+        && this.online.size > 0
         && (accountKey === undefined || this.online.has(accountKey));
     } catch { return false; }
   }
@@ -657,7 +664,7 @@ export class VoiceRoom {
     }
     return this.lifecycleOwnerLiveStrict() && !control.paused && control.executionRevision === revision
       && control.epoch === this.readyEpoch
-      && this.online.has(this.config.ingressAccountKey)
+      && this.online.size > 0
       && (accountKey === undefined || this.online.has(accountKey));
   }
   private onLifecyclePauseChange(paused: boolean): void {
@@ -1154,7 +1161,7 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
       this.store.settleLifecycleGeneration(turn.turnId, "failed", reason, ownerToken, this.now());
     };
     try {
-      if (!this.online.has(character.accountKey) && this.online.has(this.config.ingressAccountKey)) {
+      if (!this.online.has(character.accountKey) && this.online.size > 0) {
         if (this.lifecycleOwnerLive() && this.store.lifecycleControlState().executionRevision === revision) {
           this.store.settleLifecycleGeneration(turn.turnId, "failed", "account_offline", ownerToken, this.now());
         }
@@ -1546,7 +1553,7 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
   }
   private async deliverLifecycleText(item: Readonly<LifecycleDeliveryItem>, ownerToken: string,
     signal: AbortSignal): Promise<void> {
-    if (!this.online.has(item.character.accountKey) && this.online.has(this.config.ingressAccountKey)
+    if (!this.online.has(item.character.accountKey) && this.online.size > 0
       && this.lifecycleRevisionLiveStrict(item.request.executionRevision)) {
       this.settleLifecycleDelivery(item, "lifecycle_account_offline_settle_failed", () => {
         this.store.finishLifecycleSegment(item.segment.segmentId, "failed", "account_offline", ownerToken, this.now());
@@ -1573,7 +1580,7 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
   }
   private async deliverLifecycleAudio(item: Readonly<LifecycleDeliveryItem>, ownerToken: string,
     signal: AbortSignal): Promise<void> {
-    if (!this.online.has(item.character.accountKey) && this.online.has(this.config.ingressAccountKey)
+    if (!this.online.has(item.character.accountKey) && this.online.size > 0
       && this.lifecycleRevisionLiveStrict(item.request.executionRevision)) {
       this.settleLifecycleTextOnly(item, "account_offline", ownerToken, this.now());
       return;

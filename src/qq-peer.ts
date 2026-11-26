@@ -12,6 +12,7 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>;
   resolve: (id: string) => void;
   reject: (error: QqApiError) => void;
+  resolveRaw?: (data: unknown) => void;
 }
 export type QqAttemptObservation = { kind: "ack"; messageId: string } | { kind: "rejected" | "uncertain" };
 export interface QqAttemptOptions {
@@ -71,6 +72,12 @@ export class QqPeer {
         const pending = this.take(value.echo);
         if (!pending) return;
         const result = value as Record<string, unknown>;
+        if (pending.resolveRaw) {
+          if (result.status === "ok" && result.retcode === 0) pending.resolveRaw(result.data);
+          else pending.reject(new QqApiError(result.status === "failed" && typeof result.retcode === "number" &&
+            result.retcode !== 0 && result.retcode !== 1 ? "api-rejected" : "api-unconfirmed"));
+          return;
+        }
         const data = result.data as Record<string, unknown> | number | string | null;
         const messageId = data && typeof data === "object"
           ? qqMessageId((data as Record<string, unknown>).message_id)
@@ -180,6 +187,19 @@ export class QqPeer {
     return new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => this.take(echo)?.reject(new QqApiError("api-timeout")), this.timeoutMs);
       this.pending.set(echo, { resolve, reject, timer });
+      try {
+        this.socket.send(JSON.stringify({ action, params, echo }), error => {
+          if (error) this.take(echo)?.reject(new QqApiError("disconnected"));
+        });
+      } catch { this.take(echo)?.reject(new QqApiError("disconnected")); }
+    });
+  }
+  requestData(action: "get_status", params: Record<string, unknown> = {}): Promise<unknown> {
+    if (!this.open || this.socket.bufferedAmount > 1024 * 1024) return Promise.reject(new QqApiError("disconnected"));
+    const echo = randomUUID();
+    return new Promise<unknown>((resolveRaw, reject) => {
+      const timer = setTimeout(() => this.take(echo)?.reject(new QqApiError("api-timeout")), this.timeoutMs);
+      this.pending.set(echo, { resolve: () => {}, reject, resolveRaw, timer });
       try {
         this.socket.send(JSON.stringify({ action, params, echo }), error => {
           if (error) this.take(echo)?.reject(new QqApiError("disconnected"));
