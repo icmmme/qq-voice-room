@@ -8,6 +8,7 @@ import { createRoomWebToolkit } from "../src/voice-room/web.js";
 import { createRoomImageFetcher } from "../src/voice-room/image.js";
 import { startRoomQq } from "../src/voice-room/qq-server.js";
 import { roomPublicPolicy } from "../src/voice-room/public-policy.js";
+import { RoomMemoryStore } from "../src/voice-room/memory.js";
 import { readFishConfig, fishSynthesizer, FishTtsError } from "../src/voice-room/fish.js";
 import { activateRoomProxy, discoverRoomProxy, RoomProxyError } from "../src/voice-room/proxy.js";
 import { calculateContextBudget, selectRoomContextWindow } from "../src/prompting/context-budget.js";
@@ -27,6 +28,8 @@ async function main() {
   const policy = roomPublicPolicy(settings, model, resolve(file), fish
     ? [fish.apiKey, fish.baseUrl, ...fish.voices.map(v => v.referenceId)] : []);
   for (const c of settings.room.characters) policy.persona(c);
+  const memoryStore = new RoomMemoryStore(settings.dataDir, { permitsText: policy.permitsText });
+  const memoryEntryCount = memoryStore.list().length;
   const contextWindow = selectRoomContextWindow({
     roomCap: settings.room.limits.contextTokens,
     roomCapSource: settings.room.contextWindowSource,
@@ -71,12 +74,13 @@ async function main() {
     tools: web.hasSearch ? "web_search,web_fetch" : "web_fetch",
     visionMode: model.visionModelId ? "dedicated" : model.modelSupportsVision !== false ? "primary" : "disabled",
     providerRetry: "none",
+    memoryEntryCount,
   };
   const proxy = discoverRoomProxy();
   const bypassWarning = proxy.summary.ignoredBypassRuleCount
     ? " 未支持的绕过规则未生效，请核对内网域名/IP。" : "";
   if (action === "check") {
-    console.log(`房间配置有效：两账号、两份公开人设、模型格式有效；${fish ? "Fish 配置格式有效（未验证连通性/音色）" : "仅文字"}；lifecycle Worker 两账号就绪后进入 mention_only。`);
+    console.log(`房间配置有效：两账号、两份公开人设、模型格式有效；${fish ? "Fish 配置格式有效（未验证连通性/音色）" : "仅文字"}；长期记忆 ${memoryEntryCount} 条；lifecycle Worker 两账号就绪后进入 mention_only。`);
     if (deliveryModes.effectiveDeliveryMode === null) console.log("未配置 deliveryMode，启动时沿用存储的投递模式。");
     console.log(JSON.stringify(contextDiagnostic));
     console.log(`代理诊断：来源=${proxy.summary.source}，启用=${proxy.summary.enabled ? "是" : "否"}，绕过规则=${proxy.summary.bypassRuleCount} 条，忽略=${proxy.summary.ignoredBypassRuleCount} 条。${bypassWarning}`);
@@ -94,6 +98,7 @@ async function main() {
       ...policy,
       web,
       imageFetcher: createRoomImageFetcher({ timeoutMs: model.webTimeoutMs }),
+      memoryStore,
       lifecycleModel: {
         visionCapable: hasVisionModel(model),
         generate: roomLifecycleGenerator({ ...model, contextWindow: room.limits.contextTokens },
@@ -111,7 +116,7 @@ async function main() {
   const entryMode = deliveryModes.effectiveDeliveryMode === "both" ? "文字＋语音"
     : deliveryModes.effectiveDeliveryMode === "text" ? "文字" : "";
   console.log(`房间${entryMode}入口已启动，端口 ${settings.port}；等待两个 NapCat Universal 反向连接。`);
-  console.log(`lifecycle Worker 两账号就绪后进入 mention_only；仅支持 text/both，仅配置 ownerId 可切换模式；联网工具：${web.hasSearch ? "web_search+web_fetch" : "web_fetch"}。Ctrl+C 关闭并归账。`);
+  console.log(`lifecycle Worker 两账号就绪后进入 mention_only；仅支持 text/both，仅配置 ownerId 可切换模式；长期记忆：${memoryEntryCount} 条；联网工具：${web.hasSearch ? "web_search+web_fetch" : "web_fetch"}。Ctrl+C 关闭并归账。`);
   let stopping = false;
   const stop = () => {
     if (stopping) return; stopping = true;

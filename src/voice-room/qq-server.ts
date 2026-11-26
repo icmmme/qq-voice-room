@@ -12,6 +12,8 @@ import { VoiceRoom, type RoomLifecycleModelPort } from "./runtime.js";
 import type { RoomAmbientPlanner } from "./participation-planner.js";
 import type { RoomWebToolkit } from "./web.js";
 import type { RoomImageFetcher } from "./image.js";
+import { shouldDeliverAsForwardCard } from "./delivery-policy.js";
+import { formatMemorySummary, parseMemoryCommand, RoomMemoryStore } from "./memory.js";
 import { RoomSendError, type RoomControlAction, type RoomDependencies, type RoomInput,
   type RoomParticipationMode, type RoomPrompt } from "./types.js";
 import { roomRecord } from "./fish.js";
@@ -43,7 +45,12 @@ const equal = (a: string, b: string) => {
 export async function startRoomQq(settings: RoomQqSettings,
   deps: Pick<RoomDependencies, "persona" | "permitsText" | "permitsPrompt" | "now" | "onContextCompacted">
     & Partial<Pick<RoomDependencies, "generate" | "translateVoice">>
-    & { lifecycleModel?: RoomLifecycleModelPort; web?: RoomWebToolkit; imageFetcher?: RoomImageFetcher },
+    & {
+      lifecycleModel?: RoomLifecycleModelPort;
+      web?: RoomWebToolkit;
+      imageFetcher?: RoomImageFetcher;
+      memoryStore?: RoomMemoryStore;
+    },
   onNotice: (notice: RoomQqNotice) => void = () => {},
   voice?: { synthesize: RoomDependencies["synthesize"] },
   options: { disconnectGraceMs?: number; offlineAlertMs?: number; startupSingleAccountMs?: number } = {}) {
@@ -62,6 +69,8 @@ export async function startRoomQq(settings: RoomQqSettings,
     throw new Error("room-worker-config-invalid");
   }
   const workerQueue = workerSelected ? checkedWorkerQueue(settings.workerQueue) : undefined;
+  const memoryStore = deps.memoryStore
+    ?? (workerSelected ? new RoomMemoryStore(settings.dataDir, { permitsText: deps.permitsText, now: deps.now }) : undefined);
   // Reuse the lifecycle model endpoint through its existing JSON envelope. This
   // keeps production on the same model/config as lifecycle generation and adds
   // no second provider, dependency, config field or test-only entry point.
@@ -129,6 +138,7 @@ export async function startRoomQq(settings: RoomQqSettings,
     void room.startLifecycleProductionWorker({ model: deps.lifecycleModel!, ambientPlanner,
       ...(deps.web ? { web: deps.web } : {}),
       ...(deps.imageFetcher ? { imageFetcher: deps.imageFetcher } : {}),
+      ...(memoryStore ? { memoryStore } : {}),
       apiTimeoutMs: settings.apiTimeoutMs,
       closePolicy, dispatch: async request => {
         if (closing || request.signal.aborted) throw new RoomSendError("rejected");
@@ -140,11 +150,16 @@ export async function startRoomQq(settings: RoomQqSettings,
           released: request.released, physicalSettled: request.physicalSettled, notSent: request.notSent,
           capacity: closePolicy.perAccountCapacity,
         };
+        const splitFallbackNodes = request.item.segment.text.split(/\n{2,}/).map(part => part.trim()).filter(Boolean);
         const forwardNodes = request.medium === "text"
           ? (request.forwardNodes?.length
             ? request.forwardNodes
-            : request.item.segment.deliveryMode === "text" && [...request.item.segment.text].length > 200
-              ? request.item.segment.text.split(/\n{2,}/).map(part => part.trim()).filter(Boolean)
+            : request.item.segment.deliveryMode === "text"
+              && shouldDeliverAsForwardCard({
+                text: request.item.segment.text,
+                segmentCount: splitFallbackNodes.length,
+              })
+              ? splitFallbackNodes
               : undefined)
           : undefined;
         if (forwardNodes && forwardNodes.length > 0) {
@@ -244,9 +259,17 @@ export async function startRoomQq(settings: RoomQqSettings,
           notice("received", receipt);
           if (receipt === "control") {
             const trimmed = input.text.trim();
+            const memoryFeedback = room.consumeMemoryControlFeedback(input);
+            const memoryCmd = parseMemoryCommand(trimmed, { permitsText: deps.permitsText });
             const lifecycle = room.store.lifecycleControlState();
             let text: string;
-            if (/^\/room\s+status$/.test(trimmed)) {
+            if (memoryFeedback !== undefined) {
+              text = memoryFeedback;
+            } else if (memoryCmd?.kind === "list") {
+              text = memoryStore
+                ? formatMemorySummary(memoryStore.list(), { permitsText: deps.permitsText })
+                : "长期记忆未启用。";
+            } else if (/^\/room\s+status$/.test(trimmed)) {
               const st = workerStatus();
               text = st
                 ? `房间状态：模式 ${lifecycle.mode}｜投递 ${st.effectiveDeliveryMode}｜在线 ${st.connectedAccountCount}/${config.characters.length}｜${st.textCanProgress ? "文字正常" : "文字未就绪"}｜${st.audioBlockReason ? `语音受阻(${st.audioBlockReason})` : "语音正常"}${st.faultReason ? `｜故障(${st.faultReason})` : ""}`
@@ -258,7 +281,21 @@ export async function startRoomQq(settings: RoomQqSettings,
             } else {
               text = `房间模式已切换为 ${lifecycle.mode === "ambient" ? "ambient" : "mention_only"}。`;
             }
-            void acknowledge(account.accountKey, text);
+            if (deps.permitsText(text)) {
+              void acknowledge(account.accountKey, text);
+            }
+          } else if (receipt === "rejected" && input.senderId === config.ownerId && input.text.trim().startsWith("/room")) {
+            const memoryCmd = parseMemoryCommand(input.text.trim(), { permitsText: deps.permitsText });
+            if (memoryCmd?.kind === "rejected") {
+              void acknowledge(account.accountKey, "未保存：记忆内容未通过隐私或安全检查。");
+            } else if (memoryCmd?.kind === "invalid") {
+              const usage = memoryCmd.action === "remember"
+                ? "用法：/room remember <要记住的事实>"
+                : memoryCmd.action === "forget"
+                  ? "用法：/room forget <编号或关键词>"
+                  : "用法：/room memory";
+              void acknowledge(account.accountKey, `指令格式无效（${usage}）。`);
+            }
           }
         } catch {
           try {

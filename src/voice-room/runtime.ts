@@ -19,6 +19,22 @@ import { ROOM_LIFECYCLE_DEEP_MAX_SEGMENTS, ROOM_LIFECYCLE_DEEP_MAX_TOKENS, ROOM_
 import { dynamicPageTokenBudget, extractPublicUrls, isDeepRequest, WEB_HARD_CHAR_CEILING,
   type RoomWebToolkit } from "./web.js";
 import { fetchRoomImages, type RoomImageFetcher } from "./image.js";
+import {
+  displayTextWithImagePlaceholder,
+  isImageFollowUpText,
+  RECENT_IMAGE_MAX_ENTRIES,
+  RECENT_IMAGE_TTL_MS,
+  RecentImageCache,
+} from "./image-context.js";
+import { shouldDeliverAsForwardCard } from "./delivery-policy.js";
+import {
+  DEFAULT_SELECT_MAX_ITEMS,
+  DEFAULT_SELECT_MAX_TOKENS,
+  formatMemoryBlock,
+  formatMemorySummary,
+  parseMemoryCommand,
+  RoomMemoryStore,
+} from "./memory.js";
 import { loadRoomSkill, selectRoomSkill } from "./skills.js";
 import {
   AMBIENT_HISTORY_LIMIT,
@@ -59,6 +75,7 @@ export interface RoomLifecycleWorker {
   model: RoomLifecycleModelPort;
   web?: RoomWebToolkit;
   imageFetcher?: RoomImageFetcher;
+  memoryStore?: RoomMemoryStore;
   ambientPlanner?: RoomAmbientPlanner;
   apiTimeoutMs: number;
   closePolicy?: Partial<RoomClosePolicy>;
@@ -72,7 +89,6 @@ const LIFECYCLE_GENERATION_LIMIT = 4;
 const LIFECYCLE_OWNER_LEASE_MS = 5 * 60 * 1000;
 const LIFECYCLE_RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const AMBIENT_GROUP_QUESTION_MAX_CHARS = 80;
-const LIFECYCLE_FORWARD_CHAR_THRESHOLD = 200;
 const LIFECYCLE_DEEP_SEGMENT_MAX_CHARS = 4000;
 const LIFECYCLE_WEB_FETCH_BUDGET_MS = 25000;
 
@@ -133,6 +149,17 @@ export class VoiceRoom {
   private readonly lifecycleForwardNodes = new Map<string, readonly string[]>();
   /** Validated public image URLs per active request; strictly memory-only and never persisted to SQLite. */
   private readonly lifecycleInputImages = new Map<string, readonly string[]>();
+  /** Memory-only recent image cache & observed URL cache (max 8 entries, 10-min TTL, cleared on close). */
+  private readonly recentImageCache = new RecentImageCache();
+  private readonly recentObservedImageUrls = new Map<number, {
+    readonly messageRowId: number;
+    readonly platformMessageId: string;
+    readonly createdAt: number;
+    readonly urls: readonly string[];
+  }>();
+  private readonly recentImageCounts = new Map<number, { readonly count: number; readonly createdAt: number }>();
+  private readonly lifecycleControlFeedback = new Map<string, string>();
+  private memoryStore?: RoomMemoryStore;
   private readonly lifecycleGenerationTasks = new Set<Promise<void>>();
   private readonly ambientTimers = new Set<ReturnType<typeof setTimeout>>();
   private ambientPlan?: { readonly controller: AbortController; readonly promise: Promise<void> };
@@ -140,16 +167,80 @@ export class VoiceRoom {
   private readonly participationPolicy: ParticipationPolicy;
 
   constructor(file: string, config: RoomConfig, private readonly deps: RoomDependencies,
-    selection: { execution?: "lifecycle" } = {}) {
+    selection: { execution?: "lifecycle"; memoryStore?: RoomMemoryStore } = {}) {
     if (selection.execution !== undefined && selection.execution !== "lifecycle") throw new Error("room-consumer-invalid");
     this.config = checkRoomConfig(config);
     this.participationPolicy = new ParticipationPolicy(this.config);
     this.now = deps.now ?? Date.now;
+    this.memoryStore = selection.memoryStore;
     this.store = new RoomStore(file, this.config);
     try {
       if (this.config.deliveryMode !== undefined) this.store.setDeliveryMode(this.config.deliveryMode);
       if (deps.voiceAvailable === false) this.store.setVoice(false);
     } catch (error) { this.store.close(); throw error; }
+  }
+  consumeMemoryControlFeedback(input: RoomInput): string | undefined {
+    const key = this.store.eventKey(input);
+    const feedback = this.lifecycleControlFeedback.get(key);
+    if (feedback !== undefined) this.lifecycleControlFeedback.delete(key);
+    return feedback;
+  }
+  private setMemoryControlFeedback(eventKey: string, feedback: string): void {
+    this.lifecycleControlFeedback.delete(eventKey);
+    this.lifecycleControlFeedback.set(eventKey, feedback);
+    if (this.lifecycleControlFeedback.size > 16) {
+      const oldest = this.lifecycleControlFeedback.keys().next().value;
+      if (oldest !== undefined) this.lifecycleControlFeedback.delete(oldest);
+    }
+  }
+  private pruneObservedImageUrls(now: number): void {
+    for (const [rowId, entry] of this.recentObservedImageUrls) {
+      if (now - entry.createdAt >= RECENT_IMAGE_TTL_MS) {
+        this.recentObservedImageUrls.delete(rowId);
+      }
+    }
+    for (const [rowId, entry] of this.recentImageCounts) {
+      if (now - entry.createdAt >= RECENT_IMAGE_TTL_MS) {
+        this.recentImageCounts.delete(rowId);
+      }
+    }
+  }
+  private rememberImageCount(messageRowId: number, count: number, createdAt: number): void {
+    if (!Number.isSafeInteger(messageRowId) || messageRowId <= 0 || count <= 0) return;
+    this.pruneObservedImageUrls(createdAt);
+    this.recentImageCounts.delete(messageRowId);
+    this.recentImageCounts.set(messageRowId, { count, createdAt });
+    while (this.recentImageCounts.size > 32) {
+      const oldest = this.recentImageCounts.keys().next().value;
+      if (oldest === undefined) break;
+      this.recentImageCounts.delete(oldest);
+    }
+  }
+  private rememberObservedImageUrls(messageRowId: number, platformMessageId: string, createdAt: number,
+    urls: readonly string[]): void {
+    const id = platformMessageId.trim();
+    if (!id || urls.length === 0 || !Number.isFinite(createdAt)) return;
+    this.pruneObservedImageUrls(createdAt);
+    for (const [existingRowId, existing] of this.recentObservedImageUrls) {
+      if (existing.platformMessageId === id || existingRowId === messageRowId) {
+        this.recentObservedImageUrls.delete(existingRowId);
+      }
+    }
+    this.recentObservedImageUrls.set(messageRowId, Object.freeze({
+      messageRowId,
+      platformMessageId: id,
+      createdAt,
+      urls: Object.freeze([...urls]),
+    }));
+    const sorted = [...this.recentObservedImageUrls.values()]
+      .sort((left, right) => left.createdAt - right.createdAt || left.messageRowId - right.messageRowId);
+    const trimmed = sorted.length > RECENT_IMAGE_MAX_ENTRIES
+      ? sorted.slice(sorted.length - RECENT_IMAGE_MAX_ENTRIES)
+      : sorted;
+    this.recentObservedImageUrls.clear();
+    for (const entry of trimmed) {
+      this.recentObservedImageUrls.set(entry.messageRowId, entry);
+    }
   }
   setOnline(accountKey: string, value: boolean): void {
     if (!this.config.characters.some(c => c.accountKey === accountKey)) throw new Error("room-account-unknown");
@@ -295,6 +386,37 @@ export class VoiceRoom {
       || (text && !this.permits(text))) return "rejected";
     if (text.startsWith("/room")) {
       if (input.senderId !== this.config.ownerId) return "rejected";
+      const memoryCmd = parseMemoryCommand(text, { permitsText: candidate => this.permits(candidate) });
+      if (memoryCmd) {
+        if (!this.memoryStore) return "rejected";
+        if (memoryCmd.kind === "invalid" || memoryCmd.kind === "rejected") return "rejected";
+        const eventKey = this.store.eventKey(input);
+        if (memoryCmd.kind === "remember") {
+          const remembered = this.memoryStore.remember({
+            scope: memoryCmd.scope,
+            content: memoryCmd.fact,
+            now: this.now(),
+          });
+          if (!remembered.ok) return "rejected";
+          const verb = remembered.action === "updated" ? "已更新" : "已记住";
+          this.setMemoryControlFeedback(eventKey, `${verb} [${remembered.entry.id}]：${remembered.entry.content}`);
+          return "control";
+        }
+        if (memoryCmd.kind === "forget") {
+          const forgotten = this.memoryStore.forget(memoryCmd.query, { now: this.now() });
+          const feedback = forgotten.removed.length > 0
+            ? `已遗忘 ${forgotten.removed.length} 条长期记忆（剩余 ${forgotten.remaining} 条）。`
+            : "未找到匹配的长期记忆。";
+          this.setMemoryControlFeedback(eventKey, feedback);
+          return "control";
+        }
+        const entries = this.memoryStore.list({ now: this.now() });
+        this.setMemoryControlFeedback(
+          eventKey,
+          formatMemorySummary(entries, { permitsText: candidate => this.permits(candidate) }),
+        );
+        return "control";
+      }
       if (/^\/room\s+status$/.test(text)) return "control";
       if (/^\/room\s+stop$/.test(text)) {
         try {
@@ -358,6 +480,13 @@ export class VoiceRoom {
           : quotedCharacter && selectedCharacterIds.length ? "quoted_direct" : null,
         enqueue: selectedCharacterIds.length > 0, deliveryMode, policy,
       });
+      if (admitted.messageRowId !== undefined && input.images?.length) {
+        const imageTimestamp = this.now();
+        this.rememberImageCount(admitted.messageRowId, input.images.length, imageTimestamp);
+        if (admitted.kind === "record_only") {
+          this.rememberObservedImageUrls(admitted.messageRowId, input.messageId, imageTimestamp, input.images);
+        }
+      }
       if (admitted.kind === "enqueue") {
         if (admitted.request && input.images?.length) {
           this.lifecycleInputImages.set(admitted.request.requestId, Object.freeze([...input.images]));
@@ -423,6 +552,7 @@ export class VoiceRoom {
     this.workerPhase = "starting";
     this.closePolicy = checkClosePolicy(options.closePolicy);
     this.lifecycleWorker = options;
+    if (options.memoryStore !== undefined) this.memoryStore = options.memoryStore;
     this.store.setLifecyclePauseListener(paused => this.onLifecyclePauseChange(paused));
     this.store.beginDeliveryExecution();
     const fence = {};
@@ -812,6 +942,30 @@ export class VoiceRoom {
     delete payload.search;
     delete payload.github;
     delete payload.directPage;
+    const now = this.now();
+    this.pruneObservedImageUrls(now);
+    const cachedImages = this.recentImageCache.list(now);
+    const imageCountForRow = (rowId: unknown): number => {
+      if (typeof rowId !== "number" || !Number.isSafeInteger(rowId)) return 0;
+      const hit = cachedImages.find(entry => entry.messageRowId === rowId);
+      if (hit) return hit.count;
+      return this.recentImageCounts.get(rowId)?.count ?? 0;
+    };
+    if (payload.quotedMessage && typeof payload.quotedMessage === "object") {
+      const quoted = payload.quotedMessage as { id?: unknown; text?: unknown };
+      const imgCount = imageCountForRow(quoted.id);
+      if (imgCount > 0 && typeof quoted.text === "string") {
+        quoted.text = displayTextWithImagePlaceholder(quoted.text, imgCount);
+      }
+    }
+    if (Array.isArray(payload.visibleHistory)) {
+      for (const item of payload.visibleHistory as Array<{ id?: unknown; text?: unknown }>) {
+        const imgCount = imageCountForRow(item.id);
+        if (imgCount > 0 && typeof item.text === "string") {
+          item.text = displayTextWithImagePlaceholder(item.text, imgCount);
+        }
+      }
+    }
     if (options.imageNotice) {
       payload.attachedImageCount = options.imageNotice.kind === "partial"
         ? options.imageNotice.loaded + options.imageNotice.failed
@@ -843,15 +997,31 @@ export class VoiceRoom {
         ? "当前仅有 web_fetch 可用于读取明确给出的公开链接，没有联网搜索引擎；未抓到正文时请坦诚说明，不要声称已联网搜索。"
         : "";
     const skillText = loadRoomSkill(selectRoomSkill({ deep, hasWebEvidence, hasUrls }));
-    let systemPrompt: string;
-    if (deep) {
-      payload.outputProtocol = `Return ONLY one JSON object matching {"kind":"reply","segments":["paragraph 1",...]}. `
-        + `Use 1 to 5 natural segments matching the depth and mood of the request (hard upper bound ${maxSegments}; keep banter/meme/gossip tight, expand into multi-paragraph depth for serious technical articles or complex questions). `
-        + `Each segment must be non-empty and at most ${maxChars} Unicode characters. A real explicit @ must not be skipped.`;
-      systemPrompt = `你正在公开 QQ 群中扮演当前指定的一位虚构角色，始终以该角色自己的脾气、口吻和视角自然接话或拆解问题。
+    const maxInputTokens = this.config.limits.contextTokens - lifecycleOutputReserve - 1024
+      - ROOM_LIFECYCLE_PROTOCOL_RESERVE_TOKENS;
+    const memoryTokenBudget = maxInputTokens > 0
+      ? Math.min(DEFAULT_SELECT_MAX_TOKENS, Math.max(0, Math.floor(maxInputTokens * 0.25)))
+      : DEFAULT_SELECT_MAX_TOKENS;
+    let selectedMemories = this.memoryStore && memoryTokenBudget > 0
+      ? [...this.memoryStore.selectRelevantMemories({
+        queryText: target.text,
+        senderKey: request.senderKey,
+        maxItems: DEFAULT_SELECT_MAX_ITEMS,
+        maxTokens: memoryTokenBudget,
+        now,
+        permitsText: text => this.permits(text),
+      })]
+      : [];
+    const buildSystemPrompt = (memoryEntries: typeof selectedMemories): string => {
+      const memoryBlock = memoryEntries.length > 0
+        ? formatMemoryBlock(memoryEntries, { permitsText: text => this.permits(text) })
+        : "";
+      const memorySection = memoryBlock ? `\n\n## 长期记忆（跨天事实与偏好）\n${memoryBlock}` : "";
+      if (deep) {
+        return `你正在公开 QQ 群中扮演当前指定的一位虚构角色，始终以该角色自己的脾气、口吻和视角自然接话或拆解问题。
 当前角色：${character.name}
 
-${persona}
+${persona}${memorySection}
 
 ## 回复指南（Skill）
 ${skillText}
@@ -862,21 +1032,14 @@ ${skillText}
 3. 真实明确 @ 必须形成回应义务；不能 skip，也不能敷衍了事；不得输出动作旁白、角色名前缀或成人内容。
 4. 事实依据：${hasWebEvidence ? "输入 JSON 中的 webEvidence 是已抓取的公开网页/GitHub/X 原文。请严格基于这些原文提取干货或槽点；若部分内容被截断或抓取失败，坦诚说明，绝不编造。" : hasUrls ? "用户发了链接但本次未能抓到正文，请按角色口吻坦诚告知无法读取该链接，不要凭空猜测内容。" : "请基于可靠知识严谨分析。"}${toolFactHint}
 5. 只返回 JSON：{"kind":"reply","segments":["第一段",...]}。${imageInstruction}`;
-    } else {
-      const segmentRule = maxSegments === 1 ? "exactly one segment"
-        : hasSearchTools ? `1 to ${maxSegments} segments` : "one or two character lines";
-      payload.outputProtocol = `Return ONLY one JSON object matching {"kind":"skip"} or `
-        + `{"kind":"reply","segments":[${maxSegments === 1 ? '"one short segment"' : '"one or two character lines"'}]}. `
-        + `Use ${segmentRule}. Each segment must be non-empty and at most ${maxChars} Unicode characters. ${hasSearchTools ? "" : "No tools, "}URLs, markdown, `
-        + `role prefixes, or extra fields. ` + (ambient ? "Choose skip if there is no appropriate reply."
-          : "A real explicit @ must not be skipped.");
+      }
       const nonDeepToolLine = hasSearchTools
         ? "日常闲聊与已知常识请直接自然简短回复，不要无故联网；若遇到你不确定的外部事实、新项目、近况或群友让你查的内容，可自主调用 web_search（必要时用 web_fetch 读原文）核实后如实回答。"
         : "本请求完全离线且 tools-free：不得调用、声称调用或补写任何搜索、网页、GitHub、文件或身份工具。";
-      systemPrompt = `你正在公开群聊中扮演当前指定的一位虚构角色，只生成该角色自己的台词。
+      return `你正在公开群聊中扮演当前指定的一位虚构角色，只生成该角色自己的台词。
 当前角色：${character.name}
 
-${persona}
+${persona}${memorySection}
 
 ${skillText}
 
@@ -886,9 +1049,21 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
     : "真实明确 @ 必须形成回应义务；不能 skip 或留空；实在接不上也按角色本色简短回一句，别端客服腔。"}
 每条回复必须是${maxSegments === 1 ? "一段" : hasSearchTools ? "一到两段（若涉及查证总结可适当分段）" : "一到两段"}自然中文台词，${maxSegments === 1 ? "" : "闲聊不为凑数补第二段；"}不得输出动作旁白、角色名前缀、他人台词或成人内容。
 只返回 JSON：{"kind":"skip"} 或 {"kind":"reply","segments":["台词"]}。${imageInstruction}`;
+    };
+    if (deep) {
+      payload.outputProtocol = `Return ONLY one JSON object matching {"kind":"reply","segments":["paragraph 1",...]}. `
+        + `Use 1 to 5 natural segments matching the depth and mood of the request (hard upper bound ${maxSegments}; keep banter/meme/gossip tight, expand into multi-paragraph depth for serious technical articles or complex questions). `
+        + `Each segment must be non-empty and at most ${maxChars} Unicode characters. A real explicit @ must not be skipped.`;
+    } else {
+      const segmentRule = maxSegments === 1 ? "exactly one segment"
+        : hasSearchTools ? `1 to ${maxSegments} segments` : "one or two character lines";
+      payload.outputProtocol = `Return ONLY one JSON object matching {"kind":"skip"} or `
+        + `{"kind":"reply","segments":[${maxSegments === 1 ? '"one short segment"' : '"one or two character lines"'}]}. `
+        + `Use ${segmentRule}. Each segment must be non-empty and at most ${maxChars} Unicode characters. ${hasSearchTools ? "" : "No tools, "}URLs, markdown, `
+        + `role prefixes, or extra fields. ` + (ambient ? "Choose skip if there is no appropriate reply."
+          : "A real explicit @ must not be skipped.");
     }
-    const maxInputTokens = this.config.limits.contextTokens - lifecycleOutputReserve - 1024
-      - ROOM_LIFECYCLE_PROTOCOL_RESERVE_TOKENS;
+    let systemPrompt = buildSystemPrompt(selectedMemories);
     const history = Array.isArray(payload.visibleHistory)
       ? [...(payload.visibleHistory as Array<{ id?: unknown }>)] : [];
     let content = JSON.stringify(payload);
@@ -899,6 +1074,11 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
       history.splice(trimIndex, 1);
       payload.visibleHistory = history;
       content = JSON.stringify(payload);
+    }
+    while (maxInputTokens > 0 && selectedMemories.length > 0
+      && estimateTokens(systemPrompt + "\n" + content) > maxInputTokens) {
+      selectedMemories = selectedMemories.slice(0, -1);
+      systemPrompt = buildSystemPrompt(selectedMemories);
     }
     return Object.freeze({ ...base, systemPrompt,
       messages: Object.freeze([{ role: "user" as const, content }]) as RoomPrompt["messages"],
@@ -1012,25 +1192,85 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
       const imageUrls = this.lifecycleInputImages.get(request.requestId) ?? [];
       let fetchedImages: readonly ImageContent[] = [];
       let imageNotice: LifecycleImageNotice | undefined;
-      if (imageUrls.length > 0) {
-        if (this.lifecycleWorker?.model.visionCapable) {
-          const remainingForFetch = Math.max(1, Math.min(LIFECYCLE_WEB_FETCH_BUDGET_MS, request.expiresAt - this.now()));
-          const fetcher = this.lifecycleWorker.imageFetcher ?? fetchRoomImages;
-          try {
-            const batch = await this.callLifecycle(signal, remainingForFetch, child => fetcher(imageUrls, child));
-            fetchedImages = batch.images;
-            imageNotice = batch.images.length > 0 && batch.failed === 0
-              ? { kind: "loaded", count: batch.images.length }
-              : batch.images.length > 0
-                ? { kind: "partial", loaded: batch.images.length, failed: batch.failed }
-                : { kind: "fetch_failed", count: imageUrls.length };
-          } catch {
-            if (signal.aborted || !this.lifecycleRevisionLive(revision, character.accountKey)) return;
-            fetchedImages = [];
-            imageNotice = { kind: "fetch_failed", count: imageUrls.length };
+      const visionCapable = Boolean(this.lifecycleWorker?.model.visionCapable);
+      const loadFromUrls = async (
+        urls: readonly string[],
+        meta?: { readonly messageRowId: number; readonly platformMessageId: string; readonly createdAt: number },
+      ): Promise<void> => {
+        if (urls.length === 0) return;
+        if (!visionCapable) {
+          imageNotice = { kind: "vision_unconfigured", count: urls.length };
+          return;
+        }
+        const remainingForFetch = Math.max(1, Math.min(LIFECYCLE_WEB_FETCH_BUDGET_MS, request.expiresAt - this.now()));
+        const fetcher = this.lifecycleWorker?.imageFetcher ?? fetchRoomImages;
+        try {
+          const batch = await this.callLifecycle(signal, remainingForFetch, child => fetcher(urls, child));
+          fetchedImages = batch.images;
+          imageNotice = batch.images.length > 0 && batch.failed === 0
+            ? { kind: "loaded", count: batch.images.length }
+            : batch.images.length > 0
+              ? { kind: "partial", loaded: batch.images.length, failed: batch.failed }
+              : { kind: "fetch_failed", count: urls.length };
+          if (batch.images.length > 0 && meta) {
+            this.recentImageCache.remember({
+              messageRowId: meta.messageRowId,
+              platformMessageId: meta.platformMessageId,
+              createdAt: meta.createdAt,
+              count: batch.images.length,
+              images: batch.images,
+            }, this.now());
+            this.recentObservedImageUrls.delete(meta.messageRowId);
           }
+        } catch {
+          if (signal.aborted || !this.lifecycleRevisionLive(revision, character.accountKey)) return;
+          fetchedImages = [];
+          imageNotice = { kind: "fetch_failed", count: urls.length };
+        }
+      };
+      if (imageUrls.length > 0) {
+        await loadFromUrls(imageUrls, {
+          messageRowId: request.messageRowId,
+          platformMessageId: request.input.messageId,
+          createdAt: target?.createdAt ?? this.now(),
+        });
+      } else {
+        const now = this.now();
+        this.pruneObservedImageUrls(now);
+        const directObserved = this.recentObservedImageUrls.get(request.messageRowId);
+        if (directObserved) {
+          await loadFromUrls(directObserved.urls, directObserved);
         } else {
-          imageNotice = { kind: "vision_unconfigured", count: imageUrls.length };
+          const targetText = target?.text ?? "";
+          const quotedId = request.input.replyToMessageId?.trim();
+          const quotedCached = quotedId ? this.recentImageCache.get(quotedId, now) : null;
+          if (quotedCached) {
+            fetchedImages = quotedCached.images;
+            imageNotice = { kind: "loaded", count: quotedCached.count };
+          } else {
+            const quotedObserved = quotedId
+              ? [...this.recentObservedImageUrls.values()].find(entry => entry.platformMessageId === quotedId)
+              : undefined;
+            if (quotedObserved) {
+              await loadFromUrls(quotedObserved.urls, quotedObserved);
+            } else if (isImageFollowUpText(targetText)) {
+              const latestCached = this.recentImageCache.list(now).at(-1);
+              const latestObserved = [...this.recentObservedImageUrls.values()].at(-1);
+              if (latestObserved && (!latestCached || latestObserved.createdAt > latestCached.createdAt)) {
+                await loadFromUrls(latestObserved.urls, latestObserved);
+              } else {
+                const match = this.recentImageCache.resolveForFollowUp({
+                  quotedPlatformMessageId: quotedId,
+                  targetText,
+                  now,
+                });
+                if (match) {
+                  fetchedImages = match.images;
+                  imageNotice = { kind: "loaded", count: match.entry.count };
+                }
+              }
+            }
+          }
         }
       }
       if (signal.aborted || !this.lifecycleRevisionLive(revision, character.accountKey)) return;
@@ -1088,11 +1328,15 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
       }
       const segments = this.checkedLifecycleSegments(answer, maxSegments, maxChars);
       if (!segments) return fail("lifecycle_answer_invalid");
-      const totalChars = segments.reduce((sum, segment) => sum + [...segment].length, 0);
+      const joined = segments.join("\n\n");
       const shouldForward = request.source === "direct"
-        && (totalChars > LIFECYCLE_FORWARD_CHAR_THRESHOLD || segments.length >= 3 || webEvidence.length > 0);
+        && shouldDeliverAsForwardCard({
+          text: joined,
+          segmentCount: segments.length,
+          hasWebEvidence: webEvidence.length > 0,
+          deep,
+        });
       if (shouldForward) {
-        const joined = segments.join("\n\n");
         // Strategy A: long/deep replies pack into a single QQ forward card with zero TTS voice.
         if (this.store.completeLifecycleTurn(turn.turnId,
           Object.freeze([{ text: joined }]), "text", ownerToken, this.now(),
@@ -1749,7 +1993,15 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
     this.stopLifecycleRetention();
     this.closePromise = (async () => {
       try { await this.startupPromise?.catch(() => {}); }
-      finally { this.lifecycleInputImages.clear(); this.store.close(); this.workerPhase = "closed"; }
+      finally {
+        this.lifecycleInputImages.clear();
+        this.recentImageCache.clear();
+        this.recentObservedImageUrls.clear();
+        this.recentImageCounts.clear();
+        this.lifecycleControlFeedback.clear();
+        this.store.close();
+        this.workerPhase = "closed";
+      }
     })();
     return this.closePromise;
   }
@@ -1791,6 +2043,10 @@ ${ambient ? "这是主动参与的候选回复。没有合适内容时返回 ski
         finally {
           this.lifecycleAudioObservations.clear();
           this.lifecycleInputImages.clear();
+          this.recentImageCache.clear();
+          this.recentObservedImageUrls.clear();
+          this.recentImageCounts.clear();
+          this.lifecycleControlFeedback.clear();
           this.store.close();
           this.workerPhase = "closed";
         }

@@ -51,6 +51,7 @@ const reportedSpeakerLine = new RegExp(`^[^\\r\\n${colonLike}]+[${colonLike}]`, 
 const reportedSpeakerBlock = new RegExp(`^[^\\r\\n${colonLike}]+[${colonLike}]\\s*$`, "mu");
 const sharing = /(?:今天|刚刚|刚才|终于|最近).{0,40}(?:完成|搞定|做完|跑通|拿到|学会|通过|发现|做了|去了|买了|吃了|看了|听了)/;
 const normalize = (s: string) => s.toLowerCase().replace(/[\p{P}\p{S}\s]/gu, "");
+const trivialReaction = /^(?:嗯+|哦+|啊+|好+|哈+|呵+|嘻+|嘿+|收到(?:收到)?|谢谢(?:谢谢|啦|了)?|好的|好哒|好滴|行吧|行行行|ok+|yes|no|666+|233+|笑死|确实|懂了|明白了?)$/i;
 const silence = (reason: ParticipationReason): ParticipationDecision => ({ shouldReply: false, reason, maxTurns: 0 });
 
 function normalizeAddressText(text: string): string {
@@ -171,7 +172,7 @@ export class ParticipationPolicy {
     if (!ctx.online.has(this.config.ingressAccountKey)) return silence("offline");
     if (!ctx.hasBudget) return silence("budget");
     const text = latest.text.trim(), normalized = normalize(text);
-    if ([...normalized].length < 2 || /^(嗯+|哦+|啊+|好+|哈+|呵+|收到|谢谢|好的|行吧|ok|yes|no)$/i.test(normalized)) return silence("trivial");
+    if ([...normalized].length < 2 || trivialReaction.test(normalized)) return silence("trivial");
     if (pending.filter(m => normalize(m.text) === normalized).length > 1) return silence("repetition");
     const recent = ctx.history.filter(m => m.speakerType === "bot" && m.createdAt !== undefined
       && ctx.now - m.createdAt >= 0 && ctx.now - m.createdAt < FOLLOW_UP_MS);

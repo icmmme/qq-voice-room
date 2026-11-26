@@ -5553,7 +5553,7 @@ test("deep URL summary uses webEvidence, multi-paragraph output, QQ forward card
   }, () => {}, {
     synthesize: async () => {
       synthesizeCalls += 1;
-      return new Uint8Array([1, 2, 3]);
+      return Uint8Array.from([0x49, 0x44, 0x33, 0x03, 0x00, 0x01]);
     },
   });
 
@@ -6572,4 +6572,402 @@ test("parseDeepLifecycleAnswer repairs raw newlines, trailing commas, and unesca
     () => parseDeepLifecycleAnswer("stop", [{ type: "text", text: '{"kind":"reply","segments":' }]),
     (error: unknown) => error instanceof RoomModelError && error.code === "invalid-json",
   );
+});
+
+test("Stage 2 delivery policy: short <=280 char web-link banter stays chat bubble + TTS while >=3 segments or >280 chars uses forward card", async () => {
+  const { startRoomQq } = await import("../src/voice-room/qq-server.js");
+  const { createRoomWebToolkit } = await import("../src/voice-room/web.js");
+  const dir = mkdtempSync(join(tmpdir(), "qq-room-stage2-delivery-"));
+  const personaA = join(dir, "a.md");
+  const personaB = join(dir, "b.md");
+  writeFileSync(personaA, "你是毒舌吐槽役甲。");
+  writeFileSync(personaB, "你是接梗搭档乙。");
+
+  let synthesizeCalls = 0;
+  let replyMode: "short_banter" | "three_segments" | "over_280" = "short_banter";
+  const mockFetch = (async () => new Response(
+    "Title: Meme Post\nMarkdown Content:\nA short developer joke about tabs vs spaces.",
+    { status: 200, headers: { "content-type": "text/markdown" } },
+  )) as typeof fetch;
+
+  const settings = {
+    room: checkRoomConfig(roomConfig({ deliveryMode: "both" })),
+    dataDir: join(dir, "data"),
+    port: 0,
+    apiTimeoutMs: 500,
+    execution: "worker" as const,
+    workerQueue: QUEUE,
+    closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 200, releaseMs: 200, writeWaitMs: 50 },
+    accounts: [
+      { accountKey: "account-a", token: "token-aaaaaaaaaaaaaaaa", personaFile: personaA },
+      { accountKey: "account-b", token: "token-bbbbbbbbbbbbbbbb", personaFile: personaB },
+    ],
+  };
+
+  const bridge = await startRoomQq(settings, {
+    persona: c => c.id === "character-a" ? "你是毒舌吐槽役甲。" : "你是接梗搭档乙。",
+    permitsText: () => true,
+    web: createRoomWebToolkit({ fetchImpl: mockFetch }),
+    lifecycleModel: {
+      generate: async () => {
+        if (replyMode === "short_banter") {
+          return { kind: "reply", segments: ["哈哈哈哈这梗也太真实了，写代码缩进确实能吵一辈子。"] };
+        }
+        if (replyMode === "three_segments") {
+          return { kind: "reply", segments: ["第一句短梗。", "第二句吐槽。", "第三句收尾。"] };
+        }
+        return { kind: "reply", segments: ["这是一段故意超过两百八十字的详细回复，".repeat(18)] };
+      },
+    },
+  }, () => {}, {
+    synthesize: async () => {
+      synthesizeCalls += 1;
+      return Uint8Array.from([0x49, 0x44, 0x33, 0x03, 0x00, 0x01]);
+    },
+  });
+
+  const actions: Array<{ action: string; params: Record<string, unknown> }> = [];
+  const connect = (accountKey: string, selfId: string, token: string) => new Promise<InstanceType<typeof WebSocket>>((resolve, reject) => {
+    const ws = new WebSocket(`${bridge.url}/room/${accountKey}`, {
+      headers: { Authorization: `Bearer ${token}`, "x-self-id": selfId, "x-client-role": "Universal" },
+    });
+    ws.on("message", raw => {
+      const msg = JSON.parse(String(raw)) as { action?: string; params?: Record<string, unknown>; echo?: string };
+      if (msg.action && msg.echo) {
+        actions.push({ action: msg.action, params: msg.params ?? {} });
+        ws.send(JSON.stringify({ status: "ok", retcode: 0, data: 99100 + actions.length, echo: msg.echo }));
+      }
+    });
+    ws.once("open", () => resolve(ws));
+    ws.once("error", reject);
+  });
+
+  let wsA: InstanceType<typeof WebSocket> | undefined;
+  let wsB: InstanceType<typeof WebSocket> | undefined;
+  try {
+    wsA = await connect("account-a", "10002", "token-aaaaaaaaaaaaaaaa");
+    wsB = await connect("account-b", "10003", "token-bbbbbbbbbbbbbbbb");
+    await waitFor(() => bridge.status().worker?.phase === "ready", "stage2-delivery-ready");
+
+    // 1. Short <=280 char & <=2 segment web-link banter -> chat bubble + TTS (no forward card)
+    replyMode = "short_banter";
+    wsA.send(JSON.stringify({
+      post_type: "message",
+      message_type: "group",
+      group_id: 10000,
+      user_id: 10001,
+      self_id: 10002,
+      message_id: 88101,
+      message: [
+        { type: "at", data: { qq: "10002" } },
+        { type: "text", data: { text: " 看看这个梗图 https://example.com/meme" } },
+      ],
+    }));
+    await waitFor(() => bridge.room.store.lifecycleRequests().length === 1
+      && bridge.room.store.lifecycleRequests()[0]!.status === "completed", "stage2-short-banter-completed");
+    assert.equal(synthesizeCalls, 1, "short web-link banter must allow TTS");
+    assert.ok(actions.every(a => a.action === "send_group_msg"), "short banter must stay chat bubble, not forward card");
+
+    // 2. >=3 segments -> forward card with Strategy A (zero TTS)
+    actions.length = 0;
+    synthesizeCalls = 0;
+    replyMode = "three_segments";
+    wsA.send(JSON.stringify({
+      post_type: "message",
+      message_type: "group",
+      group_id: 10000,
+      user_id: 10001,
+      self_id: 10002,
+      message_id: 88102,
+      message: [
+        { type: "at", data: { qq: "10002" } },
+        { type: "text", data: { text: " 展开说说" } },
+      ],
+    }));
+    await waitFor(() => bridge.room.store.lifecycleRequests().length === 2
+      && bridge.room.store.lifecycleRequests()[1]!.status === "completed", "stage2-three-seg-completed");
+    assert.equal(synthesizeCalls, 0, "Strategy A must skip TTS for >=3 segments");
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0]!.action, "send_group_forward_msg");
+
+    // 3. >280 chars in 1 segment -> forward card with Strategy A (zero TTS)
+    actions.length = 0;
+    synthesizeCalls = 0;
+    replyMode = "over_280";
+    wsA.send(JSON.stringify({
+      post_type: "message",
+      message_type: "group",
+      group_id: 10000,
+      user_id: 10001,
+      self_id: 10002,
+      message_id: 88103,
+      message: [
+        { type: "at", data: { qq: "10002" } },
+        { type: "text", data: { text: " 再详细写一段" } },
+      ],
+    }));
+    await waitFor(() => bridge.room.store.lifecycleRequests().length === 3
+      && bridge.room.store.lifecycleRequests()[2]!.status === "completed", "stage2-over280-completed");
+    assert.equal(synthesizeCalls, 0, "Strategy A must skip TTS for >280 chars");
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0]!.action, "send_group_forward_msg");
+  } finally {
+    wsA?.terminate();
+    wsB?.terminate();
+    await bridge.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Stage 2 recent image context recalls cached ImageContent on follow-up and unmentioned observed images without SQLite persistence", async () => {
+  const pngBytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+  const directImageUrl = "https://cdn.example.com/direct-receipt.png";
+  const observedImageUrl = "https://cdn.example.com/unmentioned-chart.png";
+  const checked = checkRoomConfig(roomConfig());
+  const root = mkdtempSync(join(tmpdir(), "pa-stage2-image-recall-"));
+  let currentTime = Date.parse("2026-11-26T10:00:00Z");
+  let fetchCount = 0;
+  const fetchedUrls: string[] = [];
+  const capturedCalls: Array<{
+    imageCount: number;
+    systemPrompt: string;
+    visibleTexts: string[];
+  }> = [];
+  const dispatches: string[] = [];
+  let sentSeq = 0;
+
+  const room = new VoiceRoom(join(root, "room.sqlite"), checked, {
+    now: () => currentTime,
+    persona: character => `# ${character.name}\nSynthetic public persona.`,
+    synthesize: async () => { throw new Error("unused"); },
+    permitsText: () => true,
+    permitsPrompt: lifecyclePolicy().permitsPrompt,
+  }, { execution: "lifecycle" });
+
+  try {
+    for (const character of checked.characters) room.setOnline(character.accountKey, true);
+    await room.startLifecycleProductionWorker({
+      model: {
+        visionCapable: true,
+        generate: async (prompt, _signal, _maxChars, genOptions) => {
+          const payload = JSON.parse(prompt.messages[0].content) as {
+            visibleHistory: Array<{ text: string }>;
+          };
+          capturedCalls.push({
+            imageCount: genOptions?.images?.length ?? 0,
+            systemPrompt: prompt.systemPrompt,
+            visibleTexts: payload.visibleHistory.map(item => item.text),
+          });
+          return { kind: "reply", segments: [`收到（图数=${genOptions?.images?.length ?? 0}）`] };
+        },
+      },
+      imageFetcher: async urls => {
+        fetchCount += 1;
+        fetchedUrls.push(...urls);
+        return {
+          images: Object.freeze(urls.map(() => Object.freeze({
+            type: "image" as const,
+            mimeType: "image/png",
+            data: Buffer.from(pngBytes).toString("base64"),
+          }))),
+          attempted: urls.length,
+          failed: 0,
+          reasons: Object.freeze([]),
+        };
+      },
+      apiTimeoutMs: 100,
+      closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 100, releaseMs: 100, writeWaitMs: 50 },
+      dispatch: async req => {
+        dispatches.push(req.item.segment.text);
+        const messageId = String(720000 + ++sentSeq);
+        req.beforeSend();
+        await req.observe({ kind: "ack", messageId });
+        req.released();
+        return messageId;
+      },
+      beginClose: () => {},
+      sealObservations: async () => {},
+    });
+
+    // 1. Direct @bot pure image message -> fetched & remembered in RecentImageCache
+    assert.equal(room.receiveLifecycle(roomInput("99401", "", ["10002"], { images: [directImageUrl] }), QUEUE), "scheduled");
+    await room.whenIdle();
+    assert.equal(fetchCount, 1);
+    assert.equal(capturedCalls[0]!.imageCount, 1);
+    assert.ok(capturedCalls[0]!.visibleTexts.includes("[图片]"));
+
+    // 2. Follow-up "刚才那张图里写的啥" without images -> recalled from cache with ZERO re-fetch
+    currentTime += 30_000;
+    assert.equal(room.receiveLifecycle(roomInput("99402", "刚才那张图里写的啥", ["10002"]), QUEUE), "scheduled");
+    await room.whenIdle();
+    assert.equal(fetchCount, 1, "follow-up must recall cached ImageContent without re-fetching");
+    assert.equal(capturedCalls[1]!.imageCount, 1);
+    assert.ok(capturedCalls[1]!.systemPrompt.includes("已成功加载"));
+    assert.ok(capturedCalls[1]!.visibleTexts.includes("[图片]"));
+
+    // 3. Unmentioned human message carrying an image -> observed in URL cache, lazily fetched on follow-up
+    currentTime += 30_000;
+    assert.equal(
+      room.receiveLifecycle(roomInput("99403", "大家看这张报错图", [], { images: [observedImageUrl] }), QUEUE),
+      "observed",
+    );
+    assert.equal(fetchCount, 1, "observed message must not fetch eagerly in mention_only");
+
+    currentTime += 10_000;
+    assert.equal(room.receiveLifecycle(roomInput("99404", "刚才那张图里写的啥", ["10002"]), QUEUE), "scheduled");
+    await room.whenIdle();
+    assert.equal(fetchCount, 2, "follow-up after newer unmentioned image lazily fetches observed URL");
+    assert.deepEqual(fetchedUrls, [directImageUrl, observedImageUrl]);
+    assert.equal(capturedCalls[2]!.imageCount, 1);
+    assert.ok(capturedCalls[2]!.visibleTexts.some(text => text === "[图片] 大家看这张报错图"));
+
+    const db = new DatabaseSync(join(root, "room.sqlite"), { readOnly: true });
+    const reqJson = JSON.stringify(db.prepare("SELECT payload_json FROM room_lifecycle_requests").all());
+    const msgJson = JSON.stringify(db.prepare("SELECT text FROM room_messages").all());
+    db.close();
+    assert.equal(reqJson.includes(directImageUrl), false);
+    assert.equal(reqJson.includes(observedImageUrl), false);
+    assert.equal(msgJson.includes(directImageUrl), false);
+    assert.equal(msgJson.includes(observedImageUrl), false);
+    assert.equal(reqJson.includes(Buffer.from(pngBytes).toString("base64")), false);
+
+    await room.close();
+    assert.equal((room as unknown as { recentImageCache: { size: number } }).recentImageCache.size, 0);
+    assert.equal((room as unknown as { recentObservedImageUrls: Map<unknown, unknown> }).recentObservedImageUrls.size, 0);
+  } finally {
+    await room.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Stage 2 scoped long-term memory: owner-only commands, privacy gating, and prompt injection across >45min overnight gap", async () => {
+  const { RoomMemoryStore } = await import("../src/voice-room/memory.js");
+  const root = mkdtempSync(join(tmpdir(), "pa-stage2-memory-"));
+  const dbPath = join(root, "room.sqlite");
+  const dataDir = join(root, "data");
+  mkdirSync(dataDir, { recursive: true });
+  let currentTime = Date.parse("2026-11-26T22:00:00Z");
+  const checked = checkRoomConfig(roomConfig());
+  const policy = lifecyclePolicy(checked);
+  const capturedSystems: string[] = [];
+  const capturedHistories: string[][] = [];
+  let sentSeq = 0;
+
+  const createHarness = () => {
+    const memoryStore = new RoomMemoryStore(dataDir, { permitsText: policy.permitsText, now: () => currentTime });
+    const room = new VoiceRoom(dbPath, checked, {
+      now: () => currentTime,
+      persona: character => `# ${character.name}\nSynthetic public persona.`,
+      synthesize: async () => { throw new Error("unused"); },
+      permitsText: policy.permitsText,
+      permitsPrompt: policy.permitsPrompt,
+    }, { execution: "lifecycle", memoryStore });
+    return { memoryStore, room };
+  };
+
+  const first = createHarness();
+  try {
+    for (const character of checked.characters) first.room.setOnline(character.accountKey, true);
+    await first.room.startLifecycleProductionWorker({
+      memoryStore: first.memoryStore,
+      model: {
+        generate: async prompt => {
+          capturedSystems.push(prompt.systemPrompt);
+          const payload = JSON.parse(prompt.messages[0].content) as { visibleHistory: Array<{ text: string }> };
+          capturedHistories.push(payload.visibleHistory.map(row => row.text));
+          return { kind: "reply", segments: ["周五九点老地方见。"] };
+        },
+      },
+      apiTimeoutMs: 100,
+      closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 100, releaseMs: 100, writeWaitMs: 50 },
+      dispatch: async req => {
+        const messageId = String(730000 + ++sentSeq);
+        req.beforeSend();
+        await req.observe({ kind: "ack", messageId });
+        req.released();
+        return messageId;
+      },
+      beginClose: () => {},
+      sealObservations: async () => {},
+    });
+
+    // Non-owner memory commands are strictly rejected
+    assert.equal(first.room.receiveLifecycle(roomInput("99501", "/room remember 群友周末开黑", [], { senderId: "20002" }), QUEUE), "rejected");
+    assert.equal(first.room.receiveLifecycle(roomInput("99502", "/room memory", [], { senderId: "20002" }), QUEUE), "rejected");
+    assert.equal(first.room.receiveLifecycle(roomInput("99503", "/room forget 开黑", [], { senderId: "20002" }), QUEUE), "rejected");
+    assert.equal(first.memoryStore.list().length, 0);
+
+    // Privacy-violating /room remember is rejected and never saved
+    assert.equal(first.room.receiveLifecycle(roomInput("99504", "/room remember 我的密钥 sk-secret-1234567890abcdef"), QUEUE), "rejected");
+    assert.equal(first.memoryStore.list().length, 0);
+
+    // Owner /room remember & /room memory succeed
+    assert.equal(first.room.receiveLifecycle(roomInput("99505", "/room remember 群里每周五晚上九点准时开黑"), QUEUE), "control");
+    const rememberInput = roomInput("99505", "/room remember 群里每周五晚上九点准时开黑");
+    const rememberAck = first.room.consumeMemoryControlFeedback(rememberInput);
+    assert.ok(rememberAck?.startsWith("已记住 [mem-"));
+    assert.equal(first.memoryStore.list().length, 1);
+
+    const listInput = roomInput("99506", "/room memory");
+    assert.equal(first.room.receiveLifecycle(listInput, QUEUE), "control");
+    const listAck = first.room.consumeMemoryControlFeedback(listInput);
+    assert.ok(listAck?.includes("长期记忆共 1 条") && listAck.includes("每周五晚上九点准时开黑"));
+
+    // Pre-gap chat message
+    assert.equal(first.room.receiveLifecycle(roomInput("99507", "今晚先睡了大家晚安"), QUEUE), "observed");
+  } finally {
+    await first.room.close();
+  }
+
+  // Simulate >45min overnight gap (12 hours later) and process restart
+  currentTime += 12 * 60 * 60 * 1000;
+  const second = createHarness();
+  try {
+    for (const character of checked.characters) second.room.setOnline(character.accountKey, true);
+    await second.room.startLifecycleProductionWorker({
+      memoryStore: second.memoryStore,
+      model: {
+        generate: async prompt => {
+          capturedSystems.push(prompt.systemPrompt);
+          const payload = JSON.parse(prompt.messages[0].content) as { visibleHistory: Array<{ text: string }> };
+          capturedHistories.push(payload.visibleHistory.map(row => row.text));
+          return { kind: "reply", segments: ["记得周五晚上九点开黑！"] };
+        },
+      },
+      apiTimeoutMs: 100,
+      closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 100, releaseMs: 100, writeWaitMs: 50 },
+      dispatch: async req => {
+        const messageId = String(730000 + ++sentSeq);
+        req.beforeSend();
+        await req.observe({ kind: "ack", messageId });
+        req.released();
+        return messageId;
+      },
+      beginClose: () => {},
+      sealObservations: async () => {},
+    });
+
+    assert.equal(second.room.receiveLifecycle(roomInput("99508", "这周几点开黑来着？", ["10002"], { senderId: "20002" }), QUEUE), "scheduled");
+    await second.room.whenIdle();
+    assert.equal(capturedSystems.length, 1);
+    assert.ok(capturedSystems[0]!.includes("## 长期记忆（跨天事实与偏好）"));
+    assert.ok(capturedSystems[0]!.includes("群里每周五晚上九点准时开黑"));
+    assert.equal(capturedHistories[0]!.some(text => text.includes("大家晚安")), false,
+      "overnight gap >45min must still isolate old visibleHistory");
+
+    // Owner /room forget removes memory so subsequent turns no longer inject it
+    const forgetInput = roomInput("99509", "/room forget 开黑");
+    assert.equal(second.room.receiveLifecycle(forgetInput, QUEUE), "control");
+    assert.ok(second.room.consumeMemoryControlFeedback(forgetInput)?.includes("已遗忘 1 条"));
+    assert.equal(second.memoryStore.list().length, 0);
+
+    currentTime += 60_000;
+    assert.equal(second.room.receiveLifecycle(roomInput("99510", "这周几点开黑来着？", ["10002"], { senderId: "20002" }), QUEUE), "scheduled");
+    await second.room.whenIdle();
+    assert.equal(capturedSystems.length, 2);
+    assert.equal(capturedSystems[1]!.includes("每周五晚上九点准时开黑"), false);
+  } finally {
+    await second.room.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
