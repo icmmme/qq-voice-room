@@ -425,6 +425,7 @@ export class VoiceRoom {
         return "control";
       }
       if (/^\/room\s+status$/.test(text)) return "control";
+      if (/^\/room\s+qr$/.test(text)) return "control";
       if (/^\/room\s+stop$/.test(text)) {
         try {
           const result = this.store.stopLifecycleByControl(

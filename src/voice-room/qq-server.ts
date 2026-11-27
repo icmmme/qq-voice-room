@@ -14,6 +14,8 @@ import type { RoomWebToolkit } from "./web.js";
 import type { RoomImageFetcher } from "./image.js";
 import { shouldDeliverAsForwardCard } from "./delivery-policy.js";
 import { formatMemorySummary, parseMemoryCommand, RoomMemoryStore } from "./memory.js";
+import { buildPrivateQrRescueMessage, readQrCodePng, type QrRescueReason,
+  type QrRescueSource } from "./qr-rescue.js";
 import { RoomSendError, type RoomControlAction, type RoomDependencies, type RoomInput,
   type RoomParticipationMode, type RoomPrompt } from "./types.js";
 import { roomRecord } from "./fish.js";
@@ -59,6 +61,8 @@ export async function startRoomQq(settings: RoomQqSettings,
     startupSingleAccountMs?: number;
     livenessProbeMs?: number;
     ingressFailoverMs?: number;
+    qrRescueSources?: ReadonlyMap<string, QrRescueSource>;
+    readQrCode?: (source: QrRescueSource) => Promise<Buffer | null>;
   } = {}) {
   const testMode = settings.apiTimeoutMs <= 1000;
   const disconnectGraceMs = options.disconnectGraceMs ?? (testMode ? 0 : 10_000);
@@ -66,6 +70,8 @@ export async function startRoomQq(settings: RoomQqSettings,
   const startupSingleAccountMs = options.startupSingleAccountMs ?? (testMode ? 250 : 15_000);
   const livenessProbeMs = options.livenessProbeMs ?? (testMode ? 0 : 60_000);
   const ingressFailoverMs = options.ingressFailoverMs ?? (testMode ? 0 : 800);
+  const qrRescueSources = options.qrRescueSources;
+  const readQrCode = options.readQrCode ?? readQrCodePng;
   const workerSelected = settings.execution === "worker";
   const workerTts = typeof voice?.synthesize === "function";
   const startupModes = workerSelected ? workerDeliveryModes(settings.room.deliveryMode, workerTts) : undefined;
@@ -260,12 +266,71 @@ export async function startRoomQq(settings: RoomQqSettings,
     }
     if (targetKey) void acknowledge(targetKey, text, false);
   }
+  async function sendQrRescuePrivate(offlineAccountKey: string, reason: QrRescueReason,
+    preferredSenderKey?: string): Promise<boolean> {
+    const source = qrRescueSources?.get(offlineAccountKey);
+    if (!source) return false;
+    let senderKey = preferredSenderKey && preferredSenderKey !== offlineAccountKey
+      && peers.get(preferredSenderKey)?.open && !zombieOfflineAccounts.has(preferredSenderKey)
+      ? preferredSenderKey : undefined;
+    if (!senderKey) {
+      for (const [key, candidate] of peers.entries()) {
+        if (key === offlineAccountKey || !candidate.open) continue;
+        if (!zombieOfflineAccounts.has(key)) { senderKey = key; break; }
+        senderKey ??= key;
+      }
+    }
+    if (!senderKey) return false;
+    const png = await readQrCode(source);
+    if (!png) {
+      notice("error", "qr-rescue-unavailable");
+      return false;
+    }
+    const offlineChar = config.characters.find(c => c.accountKey === offlineAccountKey);
+    const message = buildPrivateQrRescueMessage(offlineChar?.name ?? offlineAccountKey, png, reason);
+    try {
+      await peers.get(senderKey)?.request("send_private_msg", {
+        user_id: Number(config.ownerId),
+        message,
+      });
+      notice("disconnected", "qr-rescue-sent");
+      return true;
+    } catch {
+      notice("error", "qr-rescue-failed");
+      return false;
+    }
+  }
   function handleLifecycleInput(accountKey: string, input: RoomInput) {
     try {
       const receipt = room.receiveLifecycle(input, workerQueue!);
       notice("received", receipt);
       if (receipt === "control") {
         const trimmed = input.text.trim();
+        if (/^\/room\s+qr$/.test(trimmed)) {
+          const offlineChars = config.characters.filter(
+            c => !peers.get(c.accountKey)?.open || zombieOfflineAccounts.has(c.accountKey));
+          if (!offlineChars.length) {
+            void acknowledge(accountKey, "当前所有账号均在线，无需扫码。");
+            return;
+          }
+          if (!qrRescueSources?.size) {
+            void acknowledge(accountKey, "未配置二维码互救来源（ROOM_QR_RESCUE_SOURCES）。");
+            return;
+          }
+          void (async () => {
+            const sentNames: string[] = [];
+            for (const c of offlineChars) {
+              if (await sendQrRescuePrivate(c.accountKey, "manual", accountKey)) {
+                sentNames.push(c.name);
+              }
+            }
+            const reply = sentNames.length > 0
+              ? `已私聊发送 ${sentNames.join("、")} 的最新登录二维码，请在手机 QQ 查收。`
+              : "未能读取到有效二维码图片或私聊发送失败，请检查容器日志或稍后重试。";
+            if (deps.permitsText(reply)) void acknowledge(accountKey, reply);
+          })();
+          return;
+        }
         const memoryFeedback = room.consumeMemoryControlFeedback(input);
         const memoryCmd = parseMemoryCommand(trimmed, { permitsText: deps.permitsText });
         const lifecycle = room.store.lifecycleControlState();
@@ -365,6 +430,7 @@ export async function startRoomQq(settings: RoomQqSettings,
                 const deadChar = config.characters.find(c => c.accountKey === activeKey);
                 void acknowledge(account.accountKey,
                   `提醒：${deadChar?.name ?? activeKey} 疑似假在线（未收到群消息），已自动切换由在线账号接管服务，请检查登录状态。`, false);
+                void sendQrRescuePrivate(activeKey, "zombie", account.accountKey);
               }
             }
             handleLifecycleInput(account.accountKey, input);
@@ -424,6 +490,7 @@ export async function startRoomQq(settings: RoomQqSettings,
               notice("disconnected", "account-offline-alert");
               alertHealthyPeer(account.accountKey,
                 `提醒：${character.name} 的 NapCat 连接已断开，当前由在线账号继续服务，请检查登录状态。`);
+              void sendQrRescuePrivate(account.accountKey, "offline");
             }, offlineAlertMs);
             alertTimer.unref();
             offlineAlertTimers.set(account.accountKey, alertTimer);
@@ -465,6 +532,7 @@ export async function startRoomQq(settings: RoomQqSettings,
           const deadChar = config.characters.find(c => c.accountKey === accountKey);
           alertHealthyPeer(accountKey,
             `提醒：${deadChar?.name ?? accountKey} 的 QQ 登录态已失效（假在线），已自动切换由在线账号继续服务，请重新扫码。`);
+          void sendQrRescuePrivate(accountKey, "zombie");
         }
       } else if (row.online === true && row.good !== false && zombieOfflineAccounts.has(accountKey)) {
         zombieOfflineAccounts.delete(accountKey);

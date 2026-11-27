@@ -7,6 +7,7 @@ import { hasVisionModel, roomLifecycleGenerator, roomWorkerVoiceTranslator,
 import { createRoomWebToolkit } from "../src/voice-room/web.js";
 import { createRoomImageFetcher } from "../src/voice-room/image.js";
 import { startRoomQq } from "../src/voice-room/qq-server.js";
+import { parseQrRescueSources } from "../src/voice-room/qr-rescue.js";
 import { roomPublicPolicy } from "../src/voice-room/public-policy.js";
 import { RoomMemoryStore } from "../src/voice-room/memory.js";
 import { readFishConfig, fishSynthesizer, FishTtsError } from "../src/voice-room/fish.js";
@@ -92,6 +93,7 @@ async function main() {
   console.log(proxy.summary.enabled
     ? `代理已启用：来源=${proxy.summary.source}，绕过规则=${proxy.summary.bypassRuleCount} 条，忽略=${proxy.summary.ignoredBypassRuleCount} 条。${bypassWarning}`
     : "代理未启用：直连。");
+  const qrRescueSources = parseQrRescueSources(process.env.ROOM_QR_RESCUE_SOURCES);
   let bridge: Awaited<ReturnType<typeof startRoomQq>>;
   try {
     bridge = await startRoomQq({ ...settings, room }, {
@@ -108,7 +110,9 @@ async function main() {
       onContextCompacted: notice => console.log(JSON.stringify({ type: "room-context-compacted", ...notice })),
     }, notice => console.log(JSON.stringify(notice)), fish ? {
       synthesize: fishSynthesizer(fish, policy.permitsText, fetch, code => console.log(JSON.stringify({ type: "tts-error", code }))),
-    } : undefined);
+    } : undefined, {
+      ...(qrRescueSources.size > 0 ? { qrRescueSources } : {}),
+    });
   } catch (error) {
     restoreProxy();
     throw error;

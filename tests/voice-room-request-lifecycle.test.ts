@@ -7150,3 +7150,103 @@ test("NapCat resilience: get_status zombie probe and dual-account ingress failov
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+
+test("NapCat mutual QR rescue sends private PNG on disconnect and supports on-demand /room qr", async () => {
+  const { startRoomQq } = await import("../src/voice-room/qq-server.js");
+  const { checkRoomConfig } = await import("../src/voice-room/config.js");
+  const { parseQrRescueSources } = await import("../src/voice-room/qr-rescue.js");
+
+  const parsed = parseQrRescueSources("account-a=docker:napcat-bot-a,bad-entry,account-b=file:/tmp/qr-b.png");
+  assert.equal(parsed.size, 2);
+  assert.deepEqual(parsed.get("account-a"), { kind: "docker", container: "napcat-bot-a", path: "/app/napcat/cache/qrcode.png" });
+  assert.deepEqual(parsed.get("account-b"), { kind: "file", path: "/tmp/qr-b.png" });
+
+  const dir = mkdtempSync(join(tmpdir(), "qq-room-qr-rescue-"));
+  const personaA = join(dir, "a.md");
+  const personaB = join(dir, "b.md");
+  writeFileSync(personaA, "你是甲。");
+  writeFileSync(personaB, "你是乙。");
+  const fakePng = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02]);
+  const expectedB64 = `base64://${fakePng.toString("base64")}`;
+
+  const notices: Array<{ type: string; code: string }> = [];
+  const sent: Array<{ account: string; action: string; params: Record<string, unknown> }> = [];
+  const checked = checkRoomConfig(roomConfig({ deliveryMode: "text" }));
+  const bridge = await startRoomQq({
+    room: checked,
+    dataDir: join(dir, "data"),
+    port: 0,
+    apiTimeoutMs: 500,
+    execution: "worker",
+    workerQueue: QUEUE,
+    closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 200, releaseMs: 200, writeWaitMs: 50 },
+    accounts: [
+      { accountKey: "account-a", token: "token-aaaaaaaaaaaaaaaa", personaFile: personaA },
+      { accountKey: "account-b", token: "token-bbbbbbbbbbbbbbbb", personaFile: personaB },
+    ],
+  }, {
+    persona: c => c.id === "character-a" ? "你是甲。" : "你是乙。",
+    permitsText: () => true,
+    lifecycleModel: { generate: async () => ({ kind: "reply", segments: ["ok"] }) },
+  }, notice => { notices.push({ type: notice.type, code: notice.code }); }, undefined, {
+    disconnectGraceMs: 0,
+    offlineAlertMs: 60,
+    startupSingleAccountMs: 80,
+    qrRescueSources: parsed,
+    readQrCode: async () => fakePng,
+  });
+
+  const { WebSocket } = await import("ws");
+  const connect = (accountKey: string, selfId: string, token: string) => new Promise<InstanceType<typeof WebSocket>>((resolve, reject) => {
+    const ws = new WebSocket(`${bridge.url}/room/${accountKey}`, {
+      headers: { Authorization: `Bearer ${token}`, "x-self-id": selfId, "x-client-role": "Universal" },
+    });
+    ws.on("message", raw => {
+      const msg = JSON.parse(String(raw)) as { action?: string; params?: Record<string, unknown>; echo?: string };
+      if (!msg.action || !msg.echo) return;
+      sent.push({ account: accountKey, action: msg.action, params: msg.params ?? {} });
+      ws.send(JSON.stringify({ status: "ok", retcode: 0, data: 99300 + sent.length, echo: msg.echo }));
+    });
+    ws.once("open", () => resolve(ws));
+    ws.once("error", reject);
+  });
+
+  let wsA: InstanceType<typeof WebSocket> | undefined;
+  let wsB: InstanceType<typeof WebSocket> | undefined;
+  try {
+    wsA = await connect("account-a", "10002", "token-aaaaaaaaaaaaaaaa");
+    wsB = await connect("account-b", "10003", "token-bbbbbbbbbbbbbbbb");
+    await waitFor(() => bridge.status().worker?.phase === "ready" && bridge.status().online === 2, "qr-rescue-two-online");
+
+    // 1. Drop account-b -> auto private QR rescue sent via account-a to ownerId
+    wsB.terminate();
+    await waitFor(() => notices.some(n => n.code === "qr-rescue-sent"), "auto-qr-rescue-sent");
+    const privMsgs = sent.filter(s => s.account === "account-a" && s.action === "send_private_msg");
+    assert.equal(privMsgs.length, 1);
+    assert.equal(privMsgs[0]!.params.user_id, 10001);
+    const segments = privMsgs[0]!.params.message as Array<{ type: string; data: { text?: string; file?: string } }>;
+    assert.ok(segments[0]!.data.text?.includes(checked.characters[1]!.name));
+    assert.equal(segments[1]!.type, "image");
+    assert.equal(segments[1]!.data.file, expectedB64);
+
+    // 2. Owner sends /room qr -> sends fresh private QR + confirms in group
+    wsA.send(JSON.stringify({
+      post_type: "message",
+      message_type: "group",
+      group_id: 10000,
+      user_id: 10001,
+      self_id: 10002,
+      message_id: 98501,
+      message: [{ type: "text", data: { text: "/room qr" } }],
+    }));
+    await waitFor(() => sent.filter(s => s.action === "send_private_msg").length === 2, "manual-qr-rescue-sent");
+    await waitFor(() => sent.some(s => s.action === "send_group_msg"
+      && JSON.stringify(s.params.message).includes("已私聊发送")), "manual-qr-group-ack");
+  } finally {
+    wsA?.terminate();
+    wsB?.terminate();
+    await bridge.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
