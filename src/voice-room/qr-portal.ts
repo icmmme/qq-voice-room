@@ -1,11 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
-import { execFile } from "node:child_process";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
-import { promisify } from "node:util";
 import { DEFAULT_DOCKER_QR_PATH, readQrCodePng } from "./qr-rescue.js";
-
-const execFileAsync = promisify(execFile);
 
 export type BotLoginStatus = "online" | "qr_wait" | "unknown";
 
@@ -177,35 +173,67 @@ function buildPortalUrl(baseUrl: string, accessToken: string): string {
   return `${normalized}/?k=${encodeURIComponent(accessToken)}`;
 }
 
+function dockerSocketRequest(path: string, method: "GET" | "POST", timeoutMs: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest({ socketPath: "/var/run/docker.sock", path, method }, res => {
+      const chunks: Buffer[] = [];
+      res.on("data", chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      res.on("end", () => {
+        const body = Buffer.concat(chunks);
+        if ((res.statusCode ?? 500) >= 400) {
+          reject(new Error(`docker_http_${res.statusCode}`));
+          return;
+        }
+        resolve(body);
+      });
+    });
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error("docker_socket_timeout"));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+function decodeDockerLogStream(raw: Buffer): string {
+  if (raw.byteLength < 8 || (raw[0] !== 1 && raw[0] !== 2) || raw[1] !== 0 || raw[2] !== 0 || raw[3] !== 0) {
+    return raw.toString("utf8");
+  }
+  const parts: string[] = [];
+  let offset = 0;
+  while (offset + 8 <= raw.byteLength) {
+    const stream = raw[offset];
+    if ((stream !== 1 && stream !== 2) || raw[offset + 1] !== 0 || raw[offset + 2] !== 0 || raw[offset + 3] !== 0) {
+      return raw.toString("utf8");
+    }
+    const size = raw.readUInt32BE(offset + 4);
+    offset += 8;
+    const end = Math.min(offset + size, raw.byteLength);
+    parts.push(raw.subarray(offset, end).toString("utf8"));
+    offset = end;
+  }
+  return parts.join("");
+}
+
 async function defaultReadLogs(container: string): Promise<string> {
   try {
-    const res = await execFileAsync("docker", ["logs", "--tail", "120", container], {
-      encoding: "utf8",
-      timeout: 5000,
-      maxBuffer: 1024 * 1024,
-    });
-    return `${res.stdout}\n${res.stderr}`;
+    const raw = await dockerSocketRequest(
+      `/containers/${encodeURIComponent(container)}/logs?stdout=1&stderr=1&tail=120`,
+      "GET",
+      4000,
+    );
+    return decodeDockerLogStream(raw);
   } catch {
     return "";
   }
 }
 
-async function defaultReadQrMtime(container: string): Promise<string | null> {
-  try {
-    const res = await execFileAsync("docker", ["exec", container, "stat", "-c", "%Y", DEFAULT_DOCKER_QR_PATH], {
-      encoding: "utf8",
-      timeout: 5000,
-    });
-    const sec = Number(res.stdout.trim());
-    if (!Number.isFinite(sec) || sec <= 0) return null;
-    return new Date(sec * 1000).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
-  } catch {
-    return null;
-  }
+async function defaultReadQrMtime(): Promise<string | null> {
+  return null;
 }
 
 async function defaultRestartContainer(container: string): Promise<void> {
-  await execFileAsync("docker", ["restart", container], { timeout: 20_000 });
+  await dockerSocketRequest(`/containers/${encodeURIComponent(container)}/restart?t=5`, "POST", 15_000);
 }
 
 function renderHtmlPage(params: {
@@ -404,9 +432,18 @@ export async function startQrPortal(config: QrPortalConfig) {
   let lastPushAt = -Infinity;
   let mergeTimer: ReturnType<typeof setTimeout> | undefined;
   let closing = false;
+  let cachedSnapshots: QrPortalBotSnapshot[] | undefined;
+  let cachedAt = -Infinity;
+  let inFlightSnapshots: Promise<QrPortalBotSnapshot[]> | undefined;
 
-  async function collectSnapshots(): Promise<QrPortalBotSnapshot[]> {
-    return Promise.all(bots.map(async bot => {
+  async function collectSnapshots(force = false): Promise<QrPortalBotSnapshot[]> {
+    if (!force && cachedSnapshots && now() - cachedAt < 5_000) {
+      return cachedSnapshots;
+    }
+    if (!force && inFlightSnapshots) {
+      return inFlightSnapshots;
+    }
+    const work = Promise.all(bots.map(async bot => {
       const [logs, mtime] = await Promise.all([readLogs(bot.container), readQrMtime(bot.container)]);
       return {
         id: bot.id,
@@ -415,13 +452,21 @@ export async function startQrPortal(config: QrPortalConfig) {
         status: inferBotStatusFromLogs(logs),
         qrUpdatedAt: mtime,
       };
-    }));
+    })).then(snaps => {
+      cachedSnapshots = snaps;
+      cachedAt = now();
+      return snaps;
+    }).finally(() => {
+      if (inFlightSnapshots === work) inFlightSnapshots = undefined;
+    });
+    inFlightSnapshots = work;
+    return work;
   }
 
   async function flushMergedPush(): Promise<WechatPushResult | null> {
     mergeTimer = undefined;
     if (closing || pendingPushBots.size === 0) return null;
-    const snapshots = await collectSnapshots();
+    const snapshots = await collectSnapshots(true);
     const targetIds = new Set<string>();
     for (const botId of pendingPushBots) targetIds.add(botId);
     for (const snap of snapshots) {
@@ -458,7 +503,7 @@ export async function startQrPortal(config: QrPortalConfig) {
   }
 
   async function pollOnce(): Promise<QrPortalBotSnapshot[]> {
-    const snapshots = await collectSnapshots();
+    const snapshots = await collectSnapshots(true);
     const allOnline = snapshots.length > 0 && snapshots.every(s => s.status === "online");
     if (allOnline) {
       lastPushAt = -Infinity;
@@ -569,6 +614,8 @@ export async function startQrPortal(config: QrPortalConfig) {
           return;
         }
         restartAt.set(bot.id, now());
+        cachedSnapshots = undefined;
+        cachedAt = -Infinity;
         await restartContainer(bot.container);
         sendJson(res, 200, { ok: true });
         return;
