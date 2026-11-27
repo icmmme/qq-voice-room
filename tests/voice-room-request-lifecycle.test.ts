@@ -7250,3 +7250,44 @@ test("NapCat mutual QR rescue sends private PNG on disconnect and supports on-de
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+
+test("startRoomQq rejects non-private listenHost such as 0.0.0.0", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "room-listen-host-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const personaA = join(dir, "persona-a.md");
+  const personaB = join(dir, "persona-b.md");
+  writeFileSync(personaA, "你是甲。\n");
+  writeFileSync(personaB, "你是乙。\n");
+  const room = checkRoomConfig({
+    roomId: "listen-host-room",
+    groupId: "10000",
+    ownerId: "10001",
+    ingressAccountKey: "account-a",
+    characters: [
+      { id: "character-a", accountKey: "account-a", selfId: "10002", name: "甲", voiceKey: "v-a" },
+      { id: "character-b", accountKey: "account-b", selfId: "10003", name: "乙", voiceKey: "v-b" },
+    ],
+    deliveryMode: "text",
+  });
+  await assert.rejects(
+    () => startRoomQq({
+      room,
+      dataDir: dir,
+      port: 0,
+      apiTimeoutMs: 500,
+      execution: "worker",
+      workerQueue: QUEUE,
+      closePolicy: { observationCapacity: 32, perAccountCapacity: 16, drainMs: 200, releaseMs: 200, writeWaitMs: 50 },
+      accounts: [
+        { accountKey: "account-a", token: "token-aaaaaaaaaaaaaaaa", personaFile: personaA },
+        { accountKey: "account-b", token: "token-bbbbbbbbbbbbbbbb", personaFile: personaB },
+      ],
+    }, {
+      persona: c => c.id === "character-a" ? "你是甲。" : "你是乙。",
+      permitsText: () => true,
+      lifecycleModel: { generate: async () => ({ kind: "reply", segments: ["ok"] }) },
+    }, undefined, undefined, { listenHost: "0.0.0.0" }),
+    /room-listen-host-invalid/,
+  );
+});

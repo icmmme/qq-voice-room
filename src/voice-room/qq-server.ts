@@ -42,6 +42,16 @@ const equal = (a: string, b: string) => {
   const left = Buffer.from(a), right = Buffer.from(b);
   return left.length === right.length && timingSafeEqual(left, right);
 };
+const OCTET = "(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)";
+const PRIVATE_IPV4_RE = new RegExp(
+  `^(?:127\\.0\\.0\\.1|10\\.${OCTET}\\.${OCTET}\\.${OCTET}|172\\.(?:1[6-9]|2\\d|3[01])\\.${OCTET}\\.${OCTET}|192\\.168\\.${OCTET}\\.${OCTET})$`,
+);
+function resolveListenHost(raw?: string): string {
+  const host = raw?.trim();
+  if (!host) return "127.0.0.1";
+  if (!PRIVATE_IPV4_RE.test(host)) throw new Error("room-listen-host-invalid");
+  return host;
+}
 
 /** Local reverse Universal WS. One path/token/self-id per account; never starts ordinary QQ bridge. */
 export async function startRoomQq(settings: RoomQqSettings,
@@ -61,9 +71,11 @@ export async function startRoomQq(settings: RoomQqSettings,
     startupSingleAccountMs?: number;
     livenessProbeMs?: number;
     ingressFailoverMs?: number;
+    listenHost?: string;
     qrRescueSources?: ReadonlyMap<string, QrRescueSource>;
     readQrCode?: (source: QrRescueSource) => Promise<Buffer | null>;
   } = {}) {
+  const listenHost = resolveListenHost(options.listenHost);
   const testMode = settings.apiTimeoutMs <= 1000;
   const disconnectGraceMs = options.disconnectGraceMs ?? (testMode ? 0 : 10_000);
   const offlineAlertMs = options.offlineAlertMs ?? (testMode ? 150 : 30_000);
@@ -503,7 +515,7 @@ export async function startRoomQq(settings: RoomQqSettings,
   server.on("error", () => notice("error", "http-server-failed"));
   try {
     await new Promise<void>((resolve, reject) => { server.once("error", reject);
-      server.listen(settings.port, "127.0.0.1", () => { server.off("error", reject); resolve(); }); });
+      server.listen(settings.port, listenHost, () => { server.off("error", reject); resolve(); }); });
   } catch (error) { sockets.close(); await room.close(); throw error; }
   publishWorkerStatus();
   const runLivenessProbe = async () => {
@@ -555,7 +567,7 @@ export async function startRoomQq(settings: RoomQqSettings,
   poll.unref(); heartbeat.unref(); livenessTimer?.unref();
   const port = (server.address() as AddressInfo).port;
   return {
-    room, url: `ws://127.0.0.1:${port}`,
+    room, url: `ws://${listenHost}:${port}`,
     status: () => ({ online: peers.size, ...room.status(), ...(workerModes ? { worker: workerStatus() } : {}) }),
     /** Local deterministic control seam; production Legacy receive() still owns command parsing. */
     control: (action: RoomControlAction, input: RoomInput, mode?: RoomParticipationMode) => room.handleControl(action, input, mode),

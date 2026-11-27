@@ -93,6 +93,7 @@ async function main() {
   console.log(proxy.summary.enabled
     ? `代理已启用：来源=${proxy.summary.source}，绕过规则=${proxy.summary.bypassRuleCount} 条，忽略=${proxy.summary.ignoredBypassRuleCount} 条。${bypassWarning}`
     : "代理未启用：直连。");
+  const listenHost = process.env.ROOM_WS_HOST?.trim() || undefined;
   const qrRescueSources = parseQrRescueSources(process.env.ROOM_QR_RESCUE_SOURCES);
   let bridge: Awaited<ReturnType<typeof startRoomQq>>;
   try {
@@ -111,6 +112,7 @@ async function main() {
     }, notice => console.log(JSON.stringify(notice)), fish ? {
       synthesize: fishSynthesizer(fish, policy.permitsText, fetch, code => console.log(JSON.stringify({ type: "tts-error", code }))),
     } : undefined, {
+      ...(listenHost ? { listenHost } : {}),
       ...(qrRescueSources.size > 0 ? { qrRescueSources } : {}),
     });
   } catch (error) {
